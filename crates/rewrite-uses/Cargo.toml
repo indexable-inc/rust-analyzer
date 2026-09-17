@@ -1,0 +1,29 @@
+[package]
+name = "rewrite-uses"
+version = "0.0.0"
+repository.workspace = true
+description = "Rewrite use imports to inline qualified paths and remove the use statements."
+
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rewrite-uses"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ide.workspace = true
+ide-db.workspace = true
+hir.workspace = true
+load-cargo.workspace = true
+project-model.workspace = true
+syntax.workspace = true
+vfs.workspace = true
+intern.workspace = true
+span.workspace = true
+
+[lints]
+workspace = true

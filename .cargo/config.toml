@@ -1,0 +1,25 @@
+[alias]
+xtask = "run --package xtask --bin xtask --"
+tq = "test -- -q"
+qt = "tq"
+lint = "clippy --all-targets -- --cap-lints warn"
+codegen = "run --package xtask --bin xtask -- codegen"
+dist = "run --package xtask --bin xtask -- dist"
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
+[env]
+CARGO_WORKSPACE_DIR = { value = "", relative = true }
+
+# Required because parent .cargo/config.toml uses these unstable features
+# and cargo merges config from parent directories.
+[unstable]
+profile-rustflags = true
+checksum-freshness = true
+build-analysis = true
+fine-grain-locking = true
+gc = true
+gitoxide = "fetch"
+feature-unification = true
+no-embed-metadata = true

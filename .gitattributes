@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+# git grep shouldn't match entries in this benchmark data
+bench_data/** binary
+
+# Older git versions try to fix line endings on images, this prevents it.
+*.png binary
+*.jpg binary
+*.ico binary
+
+# These files contain CRLF bytes in the preserved jj snapshot. Keep their exact
+# bytes on add and checkout; the general text rule otherwise normalizes them.
+/crates/hir-def/src/nameres/tests/imports.rs -text
+/crates/proc-macro-srv-cli/README.md -text
+/crates/proc-macro-srv-cli/src/lib.rs -text
+/crates/proc-macro-srv/src/bridge.rs -text
+/crates/proc-macro-srv/src/token_stream.rs -text
