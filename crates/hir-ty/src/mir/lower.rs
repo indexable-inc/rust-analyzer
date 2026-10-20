@@ -1530,6 +1530,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             | TyKind::Float(_)
                     ) && (lhs_ty == rhs_ty || builtin_inequal_impls)
                 };
+                // rustc's typeck drops the autoref it records for the operands of a comparison
+                // of scalars (writeback's `fix_scalar_builtin_expr`): the values are compared.
+                let compares_scalars = is_builtin && matches!(op, BinaryOp::CmpOp(_));
                 if !is_builtin
                     && let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id)
                 {
@@ -1589,6 +1592,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         span: Some((*lhs).into()),
                     };
                     (operand, current)
+                } else if compares_scalars {
+                    let Some(it) = self.lower_scalar_operand(*lhs, current)? else {
+                        return Ok(None);
+                    };
+                    it
                 } else {
                     let Some(it) = self.lower_expr_to_some_operand(*lhs, current)? else {
                         return Ok(None);
@@ -1636,8 +1644,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     );
                     return Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()));
                 }
-                let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)?
-                else {
+                let rhs_op = match compares_scalars {
+                    true => self.lower_scalar_operand(*rhs, current)?,
+                    false => self.lower_expr_to_some_operand(*rhs, current)?,
+                };
+                let Some((rhs_op, current)) = rhs_op else {
                     return Ok(None);
                 };
                 self.push_assignment(
@@ -2657,6 +2668,40 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             self.labeled_loop_blocks.insert(label.unwrap(), prev);
         }
         Ok(my.end)
+    }
+
+    /// An operand of a comparison of scalars: the value, without the autoref inference records
+    /// for `PartialEq::eq(&a, &b)`, as rustc has it after writeback.
+    fn lower_scalar_operand(
+        &mut self,
+        expr_id: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
+        let adjustments = self.infer.expr_adjustments.get(&expr_id).cloned().unwrap_or_default();
+        let Some((Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(_)), .. }, rest)) =
+            adjustments.split_last()
+        else {
+            return self.lower_expr_to_some_operand(expr_id, current);
+        };
+        if rest.is_empty()
+            && let Expr::Literal(l) = &self.store[expr_id]
+        {
+            let ty = self.expr_ty_without_adjust(expr_id);
+            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            operand.span = Some(expr_id.into());
+            return Ok(Some((operand, current)));
+        }
+        let ty = match rest.last() {
+            Some(it) => it.target.as_ref(),
+            None => self.expr_ty_without_adjust(expr_id),
+        };
+        let temp: Place<'db> = self.temp(ty, current, expr_id.into())?.into();
+        let Some(current) = self.lower_expr_to_place_with_adjust(expr_id, temp, current, rest)?
+        else {
+            return Ok(None);
+        };
+        let operand = Operand { kind: OperandKind::Copy(temp.store()), span: Some(expr_id.into()) };
+        Ok(Some((operand, current)))
     }
 
     fn has_adjustments(&self, expr_id: ExprId) -> bool {

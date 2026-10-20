@@ -161,6 +161,10 @@ building does, because it decides which locals are kept, in which order, in whic
   `let` that binds one name by value has its initializer lowered into the binding, as
   rustc's `expr_into_pattern` does, not into a temporary copied after: `let x = f.await`
   writes `x` before the awaitee is dropped, so `x` conflicts with it as in rustc.
+- **Comparisons of scalars** compare the values (`Eq(copy i, const 0)`): rustc's typeck drops
+  the autoref of `PartialEq::eq(&a, &b)` for them (writeback's `fix_scalar_builtin_expr`).
+  RA kept it and compared references, and a borrowed local is live to the end of its storage
+  in an `async` block, so a loop variable compared once was kept across every await.
 - **Promotion.** The promoted locals rustc promotes (nothing to drop, no cell) are never kept
   for a yield (`MirBody::promoted_constants`); rustc's `PromoteTemps` makes them constants.
 
