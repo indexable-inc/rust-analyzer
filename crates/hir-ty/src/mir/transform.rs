@@ -1,15 +1,18 @@
 //! The passes that take a body from [`MirPhase::Built`] to [`MirPhase::Runtime`], as rustc's
 //! `run_runtime_lowering_passes` does, in the order they run:
 //!
-//! 1. [`cleanup::hoist_indexing`]: a terminator unwinds only from what it calls.
-//! 2. [`cleanup::add_cleanup_paths`]: every call and drop names where it unwinds to.
-//! 3. [`elaborate_drops::elaborate_drops`]: every drop drops; drop flags are locals.
-//! 4. [`packed_drops::add_moves_for_packed_drops`]: what a packed struct leaves misaligned is
+//! 1. [`asserts::add_asserts`]: rustc's `Assert`s before what panics, with their own unwind
+//!    edges into the scopes' unwind drop tree, which lowering builds.
+//! 2. [`upvars::upvars_in_place`]: an `async` body uses its captures in place.
+//! 3. [`cleanup::remove_noop_landing_pads`]: an unwind edge to nothing but storage ends goes.
+//! 4. [`elaborate_drops::elaborate_drops`]: every drop drops; drop flags are locals.
+//! 5. [`packed_drops::add_moves_for_packed_drops`]: what a packed struct leaves misaligned is
 //!    moved out before it is dropped.
 //!
 //! None of them optimizes. The IDE never asks for these queries, so it never pays for them;
 //! the code generator and the interpreter do. `docs/mir-passes.md` has the design.
 
+mod asserts;
 mod cleanup;
 mod elaborate_drops;
 mod move_paths;
@@ -80,8 +83,20 @@ impl<'db> Ctx<'db> {
         crate::drop::destructor(self.db, adt).is_some()
     }
 
+    /// Whether a value of `ty` has nothing to drop and no cell in it.
+    fn is_plain(&self, ty: Ty<'db>) -> bool {
+        !self.needs_drop(ty) && crate::drop::is_freeze(self.db, self.infcx.interner, ty)
+    }
+
     fn bool_ty(&self) -> Ty<'db> {
         Ty::new_bool(self.infcx.interner)
+    }
+
+    /// The size of `ty` in bytes, if its layout is known where the body is generic.
+    fn size_of(&self, ty: Ty<'db>) -> Option<u64> {
+        let env = ParamEnvAndCrate { param_env: self.env, krate: self.krate };
+        let layout = self.db.layout_of_ty(ty.store(), env.store()).ok()?;
+        Some(layout.size.bytes())
     }
 
     /// The alignment of `ty`, if its layout is known where the body is generic.
@@ -96,9 +111,16 @@ impl<'db> Ctx<'db> {
 fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
     let ctx = Ctx::new(db, body.owner);
+    // `Assert`s first: lowering says where each panicking statement unwinds by its position.
+    asserts::add_asserts(&ctx, &mut body);
     upvars::upvars_in_place(&mut body);
-    cleanup::hoist_indexing(&ctx, &mut body);
-    cleanup::add_cleanup_paths(&ctx, &mut body);
+    body.promoted_constants = body
+        .promoted_locals
+        .iter()
+        .map(|&(local, _)| local)
+        .filter(|&local| ctx.is_plain(body.locals[local].ty.as_ref()))
+        .collect();
+    cleanup::remove_noop_landing_pads(&mut body);
     elaborate_drops::elaborate_drops(&ctx, &mut body)?;
     packed_drops::add_moves_for_packed_drops(&ctx, &mut body);
     body.phase = MirPhase::Runtime;

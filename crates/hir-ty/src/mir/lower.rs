@@ -111,6 +111,13 @@ struct MirLowerCtx<'a, 'db> {
     /// pattern is lowered (a `let` before its initializer), so locals are numbered in that
     /// order, which decides the order of what an `async` block keeps in its future.
     undeclared: FxHashSet<BindingId>,
+    /// rustc's unwind drop tree (`build/scope.rs`): a cleanup block per drop that scopes
+    /// schedule, keyed by the block unwinding goes on to after it, the local, and whether it
+    /// drops the value or ends the storage. Unwinding from anywhere goes through what is in
+    /// scope there, innermost first, and ways out of sibling scopes share what they have in
+    /// common, so what is in scope in one never meets what is in scope in another.
+    unwind_nodes: FxHashMap<(BasicBlockId, LocalId, bool), BasicBlockId>,
+    unwind_resume: Option<BasicBlockId>,
     /// The locals that hold an operand of an aggregate or a call lowered so far.
     operand_locals: FxHashSet<LocalId>,
     /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
@@ -258,8 +265,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 _ => false,
             },
             phase: MirPhase::Built,
-            panic_cleanup: None,
             upvars_in_place: Vec::new(),
+            panic_unwinds: Vec::new(),
+            promoted_constants: Vec::new(),
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -286,6 +294,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             inline_consts: 0,
             ends_temporaries: FxHashSet::default(),
             undeclared: FxHashSet::default(),
+            unwind_nodes: FxHashMap::default(),
+            unwind_resume: None,
             operand_locals: FxHashSet::default(),
             arm_unreached: false,
             or_choices: FxHashMap::default(),
@@ -1829,7 +1839,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         // No element takes the value, so it ends here.
                         (OperandKind::Copy(value), Some(0)) => {
                             let value = value.as_ref();
-                            let current = self.drop_assigned(value, element, current, span);
+                            let current = self.drop_assigned(value, element, current, span, None);
                             let empty = AggregateKind::Array(element.store());
                             let r = Rvalue::Aggregate(empty, Box::new([]));
                             self.push_assignment(current, place, r, span);
@@ -2245,6 +2255,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) -> Result<'db, Option<BasicBlockId>> {
         let b = if is_uninhabited { None } else { Some(self.new_basic_block()) };
+        let cleanup = self.unwind_here();
         self.set_terminator(
             current,
             TerminatorKind::Call {
@@ -2252,7 +2263,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 args,
                 destination: place.store(),
                 target: b,
-                cleanup: None,
+                cleanup,
                 from_hir_call: true,
             },
             span,
@@ -2466,7 +2477,112 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn push_statement(&mut self, block: BasicBlockId, statement: Statement) {
+        // A statement that panics unwinds as the `Assert` rustc has before it would.
+        if statement.kind.may_panic() && !self.result.basic_blocks[block].is_cleanup {
+            let at = self.result.basic_blocks[block].statements.len();
+            if let Some(unwind) = self.unwind_here() {
+                self.result.panic_unwinds.push((block, at, unwind));
+            }
+        }
         self.result.basic_blocks[block].statements.push(statement);
+    }
+
+    /// The unwind drop tree's way out from where lowering is: every scope's drops.
+    fn unwind_here(&mut self) -> Option<BasicBlockId> {
+        let in_scope: Vec<LocalId> =
+            self.drop_scopes.iter().flat_map(|it| it.locals.iter().copied()).collect();
+        self.unwind_through(&in_scope, None)
+    }
+
+    /// The way out of a drop of `locals[at]` of a scope that drops `locals`: what is declared
+    /// before it, then, in a coroutine, its own storage.
+    fn unwind_from_drop(&mut self, locals: &[LocalId], at: usize) -> Option<BasicBlockId> {
+        let local = locals[at];
+        let mut in_scope: Vec<LocalId> =
+            self.drop_scopes.iter().flat_map(|it| it.locals.iter().copied()).collect();
+        match in_scope.iter().position(|&it| it == local) {
+            Some(position) => in_scope.truncate(position),
+            None => in_scope.extend_from_slice(&locals[..at]),
+        }
+        self.unwind_through(&in_scope, Some(local))
+    }
+
+    /// The node of the unwind drop tree that drops `locals` last first, and before them ends
+    /// the storage of `storage_of`. A local's storage is ended on unwinding only in a coroutine,
+    /// as in rustc, where the coroutine transform reads storage liveness; `None` if there is
+    /// nothing to do on the way out.
+    fn unwind_through(
+        &mut self,
+        locals: &[LocalId],
+        storage_of: Option<LocalId>,
+    ) -> Option<BasicBlockId> {
+        let storage = self.result.coroutine.is_some();
+        let mut at = None;
+        for &local in locals {
+            if storage {
+                at = Some(self.unwind_node(at, local, false));
+            }
+            let ty = self.result.locals[local].ty.as_ref();
+            if !self.infcx.type_is_copy_modulo_regions(self.env, ty) {
+                at = Some(self.unwind_node(at, local, true));
+            }
+        }
+        if let (true, Some(local)) = (storage, storage_of) {
+            at = Some(self.unwind_node(at, local, false));
+        }
+        at
+    }
+
+    fn unwind_node(
+        &mut self,
+        parent: Option<BasicBlockId>,
+        local: LocalId,
+        value: bool,
+    ) -> BasicBlockId {
+        let parent = match parent {
+            Some(it) => it,
+            None => self.resume_block(),
+        };
+        if let Some(&node) = self.unwind_nodes.get(&(parent, local, value)) {
+            return node;
+        }
+        let (statements, kind) = match value {
+            true => (
+                Vec::new(),
+                TerminatorKind::Drop {
+                    place: Place::from(local).store(),
+                    target: parent,
+                    unwind: None,
+                },
+            ),
+            false => (
+                vec![StatementKind::StorageDead(local).with_span(MirSpan::Unknown)],
+                TerminatorKind::Goto { target: parent },
+            ),
+        };
+        let node = self.result.basic_blocks.alloc(BasicBlock {
+            statements,
+            terminator: Some(Terminator { span: MirSpan::Unknown, kind }),
+            is_cleanup: true,
+        });
+        self.unwind_nodes.insert((parent, local, value), node);
+        node
+    }
+
+    fn resume_block(&mut self) -> BasicBlockId {
+        if let Some(resume) = self.unwind_resume {
+            return resume;
+        }
+        let resume = self.result.basic_blocks.alloc(BasicBlock {
+            statements: Vec::new(),
+            terminator: Some(Terminator {
+                span: MirSpan::Unknown,
+                kind: TerminatorKind::UnwindResume,
+            }),
+            is_cleanup: true,
+        });
+        self.unwind_resume = Some(resume);
+        resume
     }
 
     fn push_fake_read(&mut self, block: BasicBlockId, p: Place<'db>, span: MirSpan) {
@@ -3059,12 +3175,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         };
         let interner = self.interner();
         let span = MirSpan::from(expr_id);
+        let awaitee_ty = self.expr_ty_after_adjustments(awaitee);
+        let future_ty = Ty::new_projection(interner, future_alias.into(), [awaitee_ty]);
+        // rustc's `into_future(e)` writes to a temporary made before what `e` makes.
+        let future = self.result.locals.alloc(Local { ty: future_ty.store() });
         let Some((awaitee_value, current)) = self.lower_expr_to_some_operand(awaitee, current)?
         else {
             return Ok(None);
         };
-        let awaitee_ty = self.expr_ty_after_adjustments(awaitee);
-        let future_ty = Ty::new_projection(interner, future_alias.into(), [awaitee_ty]);
         let output_ty = self.expr_ty_without_adjust(expr_id);
         let erased = Region::new_erased(interner);
         let future_ref_ty = Ty::new_ref(interner, erased, future_ty, Mutability::Mut);
@@ -3088,7 +3206,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
         // The future is dropped as soon as it is ready, before the rest of the statement runs.
         let scope = self.push_drop_scope();
-        let future: Place<'db> = self.temp(future_ty, current, MirSpan::Unknown)?.into();
+        self.push_storage_live_for_local(future, current, MirSpan::Unknown)?;
+        let future: Place<'db> = future.into();
         let Some(current) = self.lower_call(
             fn_operand(into_future, awaitee_ty),
             Box::new([awaitee_value]),
@@ -3283,21 +3402,36 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok(current)
     }
 
-    /// Drops the value an assignment is about to overwrite.
+    /// Drops the value an assignment of `value` is about to overwrite. If that drop unwinds,
+    /// the assignment still happens before the scopes' drops, so that the place is not dropped
+    /// twice: rustc's drop-and-replace. With no `value`, the place just goes.
     fn drop_assigned(
         &mut self,
         place: Place<'db>,
         ty: Ty<'db>,
         current: BasicBlockId,
         span: MirSpan,
+        value: Option<Rvalue>,
     ) -> BasicBlockId {
         if self.infcx.type_is_copy_modulo_regions(self.env, ty) {
             return current;
         }
         let next = self.new_basic_block();
+        let mut unwind = self.unwind_here();
+        if let Some(value) = value {
+            let target = match unwind {
+                Some(it) => it,
+                None => self.resume_block(),
+            };
+            unwind = Some(self.result.basic_blocks.alloc(BasicBlock {
+                statements: vec![StatementKind::Assign(place.store(), value).with_span(span)],
+                terminator: Some(Terminator { span, kind: TerminatorKind::Goto { target } }),
+                is_cleanup: true,
+            }));
+        }
         self.set_terminator(
             current,
-            TerminatorKind::Drop { place: place.store(), target: next, unwind: None },
+            TerminatorKind::Drop { place: place.store(), target: next, unwind },
             span,
         );
         next
@@ -3309,16 +3443,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         current: &mut Idx<BasicBlock>,
         span: MirSpan,
     ) {
-        for &l in scope.locals.iter().rev() {
+        for (at, &l) in scope.locals.iter().enumerate().rev() {
             if !self.infcx.type_is_copy_modulo_regions(self.env, self.result.locals[l].ty.as_ref())
             {
+                let unwind = self.unwind_from_drop(&scope.locals, at);
                 let prev = std::mem::replace(current, self.new_basic_block());
                 self.set_terminator(
                     prev,
                     TerminatorKind::Drop {
                         place: Place::from(l).store(),
                         target: *current,
-                        unwind: None,
+                        unwind,
                     },
                     span,
                 );
@@ -3669,13 +3804,17 @@ fn lower_closure_body<'db>(
         }
     }
     // What a pattern without bindings matches on is not read, so it is not captured either.
+    // The statement becomes a `Nop`, so that `panic_unwinds` still finds the others.
     for (_, block) in ctx.result.basic_blocks.iter_mut() {
-        block.statements.retain(|statement| match &statement.kind {
-            StatementKind::FakeRead(place) => upvar_map
-                .get(&place.local)
-                .is_none_or(|captures| captured_place(db, captures, place).is_some()),
-            _ => true,
-        });
+        for statement in &mut block.statements {
+            if let StatementKind::FakeRead(place) = &statement.kind
+                && upvar_map
+                    .get(&place.local)
+                    .is_some_and(|captures| captured_place(db, captures, place).is_none())
+            {
+                statement.kind = StatementKind::Nop;
+            }
+        }
     }
     let mut err = None;
     ctx.result.walk_places(|mir_place| {

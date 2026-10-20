@@ -471,14 +471,12 @@ pub(super) fn live_blocks(body: &MirBody<'_>) -> Vec<bool> {
         }
         let block = &body.basic_blocks[id];
         let Some(terminator) = &block.terminator else { continue };
-        let panics = !block.is_cleanup && block.statements.iter().any(|it| it.kind.may_panic());
         let next = terminator
             .kind
             .successors()
             .into_iter()
             .filter(|it| !unreached.contains(it))
-            .chain(terminator.kind.unwind())
-            .chain(panics.then_some(body.panic_cleanup).flatten());
+            .chain(terminator.kind.unwind());
         stack.extend(next.filter(|&it| !live[index(it)]));
     }
     live
@@ -537,12 +535,6 @@ impl InitAnalysis {
                 }
             };
             for at in 0..block.statements.len() {
-                if !block.is_cleanup
-                    && block.statements[at].kind.may_panic()
-                    && let Some(cleanup) = body.panic_cleanup
-                {
-                    flow(cleanup, &state, &mut entry, &mut pending);
-                }
                 let here =
                     effects.entry((id, at)).or_insert_with(|| effects_at(ctx, data, body, id, at));
                 for effect in here.iter() {

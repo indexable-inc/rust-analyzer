@@ -45,6 +45,49 @@ pub enum DropGlue {
     HasDropGlue,
 }
 
+/// Whether no part of a value of `ty` can change behind a shared reference: no `UnsafeCell`,
+/// no union, no type parameter. rustc promotes `&expr` only of such a type.
+pub fn is_freeze<'db>(db: &'db dyn HirDatabase, interner: DbInterner<'db>, ty: Ty<'db>) -> bool {
+    match ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never
+        | TyKind::Ref(..)
+        | TyKind::RawPtr(..)
+        | TyKind::FnPtr(..)
+        | TyKind::FnDef(..) => true,
+        TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
+            is_freeze(db, interner, element)
+        }
+        TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(db, interner, field)),
+        TyKind::Adt(def, args) => {
+            let variants: Vec<hir_def::VariantId> = match def.def_id() {
+                AdtId::StructId(id) => {
+                    if Some(id) == interner.lang_items().UnsafeCell {
+                        return false;
+                    }
+                    vec![id.into()]
+                }
+                AdtId::EnumId(id) => {
+                    id.enum_variants(db).variants.iter().map(|(_, it)| it.0.into()).collect()
+                }
+                AdtId::UnionId(_) => return false,
+            };
+            variants.into_iter().all(|variant| {
+                db.field_types(variant).iter().all(|(_, field)| {
+                    let ty = field.ty().instantiate(interner, args).skip_norm_wip();
+                    is_freeze(db, interner, ty)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
 pub fn has_drop_glue<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> DropGlue {
     has_drop_glue_impl(infcx, ty, env, &mut FxHashSet::default())
 }

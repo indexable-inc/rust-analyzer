@@ -463,7 +463,15 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     {
                         let local = self.binding_local(*binding)?;
                         let ty = self.result.locals[local].ty.as_ref();
-                        current = self.drop_assigned(local.into(), ty, current, pattern.into());
+                        let value =
+                            Operand { kind: OperandKind::Copy(cond_place.store()), span: None };
+                        current = self.drop_assigned(
+                            local.into(),
+                            ty,
+                            current,
+                            pattern.into(),
+                            Some(value.into()),
+                        );
                         self.push_match_assignment(
                             current,
                             local,
@@ -591,7 +599,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 };
                 let ty = self.expr_ty_without_adjust(expr);
                 let value = self.assigned_part(expr, cond_place)?;
-                let current = self.drop_assigned(lhs_place, ty, current, expr.into());
+                let current =
+                    self.drop_assigned(lhs_place, ty, current, expr.into(), Some(value.clone()));
                 self.push_assignment(current, lhs_place, value, expr.into());
                 (current, current_else)
             }

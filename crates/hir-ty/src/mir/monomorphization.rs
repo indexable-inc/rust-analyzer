@@ -286,10 +286,13 @@ impl<'db> Filler<'db> {
                         | Rvalue::Len(_)
                         | Rvalue::Discriminant(_)
                         | Rvalue::CopyForDeref(_) => (),
-                        Rvalue::ThreadLocalRef(n)
-                        | Rvalue::AddressOf(n)
-                        | Rvalue::BinaryOp(n)
-                        | Rvalue::NullaryOp(n) => match *n {},
+                        Rvalue::BinaryOp(_, lhs, rhs) => {
+                            self.fill_operand(lhs)?;
+                            self.fill_operand(rhs)?;
+                        }
+                        Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => {
+                            match *n {}
+                        }
                     },
                     StatementKind::InlineAsm(asm) => {
                         for operand in &mut asm.operands {
@@ -320,6 +323,19 @@ impl<'db> Filler<'db> {
                     TerminatorKind::SwitchInt { discr, .. } => {
                         self.fill_operand(discr)?;
                     }
+                    TerminatorKind::Assert { cond, msg, .. } => {
+                        self.fill_operand(cond)?;
+                        match msg {
+                            super::AssertKind::BoundsCheck { len: a, index: b }
+                            | super::AssertKind::Overflow(_, a, b) => {
+                                self.fill_operand(a)?;
+                                self.fill_operand(b)?;
+                            }
+                            super::AssertKind::OverflowNeg(a)
+                            | super::AssertKind::DivisionByZero(a)
+                            | super::AssertKind::RemainderByZero(a) => self.fill_operand(a)?,
+                        }
+                    }
                     TerminatorKind::Goto { .. }
                     | TerminatorKind::UnwindResume
                     | TerminatorKind::Abort
@@ -327,7 +343,6 @@ impl<'db> Filler<'db> {
                     | TerminatorKind::Unreachable
                     | TerminatorKind::Drop { .. }
                     | TerminatorKind::DropAndReplace { .. }
-                    | TerminatorKind::Assert { .. }
                     | TerminatorKind::Yield { .. }
                     | TerminatorKind::CoroutineDrop
                     | TerminatorKind::FalseEdge { .. }

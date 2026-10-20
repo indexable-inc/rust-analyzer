@@ -388,6 +388,63 @@ pub struct Terminator {
     pub kind: TerminatorKind,
 }
 
+/// What a failed [`TerminatorKind::Assert`] panics with: rustc's `AssertKind`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AssertKind {
+    BoundsCheck { len: Operand, index: Operand },
+    Overflow(BinOp, Operand, Operand),
+    OverflowNeg(Operand),
+    DivisionByZero(Operand),
+    RemainderByZero(Operand),
+}
+
+impl AssertKind {
+    /// A check a crate that compiles without overflow checks does not make, as rustc's
+    /// `is_optional_overflow_check`: the body has it whatever the crate does.
+    pub fn is_optional_overflow_check(&self) -> bool {
+        matches!(
+            self,
+            AssertKind::OverflowNeg(_)
+                | AssertKind::Overflow(
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Shl | BinOp::Shr,
+                    ..
+                )
+        )
+    }
+
+    pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
+        match self {
+            AssertKind::BoundsCheck { len, index } => {
+                f(len);
+                f(index);
+            }
+            AssertKind::Overflow(_, a, b) => {
+                f(a);
+                f(b);
+            }
+            AssertKind::OverflowNeg(a)
+            | AssertKind::DivisionByZero(a)
+            | AssertKind::RemainderByZero(a) => f(a),
+        }
+    }
+
+    pub(crate) fn for_each_operand(&self, f: &mut impl FnMut(&Operand)) {
+        match self {
+            AssertKind::BoundsCheck { len, index } => {
+                f(len);
+                f(index);
+            }
+            AssertKind::Overflow(_, a, b) => {
+                f(a);
+                f(b);
+            }
+            AssertKind::OverflowNeg(a)
+            | AssertKind::DivisionByZero(a)
+            | AssertKind::RemainderByZero(a) => f(a),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum TerminatorKind {
     /// Block has one successor; we continue execution there.
@@ -536,7 +593,7 @@ pub enum TerminatorKind {
     Assert {
         cond: Operand,
         expected: bool,
-        //msg: AssertMessage,
+        msg: AssertKind,
         target: BasicBlockId,
         cleanup: Option<BasicBlockId>,
     },
@@ -735,6 +792,10 @@ pub enum BinOp {
     Gt,
     /// The `ptr.offset` operator
     Offset,
+    /// `(a + b, overflowed)`, as rustc's: the check an overflowing `+` gets in runtime MIR.
+    AddWithOverflow,
+    SubWithOverflow,
+    MulWithOverflow,
 }
 
 impl BinOp {
@@ -786,6 +847,9 @@ impl Display for BinOp {
             BinOp::Ge => ">=",
             BinOp::Gt => ">",
             BinOp::Offset => "`offset`",
+            BinOp::AddWithOverflow => "`AddWithOverflow`",
+            BinOp::SubWithOverflow => "`SubWithOverflow`",
+            BinOp::MulWithOverflow => "`MulWithOverflow`",
         })
     }
 }
@@ -920,8 +984,11 @@ pub enum Rvalue {
     ///   types and return a value of that type.
     /// * The remaining operations accept signed integers, unsigned integers, or floats with
     ///   matching types and return a value of that type.
-    //BinaryOp(BinOp, Box<(Operand, Operand)>),
-    BinaryOp(std::convert::Infallible),
+    ///
+    /// From [`MirPhase::Runtime`] on, this is the only binary operation: it never panics, the
+    /// checks rustc makes are `Assert`s before it, and `AddWithOverflow` and the like give the
+    /// value with whether it overflowed. Built bodies use `CheckedBinaryOp` instead.
+    BinaryOp(BinOp, Operand, Operand),
 
     /// Same as `BinaryOp`, but yields `(T, bool)` with a `bool` indicating an error condition.
     ///
@@ -1063,9 +1130,9 @@ pub struct BasicBlock {
 }
 
 impl StatementKind {
-    /// Whether the statement may panic: index out of bounds, overflow, division by zero. From
-    /// [`MirPhase::Runtime`] on such a panic unwinds to [`MirBody::panic_cleanup`]; no other
-    /// statement unwinds.
+    /// Whether the statement may panic in a built body: index out of bounds, overflow, division
+    /// by zero. From [`MirPhase::Runtime`] on each of these is an `Assert` before the statement,
+    /// and no statement panics.
     pub fn may_panic(&self) -> bool {
         let indexes = |place: &StoredPlace| {
             place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(_)))
@@ -1140,7 +1207,7 @@ impl Rvalue {
         match self {
             Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) => f(it),
             Rvalue::UnaryOp(_, it) => f(it),
-            Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+            Rvalue::CheckedBinaryOp(_, lhs, rhs) | Rvalue::BinaryOp(_, lhs, rhs) => {
                 f(lhs);
                 f(rhs);
             }
@@ -1149,10 +1216,9 @@ impl Rvalue {
             | Rvalue::Len(_)
             | Rvalue::Discriminant(_)
             | Rvalue::CopyForDeref(_) => (),
-            Rvalue::ThreadLocalRef(n)
-            | Rvalue::AddressOf(n)
-            | Rvalue::BinaryOp(n)
-            | Rvalue::NullaryOp(n) => match *n {},
+            Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => {
+                match *n {}
+            }
         }
     }
 
@@ -1160,7 +1226,7 @@ impl Rvalue {
         match self {
             Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) => f(it),
             Rvalue::UnaryOp(_, it) => f(it),
-            Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+            Rvalue::CheckedBinaryOp(_, lhs, rhs) | Rvalue::BinaryOp(_, lhs, rhs) => {
                 f(lhs);
                 f(rhs);
             }
@@ -1169,10 +1235,9 @@ impl Rvalue {
             | Rvalue::Len(_)
             | Rvalue::Discriminant(_)
             | Rvalue::CopyForDeref(_) => (),
-            Rvalue::ThreadLocalRef(n)
-            | Rvalue::AddressOf(n)
-            | Rvalue::BinaryOp(n)
-            | Rvalue::NullaryOp(n) => match *n {},
+            Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => {
+                match *n {}
+            }
         }
     }
 }
@@ -1181,9 +1246,12 @@ impl TerminatorKind {
     pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
         match self {
             TerminatorKind::SwitchInt { discr: it, .. }
-            | TerminatorKind::Assert { cond: it, .. }
             | TerminatorKind::Yield { value: it, .. }
             | TerminatorKind::DropAndReplace { value: it, .. } => f(it),
+            TerminatorKind::Assert { cond, msg, .. } => {
+                f(cond);
+                msg.for_each_operand_mut(f);
+            }
             TerminatorKind::Call { func, args, .. } => {
                 f(func);
                 args.iter_mut().for_each(f);
@@ -1203,9 +1271,12 @@ impl TerminatorKind {
     pub(crate) fn for_each_operand(&self, f: &mut impl FnMut(&Operand)) {
         match self {
             TerminatorKind::SwitchInt { discr: it, .. }
-            | TerminatorKind::Assert { cond: it, .. }
             | TerminatorKind::Yield { value: it, .. }
             | TerminatorKind::DropAndReplace { value: it, .. } => f(it),
+            TerminatorKind::Assert { cond, msg, .. } => {
+                f(cond);
+                msg.for_each_operand(f);
+            }
             TerminatorKind::Call { func, args, .. } => {
                 f(func);
                 args.iter().for_each(f);
@@ -1301,15 +1372,20 @@ pub struct MirBody<'db> {
     pub inherits_overflow_checks: bool,
     /// Which passes the body has been through: see [`MirPhase`].
     pub phase: MirPhase,
-    /// From [`MirPhase::Runtime`] on, the cleanup block a statement that panics unwinds to: an
-    /// index out of bounds, an overflow, a division by zero. rustc has an `Assert` terminator
-    /// for each of these; here they stay inside the statement, so they share one target.
-    pub panic_cleanup: Option<BasicBlockId>,
     /// From [`MirPhase::Runtime`] on, in the body of an `async` block: the locals lowering
     /// copied each capture into, which are the captures themselves, the field of the future
     /// with the index next to each. They hold their value when the body starts and are kept in
     /// the future's prefix, as rustc uses captures in place (`(_1.0)`).
     pub upvars_in_place: Vec<(LocalId, u32)>,
+    /// In a built body, the cleanup block each statement that may panic unwinds to, by its
+    /// block and index: where the `Assert` rustc has before it unwinds. The pass that makes
+    /// those `Assert`s (`transform::asserts`) uses it up.
+    pub panic_unwinds: Vec<(BasicBlockId, usize, BasicBlockId)>,
+    /// From [`MirPhase::Runtime`] on, the promoted locals rustc promotes: of a type with
+    /// nothing to drop and no cell in it. rustc's `PromoteTemps` makes the borrow of such a
+    /// temporary a constant and the temporary goes, so it is never kept across a yield; the
+    /// code generator gives it read-only or static memory.
+    pub promoted_constants: Vec<LocalId>,
 }
 
 /// What a body means, which depends on the passes it has been through. The IDE only ever
@@ -1317,16 +1393,18 @@ pub struct MirBody<'db> {
 /// [`MirPhase::Runtime`], which is computed on its own (`runtime_mir_body` and the like).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum MirPhase {
-    /// As lowering builds it. A `Drop` drops what the place holds if it holds anything, which
-    /// the code that runs it has to keep track of, and nothing unwinds: every `cleanup` and
-    /// `unwind` is `None`.
+    /// As lowering builds it, as rustc's MIR building does. A `Drop` drops what the place holds
+    /// if it holds anything, which the code that runs it has to keep track of. Calls and drops
+    /// unwind into the scopes' unwind drop tree: cleanup blocks that drop what is in scope,
+    /// innermost first, and in a coroutine end the storage of each, then `UnwindResume`. A
+    /// statement may panic (`CheckedBinaryOp`, an index), unwinding where
+    /// [`MirBody::panic_unwinds`] says.
     #[default]
     Built,
     /// After drop elaboration, as rustc's `MirPhase::Runtime`. Every `Drop` drops, and
     /// whether it runs is decided by the blocks around it, which read drop flags that are
-    /// ordinary `bool` locals. Every call and drop outside a cleanup block names the cleanup
-    /// block it unwinds to, as does [`MirBody::panic_cleanup`] for statements; cleanup blocks
-    /// end in `UnwindResume`. A drop in a cleanup block that unwinds aborts.
+    /// ordinary `bool` locals. What panics is an `Assert`, with an unwind edge of its own, and
+    /// no statement panics. A drop in a cleanup block that unwinds aborts.
     Runtime,
 }
 
@@ -1390,7 +1468,7 @@ impl MirBody<'_> {
                             | Rvalue::Discriminant(p)
                             | Rvalue::Len(p)
                             | Rvalue::Ref(_, p) => f(p),
-                            Rvalue::CheckedBinaryOp(_, o1, o2) => {
+                            Rvalue::CheckedBinaryOp(_, o1, o2) | Rvalue::BinaryOp(_, o1, o2) => {
                                 for_operand(o1, &mut f);
                                 for_operand(o2, &mut f);
                             }
@@ -1401,7 +1479,6 @@ impl MirBody<'_> {
                             }
                             Rvalue::ThreadLocalRef(n)
                             | Rvalue::AddressOf(n)
-                            | Rvalue::BinaryOp(n)
                             | Rvalue::NullaryOp(n) => match *n {},
                         }
                     }
@@ -1455,8 +1532,9 @@ impl MirBody<'_> {
                         args.iter_mut().for_each(|x| for_operand(x, &mut f));
                         f(destination);
                     }
-                    TerminatorKind::Assert { cond, .. } => {
+                    TerminatorKind::Assert { cond, msg, .. } => {
                         for_operand(cond, &mut f);
+                        msg.for_each_operand_mut(&mut |it| for_operand(it, &mut f));
                     }
                     TerminatorKind::Yield { value, resume_arg, .. } => {
                         for_operand(value, &mut f);
@@ -1514,10 +1592,13 @@ impl MirBody<'_> {
             scope_ends,
             inherits_overflow_checks: _,
             phase: _,
-            panic_cleanup: _,
             upvars_in_place,
+            panic_unwinds,
+            promoted_constants,
         } = self;
+        promoted_constants.shrink_to_fit();
         upvars_in_place.shrink_to_fit();
+        panic_unwinds.shrink_to_fit();
         unreached.shrink_to_fit();
         scope_ends.shrink_to_fit();
         promoted_locals.shrink_to_fit();

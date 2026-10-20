@@ -7,8 +7,7 @@
 //! with the same conflicts, and `rustc_abi`'s coroutine layout places them as rustc does.
 //!
 //! rustc's runtime body has had its `FakeRead`s removed (`CleanupPostBorrowck`); they are
-//! ignored here. A statement that panics stands for rustc's `Assert` before it: it unwinds to
-//! [`MirBody::panic_cleanup`] with what held before the statement.
+//! ignored here. No statement unwinds: what panics is an `Assert` before it.
 
 use rustc_index::bit_set::DenseBitSet;
 use smallvec::SmallVec;
@@ -109,13 +108,6 @@ fn edges<'a>(body: &MirBody<'_>, terminator: &'a Terminator) -> SmallVec<[Edge<'
     edges
 }
 
-fn panics(body: &MirBody<'_>, id: BasicBlockId, statement: &Statement) -> Option<BasicBlockId> {
-    if body.basic_blocks[id].is_cleanup || !statement.kind.may_panic() {
-        return None;
-    }
-    body.panic_cleanup
-}
-
 /// The blocks control reaches from the start.
 fn reachable(body: &MirBody<'_>) -> Vec<bool> {
     let mut reached = vec![false; body.basic_blocks.len()];
@@ -125,9 +117,6 @@ fn reachable(body: &MirBody<'_>) -> Vec<bool> {
             continue;
         }
         let block = &body.basic_blocks[id];
-        for statement in &block.statements {
-            stack.extend(panics(body, id, statement));
-        }
         if let Some(terminator) = &block.terminator {
             for edge in edges(body, terminator) {
                 let (Edge::Plain(to) | Edge::Returns(to, _) | Edge::Resumes(to, _)) = edge;
@@ -231,8 +220,12 @@ impl MirBody<'_> {
             if let Some(receiver) = receiver {
                 live.remove(receiver);
             }
-            // What the body uses in place of a capture is the future's own field.
+            // What the body uses in place of a capture is the future's own field, and a
+            // promoted constant is no local of rustc's.
             for &(local, _) in &self.upvars_in_place {
+                live.remove(local_index(local));
+            }
+            for &local in &self.promoted_constants {
                 live.remove(local_index(local));
             }
             any.union(&live);
@@ -388,9 +381,6 @@ impl MirBody<'_> {
             let (mut borrowed, mut requires) = self.entry_states(&forward, id);
             let block = &self.basic_blocks[id];
             for statement in &block.statements {
-                if let Some(cleanup) = panics(self, id, statement) {
-                    flow(&mut forward, &mut worklist, cleanup, &borrowed, &requires);
-                }
                 self.storage_statement(statement, &mut borrowed, &mut requires, &mut |_| ());
             }
             let Some(terminator) = &block.terminator else { continue };
@@ -452,9 +442,6 @@ impl MirBody<'_> {
                 }
                 for statement in block.statements.iter().rev() {
                     live_statement(&statement.kind, &mut state);
-                    if let Some(cleanup) = panics(self, id, statement) {
-                        state.union(&live_in[block_index(cleanup)]);
-                    }
                 }
                 if live_in[block_index(id)] != state {
                     live_in[block_index(id)] = state;

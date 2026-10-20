@@ -57,9 +57,9 @@ use crate::{
 };
 
 use super::{
-    AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError, MirPhase,
-    MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, return_slot,
+    AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError,
+    MirPhase, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue,
+    StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 
 mod shim;
@@ -890,6 +890,15 @@ impl<'db> Evaluator<'db> {
                         not_supported!("block without terminator");
                     };
                     match &terminator.kind {
+                        TerminatorKind::Assert { cond, expected, msg, target, .. } => {
+                            let holds = self.eval_operand(cond, locals)?.get(self)?[0] != 0;
+                            let skipped =
+                                msg.is_optional_overflow_check() && !self.checks_overflow(locals);
+                            if holds != *expected && !skipped {
+                                return Err(MirEvalError::Panic(self.assert_message(msg, locals)?));
+                            }
+                            current_block_idx = *target;
+                        }
                         TerminatorKind::Goto { target } => {
                             current_block_idx = *target;
                         }
@@ -1164,7 +1173,9 @@ impl<'db> Evaluator<'db> {
                     Owned(c)
                 }
             }
-            Rvalue::CheckedBinaryOp(op, lhs, rhs) => 'binary_op: {
+            Rvalue::CheckedBinaryOp(op, lhs, rhs) | Rvalue::BinaryOp(op, lhs, rhs) => 'binary_op: {
+                // In runtime MIR the checks are `Assert`s before the operation, which wraps.
+                let checked = matches!(r, Rvalue::CheckedBinaryOp(..));
                 let lc = self.eval_operand(lhs, locals)?;
                 let rc = self.eval_operand(rhs, locals)?;
                 let mut lc = lc.get(self)?;
@@ -1355,7 +1366,7 @@ impl<'db> Evaluator<'db> {
                         | BinOp::Div
                         | BinOp::Rem
                         | BinOp::Sub => {
-                            let wraps = !self.checks_overflow(locals);
+                            let wraps = !checked || !self.checks_overflow(locals);
                             let r = match op {
                                 BinOp::Add if wraps => l128.wrapping_add(r128),
                                 BinOp::Mul if wraps => l128.wrapping_mul(r128),
@@ -1385,7 +1396,7 @@ impl<'db> Evaluator<'db> {
                         BinOp::Shl | BinOp::Shr => {
                             let r = 'b: {
                                 let bits = lc.len() as u32 * 8;
-                                let amount = if self.checks_overflow(locals) {
+                                let amount = if checked && self.checks_overflow(locals) {
                                     r128.as_u32()
                                 } else {
                                     // An unchecked shift takes the low bits of its amount.
@@ -1409,6 +1420,24 @@ impl<'db> Evaluator<'db> {
                                 return Err(MirEvalError::Panic(format!("Overflow in {op:?}")));
                             };
                             Owned(r.to_bytes())
+                        }
+                        BinOp::AddWithOverflow
+                        | BinOp::SubWithOverflow
+                        | BinOp::MulWithOverflow => {
+                            let (value, overflowed) = match op {
+                                BinOp::AddWithOverflow => {
+                                    (l128.wrapping_add(r128), l128.checked_add(r128).is_none())
+                                }
+                                BinOp::SubWithOverflow => {
+                                    (l128.wrapping_sub(r128), l128.checked_sub(r128).is_none())
+                                }
+                                _ => (l128.wrapping_mul(r128), l128.checked_mul(r128).is_none()),
+                            };
+                            // `(T, bool)`: the value, the flag, and padding to twice `T`.
+                            let mut bytes = value.to_bytes();
+                            bytes.push(u8::from(overflowed));
+                            bytes.resize(2 * lc.len(), 0);
+                            Owned(bytes)
                         }
                         BinOp::Offset => not_supported!("offset binop"),
                     }
@@ -1625,10 +1654,27 @@ impl<'db> Evaluator<'db> {
                     Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec())
                 }
             },
-            Rvalue::ThreadLocalRef(n)
-            | Rvalue::AddressOf(n)
-            | Rvalue::BinaryOp(n)
-            | Rvalue::NullaryOp(n) => match *n {},
+            Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => match *n {},
+        })
+    }
+
+    /// What a failed `Assert` panics with: the words the interpreter has always used for an
+    /// overflow, and rustc's for an index out of bounds.
+    fn assert_message(
+        &mut self,
+        msg: &AssertKind,
+        locals: &mut Locals<'db>,
+    ) -> Result<'db, String> {
+        Ok(match msg {
+            AssertKind::BoundsCheck { len, index } => {
+                let len = from_bytes!(usize, self.eval_operand(len, locals)?.get(self)?);
+                let index = from_bytes!(usize, self.eval_operand(index, locals)?.get(self)?);
+                format!("index out of bounds: the len is {len} but the index is {index}")
+            }
+            AssertKind::Overflow(op, ..) => format!("Overflow in {op:?}"),
+            AssertKind::OverflowNeg(_) => "Overflow in Neg".to_owned(),
+            AssertKind::DivisionByZero(_) => "Overflow in Div".to_owned(),
+            AssertKind::RemainderByZero(_) => "Overflow in Rem".to_owned(),
         })
     }
 

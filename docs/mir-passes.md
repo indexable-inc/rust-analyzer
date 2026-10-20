@@ -13,15 +13,16 @@ The code is `crates/hir-ty/src/mir/transform.rs` and `transform/`.
 `MirBody::phase` is `MirPhase::Built` or `MirPhase::Runtime`.
 
 - **Built** is what lowering produces, and what every IDE feature reads (`mir_body`,
-  `monomorphized_mir_body`, borrowck, diagnostics). A `Drop` there drops what the place holds
-  *if* it holds anything; no call or drop names where it unwinds to.
+  `monomorphized_mir_body`, diagnostics). A `Drop` there drops what the place holds *if* it
+  holds anything. Calls and drops unwind into the scopes' unwind drop tree, as rustc's MIR
+  building makes it. A statement can panic (`CheckedBinaryOp`, an `Index`), and
+  `MirBody::panic_unwinds` says where to.
 - **Runtime** is rustc's `MirPhase::Runtime(PostCleanup)` minus optimizations:
   - every `Drop` drops;
   - whether a drop runs is decided by the blocks around it, which read drop flags that are
     ordinary `bool` locals;
-  - every call and drop outside a cleanup block names the cleanup block it unwinds to;
-  - `MirBody::panic_cleanup` is where a statement that panics (index out of bounds, overflow,
-    division by zero) unwinds to;
+  - what panics is an `Assert` terminator before it, with its own unwind edge, and the only
+    binary operation is the non-panicking `BinaryOp` (with `AddWithOverflow` and the like);
   - cleanup blocks end in `UnwindResume`.
 
 The runtime bodies are separate salsa queries, so the IDE never computes them:
@@ -45,24 +46,34 @@ and none is dropped. An inline `const { .. }` is lowered in place into a tempora
 **Constant indices from the end** count as rustc's do: `ConstantIndex { offset, from_end: true }`
 with offset 1 is the last element. RA's lowering used 0.
 
+**Unwind drop trees**, as `rustc_mir_build/src/builder/scope.rs` builds them. Every call, drop
+and panicking statement unwinds to the node of the tree for what is in scope where it is:
+what every scope holds, last declared first, its value dropped if it needs dropping and, in a
+coroutine, its storage ended. Nodes are cleanup blocks keyed by the node unwinding goes on to,
+so ways out of sibling scopes share what they have in common and never what they do not
+(rustc's cached exits). A drop at a scope's end unwinds through what was declared before the
+local it drops. The drop before an assignment (`drop_assigned`) unwinds to a block that still
+assigns: rustc's drop-and-replace. Before, one chain of drops for the whole body was built
+after lowering.
+
 ## The passes, in order
 
-1. **`cleanup::hoist_indexing`**: makes a terminator unwind only from what it calls. A
-   terminator operand that reads through an `Index` projection, the destination of a call
-   that is indexed, and an indexed drop get the indexing moved into a statement before them.
-   That statement can panic, and it unwinds through `panic_cleanup`.
-2. **`cleanup::add_cleanup_paths`**: builds the cleanup chain and points every call, drop and
-   panicking statement outside cleanup at it.
-   - The chain is one `Drop(local)` block per local the body drops, in reverse scope order:
-     the order the code generator's landing pad used, ported from it.
-   - A drop in a cleanup block has no unwind edge.
-   - `place = value` on a field (a drop followed by the assignment) gets a cleanup block that
-     still does the assignment before joining the chain, so that the place is not dropped
-     twice: rustc's drop-and-replace.
+1. **`asserts::add_asserts`**: rustc's checks, as its MIR building makes them, each an
+   `Assert` with the unwind edge lowering recorded for the statement:
+   - `a + b`, `a - b`, `a * b`: `t = AddWithOverflow(a, b); assert(!t.1); x = t.0`;
+   - `a / b`, `a % b`: `assert(b != 0)`, and for signed integers `assert(!(b == -1 && a == MIN))`;
+   - `a << b`, `a >> b`: `assert(b as unsigned < BITS)`;
+   - `-a`: `assert(a != MIN)`;
+   - `base[i]`: `len = Len(base); assert(i < len)`, at the index expression.
 
-   One chain for the whole body keeps the code generator's behaviour. rustc's per-scope drop
-   trees give each call a shorter chain; the flags make the two equivalent in what they drop.
-3. **`elaborate_drops::elaborate_drops`**: a port of rustc's `elaborate_drops` and
+   Overflow checks are made where rustc makes them: in a crate that checks overflow, in a
+   function with `#[rustc_inherit_overflow_checks]` and in every constant and static. They are
+   optional checks, which the code generator and the interpreter skip where the instance does
+   not check overflow, as rustc's codegen does. Every `CheckedBinaryOp` becomes a `BinaryOp`.
+2. **`upvars::upvars_in_place`**: see Coroutines.
+3. **`cleanup::remove_noop_landing_pads`**: rustc's `RemoveNoopLandingPads`. An unwind edge to
+   a cleanup block that only ends storage on the way to `UnwindResume` goes.
+4. **`elaborate_drops::elaborate_drops`**: a port of rustc's `elaborate_drops` and
    `DropCtxt`.
    - *Move paths* (`move_paths.rs`) are created for:
      - every local that needs drop (promoted constants are never dropped);
@@ -70,8 +81,7 @@ with offset 1 is the last element. RA's lowering used 0.
        tuples and closures; enum variants (`Downcast`); `Box` contents; constant indices and
        subslices of arrays, by element.
    - *Init analysis*: a forward maybe-init / maybe-uninit dataflow over the move paths.
-     - Unwind edges are taken before each panicking statement and after each terminator's
-       effects.
+     - Unwind edges are taken after each terminator's effects.
      - A call initializes its destination only on its normal edge.
      - Blocks in `unreached` are not executed.
    - *Each drop* is one of:
@@ -86,13 +96,14 @@ with offset 1 is the last element. RA's lowering used 0.
        - a `Box` drops its contents, then `<Box as Drop>::drop`, then its fields;
        - an array drops its elements.
    - *Flags*:
-     - one `bool` per path that needs one, written right after each statement that
+     - one `bool` per path that needs one, all made before any drop is elaborated, in
+       rustc's order (`collect_drop_flags`), written right after each statement that
        initializes or moves out of it, so that a statement that panics unwinds with the state
        before it;
      - a call's destination flag is written on its normal edge;
      - flags are cleared after each elaborated drop, on the normal and the unwind edge;
      - flags are set at entry from the parameters.
-4. **`packed_drops::add_moves_for_packed_drops`**: a drop of a field that a `#[repr(packed)]`
+5. **`packed_drops::add_moves_for_packed_drops`**: a drop of a field that a `#[repr(packed)]`
    struct leaves misaligned is turned into a move to an aligned temporary and a drop of that.
 
 There are no optimization passes: no inlining, GVN, SROA, const propagation or simplification.
@@ -142,24 +153,28 @@ building does, because it decides which locals are kept, in which order, in whic
   them in block order after `SimplifyCfg`, which never moves a yield: its block is an arm of
   the switch on the poll result, not the target of a `goto` it could be merged into.
 
-What still differs:
-- **Unwind paths.** rustc builds an unwind drop tree per scope, and in coroutines it emits
-  `StorageDead` on it. Here every call and panicking statement unwinds to one chain for the
-  whole body (`cleanup::add_cleanup_paths`), so the storage states of all unwind points meet
-  at its head, and two kept locals that rustc can overlap may be recorded as conflicting
-  there. Adding `StorageDead` to the chain does not change that. It needs per-scope unwind
-  trees from lowering, and, because statements that panic share `panic_cleanup`, `Assert`
-  terminators for overflow and bounds checks.
-- **Temporaries.** RA makes a temporary for a `let` initializer that rustc lowers straight
-  into the binding, allocates a call's argument temporaries before its destination where
-  rustc does the opposite, and so on. These are rarely kept across a yield, but where they
-  are, their order can differ.
-- **Promotion and cleanup.** rustc's body has had constants promoted, fake reads removed and
-  `Derefer` run before the transform.
+- **Unwind paths.** Lowering builds rustc's unwind drop trees, with `StorageDead` on them in
+  coroutines, and checks are `Assert`s with their own unwind edges, so what is in scope in one
+  scope is never seen with what is in scope in another.
+- **Temporaries.** A temporary is made before what is lowered into it, as rustc's `as_temp`
+  does, and `into_future`'s destination before the awaited expression's temporaries.
+- **Promotion.** The promoted locals rustc promotes (nothing to drop, no cell) are never kept
+  for a yield (`MirBody::promoted_constants`); rustc's `PromoteTemps` makes them constants.
 
-Until these match, ra-jit keeps a future and everything that makes, polls or drops it on one
-side (rustc's or its own); `RA_JIT_MIX_FUTURES=1` lifts that to measure how close the layouts
-are (`harness/mixfutures`).
+rustc's other passes before the coroutine transform change nothing that is kept: its
+post-borrowck cleanup removes fake reads (ignored here) and fake borrows (RA makes none),
+`SimplifyCfg` and `Derefer` do not change which locals live across a yield, and
+`RemoveStorageMarkers` runs only in the optimizations, after it.
+
+What may still differ: where a temporary's scope ends in an expression RA lowers otherwise
+than rustc (edition-dependent tail and condition temporaries, `for`, `?`), an array's
+bounds check reading its length into a temporary where rustc uses the constant, and
+`AbortUnwindingCalls`, which drops the unwind edges of calls that cannot unwind. These change
+what a future keeps only where such a temporary lives across a yield, or a no-unwind call
+changes which unwind paths there are.
+
+ra-jit mixes futures by default now; `RA_JIT_SPLIT_FUTURES=1` keeps a future and everything
+that makes, polls or drops it on one side, until mixing is verified (`harness/mixfutures`).
 
 ## What the consumers do with it
 
@@ -169,8 +184,12 @@ generates nothing else:
 - `Drop` is `drop_in_place` and a jump;
 - each cleanup block a call unwinds to gets its own landing pad, which keeps the exception
   and jumps to the block;
-- `UnwindResume` resumes with the kept exception.
-
+- `UnwindResume` resumes with the kept exception;
+- `Assert` branches to rustc's `panic_const_*` or `panic_bounds_check`, through the landing pad
+  of its unwind edge, and skips an optional overflow check where overflow is not checked; no
+  place it reads checks an index, and no operation panics on its own (the bounds checks in
+  `element`, the overflow and division checks in `binary_op`, the index spans and the
+  `FakeRead` of an indexed place are deleted);
 - an `async` body that unwinds stores the panicked state before resuming;
 - dropping a suspended future enters the drop path of the yield it is suspended at; one that
   never started drops its upvars.
@@ -182,20 +201,13 @@ drops, the landing pad that dropped live locals, flags in the future's prefix.
 
 **The interpreter** runs Runtime bodies only, promoted constants included: a `Drop` drops. Its
 place-set drop tracking (`DropFlags`) is deleted, and a body that is not elaborated (an `async`
-body, which it can't run anyway) is reported as not supported.
+body, which it can't run anyway) is reported as not supported. A failed `Assert` is a panic
+with the words its own checks used (`Overflow in Add`, `index out of bounds: ..`).
 
 ## Not done yet
 
 - **Abort on unwind.** A drop in a cleanup block that unwinds should abort (rustc's
   `UnwindAction::Terminate`); it continues unwinding today, which is what codegen did before.
-  `nounwind` callees do not yet get `Terminate` edges.
-- **Panics inside statements.** RA's MIR has no `Assert` terminator: `CheckedBinaryOp`
-  panics on overflow and an `Index` projection panics out of bounds, in the middle of a
-  statement. rustc's MIR computes the overflow bit or `Len` and `Lt`, then branches with
-  `Assert`. Lowering both as rustc does would delete `panic_cleanup`, the
-  `hoist_indexing` pass, and codegen's `index_spans` and `FakeRead` of an indexed place.
+  `nounwind` callees do not yet lose their unwind edges (`AbortUnwindingCalls`).
 - **Subslices of arrays.** `Subslice { from, to }` always counts `to` from the end; rustc's
   has `from_end` and counts from the start for arrays.
-- **Temporary drop order in lowering.** Temporaries are dropped where RA's lowering puts
-  their scope ends. The differential tests and the fuzzer show no difference from rustc on
-  the cases they cover, but no rustc-style scope tree was built.
