@@ -1858,7 +1858,7 @@ impl Function {
                 "evaluation of builtin derive impl methods is not supported".to_owned(),
             )));
         };
-        let body = db.monomorphized_mir_body(
+        let body = db.monomorphized_runtime_mir_body(
             id.into(),
             GenericArgs::empty().store(),
             ParamEnvAndCrate {

@@ -32,7 +32,7 @@ fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), 
             })
             .expect("no main function found");
         let body = db
-            .monomorphized_mir_body(
+            .monomorphized_runtime_mir_body(
                 func_id.into(),
                 GenericArgs::empty().store(),
                 crate::ParamEnvAndCrate {

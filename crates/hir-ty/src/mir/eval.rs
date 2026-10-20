@@ -57,9 +57,9 @@ use crate::{
 };
 
 use super::{
-    AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError, MirSpan,
-    Operand, OperandKind, Place, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, return_slot,
+    AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError, MirPhase,
+    MirSpan, Operand, OperandKind, Place, PlaceElem, PlaceTy, ProjectionElem, Rvalue,
+    StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 
 mod shim;
@@ -3034,7 +3034,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
     ) -> Result<'db, Option<StackFrame<'a, 'db>>> {
         let mir_body = self
             .db
-            .monomorphized_mir_body_for_closure(
+            .monomorphized_runtime_mir_body_for_closure(
                 closure,
                 generic_args.store(),
                 self.param_env.store(),
@@ -3149,7 +3149,11 @@ impl<'a, 'db> Evaluator<'a, 'db> {
 
             let mir_body = self
                 .db
-                .monomorphized_mir_body(imp.into(), generic_args.store(), self.param_env.store())
+                .monomorphized_runtime_mir_body(
+                    imp.into(),
+                    generic_args.store(),
+                    self.param_env.store(),
+                )
                 .map_err(|e| {
                     MirEvalError::InFunction(
                         Box::new(MirEvalError::MirLowerError(imp, e)),
@@ -3411,7 +3415,9 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         span: MirSpan,
     ) -> Result<'db, ()> {
         let (addr, ty, metadata) = self.place_addr_and_ty_and_metadata(place, locals)?;
-        if !locals.drop_flags.remove_place(place.as_ref()) {
+        // After drop elaboration a `Drop` drops; before it, what was moved out says whether.
+        let built = locals.body.phase == MirPhase::Built;
+        if !locals.drop_flags.remove_place(place.as_ref()) && built {
             return Ok(());
         }
         let metadata = match metadata {
@@ -3443,7 +3449,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         );
         if let Either::Left(drop_impl) = drop_impl
             && matches!(drop_impl.lookup(self.db).container, ItemContainerId::ImplId(_))
-            && let Ok(body) = self.db.monomorphized_mir_body(
+            && let Ok(body) = self.db.monomorphized_runtime_mir_body(
                 drop_impl.into(),
                 drop_args.store(),
                 self.param_env.store(),
@@ -3551,7 +3557,7 @@ pub fn render_const_using_debug_impl<'db>(
     let locals = &Locals {
         ptr: ArenaMap::new(),
         body: db
-            .mir_body(owner)
+            .runtime_mir_body(owner)
             .map_err(|_| MirEvalError::NotSupported("unreachable".to_owned()))?,
         drop_flags: DropFlags::default(),
     };
@@ -3596,7 +3602,8 @@ pub fn render_const_using_debug_impl<'db>(
         not_supported!("std::fmt::format not found");
     };
     let interval = evaluator.interpret_mir(
-        db.mir_body(format_fn.into()).map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
+        db.runtime_mir_body(format_fn.into())
+            .map_err(|e| MirEvalError::MirLowerError(format_fn, e))?,
         [IntervalOrOwned::Borrowed(Interval { addr: arguments, size: ptr_size * 2 })].into_iter(),
     )?;
     let message_string = interval.get(&evaluator)?;

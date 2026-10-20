@@ -434,7 +434,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
     let repr = AttrFlags::repr(db, loc.parent.into());
     let is_signed = repr.and_then(|repr| repr.int).is_none_or(|int| int.is_signed());
 
-    let mir_body = db.monomorphized_mir_body(
+    let mir_body = db.monomorphized_runtime_mir_body(
         def.into(),
         GenericArgs::empty().store(),
         ParamEnvAndCrate {
@@ -474,7 +474,7 @@ pub(crate) fn const_eval<'db>(
         subst: StoredGenericArgs,
         trait_env: Option<StoredParamEnvAndCrate>,
     ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let body = db.monomorphized_mir_body(
+        let body = db.monomorphized_runtime_mir_body(
             def.into(),
             subst,
             // The crate the constant is evaluated for, not the one it is in: the impls its
@@ -518,7 +518,7 @@ pub(crate) fn anon_const_eval<'db>(
         subst: StoredGenericArgs,
         trait_env: Option<StoredParamEnvAndCrate>,
     ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let body = db.monomorphized_mir_body(
+        let body = db.monomorphized_runtime_mir_body(
             def.into(),
             subst,
             ParamEnvAndCrate {
@@ -556,7 +556,7 @@ pub(crate) fn const_eval_static<'db>(
         db: &'db dyn HirDatabase,
         def: StaticId,
     ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let body = db.monomorphized_mir_body(
+        let body = db.monomorphized_runtime_mir_body(
             def.into(),
             GenericArgs::empty().store(),
             ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
