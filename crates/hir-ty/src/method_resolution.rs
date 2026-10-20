@@ -10,6 +10,7 @@ mod confirm;
 mod probe;
 
 use either::Either;
+use crate::next_solver::StoredGenericArgs;
 use hir_expand::name::Name;
 use intern::Symbol;
 use salsa::SalsaValue;
@@ -411,6 +412,34 @@ pub fn is_dyn_method<'db>(
         }
     }
     None
+}
+
+/// What [`lookup_impl_method_query`] returns, in a form a query can keep.
+pub(crate) type StoredImplMethod =
+    (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, StoredGenericArgs);
+
+/// [`lookup_impl_method_query`], memoized: codegen asks the same trait method with the same
+/// arguments many times per build and again on every edit, and each ask re-runs trait
+/// selection in a fresh inference context.
+#[salsa::tracked(cycle_result = lookup_impl_method_cycle_result, returns(clone))]
+pub(crate) fn lookup_impl_method_stored(
+    db: &dyn HirDatabase,
+    env: crate::traits::StoredParamEnvAndCrate,
+    func: FunctionId,
+    fn_subst: StoredGenericArgs,
+) -> StoredImplMethod {
+    let (found, args) = lookup_impl_method_query(db, env.as_ref(db), func, fn_subst.as_ref());
+    (found, args.store())
+}
+
+fn lookup_impl_method_cycle_result(
+    _: &dyn HirDatabase,
+    _: salsa::Id,
+    _env: crate::traits::StoredParamEnvAndCrate,
+    func: FunctionId,
+    fn_subst: StoredGenericArgs,
+) -> StoredImplMethod {
+    (Either::Left(func), fn_subst)
 }
 
 /// Looks up the impl method that actually runs for the trait method `func`.

@@ -129,6 +129,9 @@ struct MirLowerCtx<'a, 'db> {
     /// While the pattern of a match arm that has a guard is lowered: what it binds by value, and
     /// the place each came out of.
     guarded_moves: Option<Vec<(LocalId, Place<'db>)>>,
+    /// Whether each type asked about is `Copy`. Every statement that may panic asks of every
+    /// local in scope, which in a long body is the most of lowering it.
+    copy: FxHashMap<Ty<'db>, bool>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
 }
@@ -300,6 +303,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             arm_unreached: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
+            copy: FxHashMap::default(),
             env,
             infcx,
         }
@@ -2541,8 +2545,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             if storage {
                 at = Some(self.unwind_node(at, local, false));
             }
-            let ty = self.result.locals[local].ty.as_ref();
-            if !self.infcx.type_is_copy_modulo_regions(self.env, ty) {
+            if !self.is_copy(self.result.locals[local].ty.as_ref()) {
                 at = Some(self.unwind_node(at, local, true));
             }
         }
@@ -2550,6 +2553,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             at = Some(self.unwind_node(at, local, false));
         }
         at
+    }
+
+    /// Whether a value of `ty` is `Copy`, which nothing drops.
+    pub(super) fn is_copy(&mut self, ty: Ty<'db>) -> bool {
+        let (infcx, env) = (&self.infcx, self.env);
+        *self.copy.entry(ty).or_insert_with(|| infcx.type_is_copy_modulo_regions(env, ty))
     }
 
     fn unwind_node(
@@ -3511,7 +3520,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
         value: Option<Rvalue>,
     ) -> BasicBlockId {
-        if self.infcx.type_is_copy_modulo_regions(self.env, ty) {
+        if self.is_copy(ty) {
             return current;
         }
         let next = self.new_basic_block();
@@ -3542,8 +3551,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         span: MirSpan,
     ) {
         for (at, &l) in scope.locals.iter().enumerate().rev() {
-            if !self.infcx.type_is_copy_modulo_regions(self.env, self.result.locals[l].ty.as_ref())
-            {
+            if !self.is_copy(self.result.locals[l].ty.as_ref()) {
                 let unwind = self.unwind_from_drop(&scope.locals, at);
                 let prev = std::mem::replace(current, self.new_basic_block());
                 self.set_terminator(
@@ -3968,7 +3976,7 @@ fn lower_closure_body<'db>(
     if let Some(err) = err {
         return Err(MirLowerError::UnresolvedUpvar(err));
     }
-    ctx.result.mark_moves(&ctx.infcx, ctx.env);
+    ctx.result.mark_moves(&ctx.infcx, ctx.env, &mut ctx.copy);
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
 }
@@ -4082,7 +4090,7 @@ pub fn promoted_mir_body_query<'db>(
         let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
     }
-    ctx.result.mark_moves(&ctx.infcx, ctx.env);
+    ctx.result.mark_moves(&ctx.infcx, ctx.env, &mut ctx.copy);
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
 }
@@ -4193,7 +4201,7 @@ pub fn lower_to_mir_with_store<'db>(
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
     }
-    ctx.result.mark_moves(&ctx.infcx, ctx.env);
+    ctx.result.mark_moves(&ctx.infcx, ctx.env, &mut ctx.copy);
     Ok(ctx.result)
 }
 

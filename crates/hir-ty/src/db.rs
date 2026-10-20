@@ -250,7 +250,16 @@ pub trait HirDatabase: SourceDatabase + 'static {
     ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>)
     {
         let db = self.as_dyn();
-        crate::method_resolution::lookup_impl_method_query(db, env, func, fn_subst)
+        if !matches!(func.loc(db).container, hir_def::ItemContainerId::TraitId(_)) {
+            return (Either::Left(func), fn_subst);
+        }
+        let (found, args) = crate::method_resolution::lookup_impl_method_stored(
+            db,
+            env.store(),
+            func,
+            fn_subst.store(),
+        );
+        (found, args.as_ref())
     }
 
     // endregion:mir

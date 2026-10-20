@@ -1551,8 +1551,13 @@ impl<'db> MirBody<'db> {
     /// Says `Move` for every operand that reads a place whose type is not `Copy`, as rustc's
     /// MIR building does: lowering writes `Copy` for each, and whether a use of a place moves
     /// out of it depends on its type alone.
-    pub(crate) fn mark_moves(&mut self, infcx: &InferCtxt<'db>, env: ParamEnv<'db>) {
-        let mut copy = FxHashMap::default();
+    /// `copy` is what is known already of which types are `Copy`.
+    pub(crate) fn mark_moves(
+        &mut self,
+        infcx: &InferCtxt<'db>,
+        env: ParamEnv<'db>,
+        copy: &mut FxHashMap<Ty<'db>, bool>,
+    ) {
         let mut blocks = std::mem::take(&mut self.basic_blocks);
         let mut mark = |operand: &mut Operand| {
             let OperandKind::Copy(place) = &operand.kind else { return };
