@@ -1802,13 +1802,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             "Array repeat expression with non array type",
                         ));
                     };
+                    if let Some(constant) = self.constant_operand(*initializer)? {
+                        let r = Rvalue::Repeat(constant, len.store());
+                        self.push_assignment(current, place, r, expr_id.into());
+                        return Ok(Some(current));
+                    }
                     let Some((init, current)) =
                         self.lower_expr_to_some_operand(*initializer, current)?
                     else {
                         return Ok(None);
                     };
+                    // An inline `const { .. }` is lowered in place, into a temporary: each element
+                    // is a copy of its bytes and the temporary is used up, `[const { .. }; 0]` too.
                     if self.names_constant(*initializer) {
-                        let r = Rvalue::Repeat(init, len.store());
+                        let r = Rvalue::Repeat(self.moved(init), len.store());
                         self.push_assignment(current, place, r, expr_id.into());
                         return Ok(Some(current));
                     }
@@ -2303,6 +2310,30 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     /// Whether an expression is a constant item or a `const` block, which an array repeats by
     /// making it once per element, rather than a value the array takes.
+    /// The constant a path names, as an operand, as rustc's MIR has it in `[CONSTANT; N]`.
+    fn constant_operand(&mut self, expr: ExprId) -> Result<'db, Option<Operand>> {
+        let Expr::Path(path) = &self.store[expr] else { return Ok(None) };
+        if self.has_adjustments(expr) {
+            return Ok(None);
+        }
+        let (konst, subst) = if let Some((candidate, subst)) =
+            self.infer.assoc_resolutions_for_expr(expr)
+        {
+            let CandidateId::ConstId(konst) = candidate else { return Ok(None) };
+            (konst, subst)
+        } else {
+            let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
+            let hygiene = self.store.expr_path_hygiene(expr);
+            let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
+            self.resolver.reset_to_guard(guard);
+            let Some(ValueNs::ConstId(konst)) = resolved else { return Ok(None) };
+            (konst, GenericArgs::empty())
+        };
+        let mut operand = self.lower_const_to_operand(subst, konst.into())?;
+        operand.span = Some(expr.into());
+        Ok(Some(operand))
+    }
+
     fn names_constant(&mut self, expr: ExprId) -> bool {
         let Expr::Path(path) = &self.store[expr] else {
             return matches!(self.store[expr], Expr::Const(_));

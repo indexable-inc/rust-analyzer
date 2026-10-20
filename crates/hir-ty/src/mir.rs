@@ -1968,8 +1968,7 @@ impl MirBody<'_> {
 impl<'db> MirBody<'db> {
     /// Says `Move` for every operand that reads a place whose type is not `Copy`, as rustc's
     /// MIR building does: lowering writes `Copy` for each, and whether a use of a place moves
-    /// out of it depends on its type alone. Not the operand of `[CONSTANT; N]`, which lowering
-    /// leaves `Copy`: each element is the constant made again, and `[CONSTANT; 0]` makes none.
+    /// out of it depends on its type alone.
     pub(crate) fn mark_moves(&mut self, infcx: &InferCtxt<'db>, env: ParamEnv<'db>) {
         let mut copy = FxHashMap::default();
         let mut blocks = std::mem::take(&mut self.basic_blocks);
@@ -1984,9 +1983,6 @@ impl<'db> MirBody<'db> {
         };
         for (_, block) in blocks.iter_mut() {
             for statement in &mut block.statements {
-                if let StatementKind::Assign(_, Rvalue::Repeat(..)) = statement.kind {
-                    continue;
-                }
                 statement.kind.for_each_operand_mut(&mut mark);
             }
             if let Some(terminator) = &mut block.terminator {

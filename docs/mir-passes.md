@@ -35,10 +35,12 @@ bodies). Only codegen and the interpreter ask for them.
 
 **Move vs Copy** (`MirBody::mark_moves`, run at the end of every lowering). RA's lowering
 wrote `Copy` for every operand that reads a place. Now an operand whose place type is not
-`Copy` (modulo regions) is `Move`, as rustc's MIR building does. The one exception is the
-operand of `[CONSTANT; N]`: lowering reads the constant's temporary with `Copy` because each
-element is the constant made again, and `[CONSTANT; 0]` makes none. That `Copy` uses the
-temporary up, and the passes treat it as a move that drops nothing.
+`Copy` (modulo regions) is `Move`, as rustc's MIR building does, with no exceptions.
+
+**`[CONSTANT; N]`** repeats the constant operand, as rustc's MIR has it: no temporary is made
+and none is dropped. An inline `const { .. }` is lowered in place into a temporary, which the
+`Repeat` moves: each element is a copy of its bytes. `Repeat` itself never drops; a value
+`[value; 0]` does not take is dropped before it, as rustc's `build_zero_repeat` does.
 
 **Constant indices from the end** count as rustc's do: `ConstantIndex { offset, from_end: true }`
 with offset 1 is the last element. RA's lowering used 0.

@@ -18,7 +18,7 @@ use crate::{
     consteval::try_const_usize,
     mir::{
         BasicBlockId, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem, PlaceTy,
-        Projection, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+        Projection, ProjectionElem, StatementKind, StoredPlace, TerminatorKind,
     },
     next_solver::TyKind,
 };
@@ -383,15 +383,6 @@ pub(super) fn effects_at<'db>(
     let data_block = &body.basic_blocks[block];
     if let Some(statement) = data_block.statements.get(at) {
         statement.kind.for_each_operand(&mut |operand| moved(operand, &mut effects));
-        // `[CONSTANT; N]` reads the temporary the constant is made in with `Copy`, as each
-        // element is the constant made again: the temporary is used up, and never dropped.
-        if let StatementKind::Assign(_, Rvalue::Repeat(operand, _)) = &statement.kind
-            && let OperandKind::Copy(place) = &operand.kind
-        {
-            for path in data.paths_of(ctx, place) {
-                effects.push(Effect { path, init: false });
-            }
-        }
         match &statement.kind {
             StatementKind::Assign(place, _) => {
                 for path in data.paths_of(ctx, &init_target(ctx, body, place)) {
