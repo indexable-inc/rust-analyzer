@@ -2316,19 +2316,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if self.has_adjustments(expr) {
             return Ok(None);
         }
-        let (konst, subst) = if let Some((candidate, subst)) =
-            self.infer.assoc_resolutions_for_expr(expr)
-        {
-            let CandidateId::ConstId(konst) = candidate else { return Ok(None) };
-            (konst, subst)
-        } else {
-            let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
-            let hygiene = self.store.expr_path_hygiene(expr);
-            let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
-            self.resolver.reset_to_guard(guard);
-            let Some(ValueNs::ConstId(konst)) = resolved else { return Ok(None) };
-            (konst, GenericArgs::empty())
-        };
+        let (konst, subst) =
+            if let Some((candidate, subst)) = self.infer.assoc_resolutions_for_expr(expr) {
+                let CandidateId::ConstId(konst) = candidate else { return Ok(None) };
+                (konst, subst)
+            } else {
+                let guard = self.resolver.update_to_inner_scope(self.db, self.store_owner, expr);
+                let hygiene = self.store.expr_path_hygiene(expr);
+                let resolved = self.resolver.resolve_path_in_value_ns_fully(self.db, path, hygiene);
+                self.resolver.reset_to_guard(guard);
+                let Some(ValueNs::ConstId(konst)) = resolved else { return Ok(None) };
+                (konst, GenericArgs::empty())
+            };
         let mut operand = self.lower_const_to_operand(subst, konst.into())?;
         operand.span = Some(expr.into());
         Ok(Some(operand))
@@ -3136,13 +3135,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Rvalue::Aggregate(self.poll_variant(false)?, Box::new([])),
             span,
         );
+        // A future dropped while it waits here drops what is in scope, innermost first, as
+        // rustc's coroutine drop does.
+        let dropped = self.new_basic_block();
+        let end = self.drop_until_scope(0, dropped, span);
+        self.set_terminator(end, TerminatorKind::CoroutineDrop, span);
         self.set_terminator(
             pending,
             TerminatorKind::Yield {
                 value: Operand { kind: OperandKind::Copy(poll.store()), span: None },
                 resume: again,
                 resume_arg: Place::from(context).store(),
-                drop: None,
+                drop: Some(dropped),
             },
             span,
         );

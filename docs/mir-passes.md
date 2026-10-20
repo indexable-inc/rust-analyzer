@@ -97,17 +97,73 @@ with offset 1 is the last element. RA's lowering used 0.
 
 There are no optimization passes: no inlining, GVN, SROA, const propagation or simplification.
 
+## Coroutines
+
+`async` bodies go through the same passes. Lowering gives each `Yield` a `drop` edge to a
+path that drops what is in scope there, innermost first, and ends in `CoroutineDrop`, as
+rustc's coroutine drop tree does; drop elaboration makes those drops conditional like any
+other, and the flags it adds are ordinary `bool` locals.
+
+What the future keeps (`MirBody::locals_held_across_yields`, `mir/held.rs`) is computed on the
+runtime body as rustc's `StateTransform` computes it (`rustc_mir_transform/src/coroutine/
+layout.rs` at 1.99.0), with ports of the analyses it runs:
+- `MaybeLiveLocals`, backwards, a call's destination and a yield's resume argument written
+  on their edges, a `Drop` a use;
+- `MaybeBorrowedLocals`, where a `Drop` counts as a borrow;
+- `MaybeRequiresStorage`, with a local moved out whole and never borrowed before needing no
+  storage after;
+- `always_storage_live_locals`.
+
+At each reachable yield, in block order, the locals live at the end of the block, plus the
+borrowed ones (an `async` block is immovable), intersected with the ones that need storage,
+less the reference to the future, are kept there: one variant each. Two kept locals conflict
+when both need storage at a statement or terminator of a reachable block that does not end in
+`Unreachable`; one that is always storage live (a drop flag, a parameter) conflicts with all.
+The layout (`layout.rs`) hands those to `rustc_abi`'s coroutine layout, with only the upvars in
+the prefix and each local a `MaybeUninit` of its type, as `rustc_ty_utils` does. The vendored
+`rustc_abi` coroutine layout is the same code as rustc 1.99's.
+
+So for the same MIR the layout is rustc's. The MIR is not the same yet, and these differences
+change which locals are kept, in which order, and in which variant:
+- **Locals.** RA declares every binding of a body before any temporary; rustc declares a
+  binding where its pattern is lowered. Saved locals are ordered by local index, and fields of
+  one variant with the same alignment are placed in that order.
+- **`await`.** rustc desugars it to `match into_future(e) { mut __awaitee => loop { match
+  poll(Pin::new_unchecked(&mut __awaitee), get_context(cx)) { .. } cx = yield () } }`; RA
+  lowers it directly, with other temporaries and no `__awaitee` binding.
+- **Captures.** RA moves each capture of an `async` block into a local at the start of the
+  body; rustc uses captures in place, so those locals are kept by RA and not by rustc, and
+  RA's future can be bigger. rustc does move the parameters of an `async fn` into locals
+  (`let x = x;` in its HIR lowering), which RA does not do the same way.
+- **Storage markers.** rustc emits `StorageDead` on coroutine unwind paths too; RA's cleanup
+  chain has none. Where markers are placed decides storage conflicts.
+- **Block order.** rustc's yields are numbered in block order after `SimplifyCfg`, which merges
+  blocks; RA's are numbered in lowering order.
+- **Promotion and cleanup.** rustc's body has had constants promoted, fake reads and fake
+  borrows removed, and `Derefer` run before the transform.
+
+Until these match, ra-jit keeps a future and everything that makes, polls or drops it on one
+side (rustc's or its own); `RA_JIT_MIX_FUTURES=1` lifts that to measure how close the layouts
+are (`harness/mixfutures`).
+
 ## What the consumers do with it
 
-**ra-jit codegen** (`crates/hir-ty-codegen/mod.rs`) generates a Runtime body directly:
-- no drop flags of its own;
+**ra-jit codegen** (`crates/hir-ty-codegen/mod.rs`) generates a Runtime body directly, and
+generates nothing else:
+- no drop flags of its own, in `async` bodies too;
 - `Drop` is `drop_in_place` and a jump;
 - each cleanup block a call unwinds to gets its own landing pad, which keeps the exception
   and jumps to the block;
 - `UnwindResume` resumes with the kept exception.
 
+- an `async` body that unwinds stores the panicked state before resuming;
+- dropping a suspended future enters the drop path of the yield it is suspended at; one that
+  never started drops its upvars.
+
 The flag-following machinery that tried to decide drops statically was deleted
-(`FlagEvent`, `Held`, `FlagFlow`, `follow_flags`, `forget_unread_flags`; 529 lines).
+(`FlagEvent`, `Held`, `FlagFlow`, `follow_flags`, `forget_unread_flags`; 529 lines), and then
+the rest of the drop handling for built bodies: drop flags and partial-move bits, deferred
+drops, the landing pad that dropped live locals, flags in the future's prefix.
 
 **The interpreter** runs Runtime bodies only, promoted constants included: a `Drop` drops. Its
 place-set drop tracking (`DropFlags`) is deleted, and a body that is not elaborated (an `async`
@@ -115,18 +171,6 @@ body, which it can't run anyway) is reported as not supported.
 
 ## Not done yet
 
-- **Coroutines.** `run_passes` returns `async` bodies unchanged. Codegen and layout still use
-  the built body with their own drop flags, which live in the future's prefix and make some
-  futures larger than rustc's. The next stage:
-  - elaborate coroutine bodies, so their flags are ordinary locals and the held-locals
-    analysis (`MirBody::locals_held_across_yields`) keeps them in the variants as rustc's
-    `StateTransform` does;
-  - give each `Yield` a drop path (rustc's coroutine drop tree), so that dropping a suspended
-    future is MIR and not codegen's `drop_live_locals`;
-  - lay the future out from the runtime body.
-
-  After that the rest of codegen's legacy drop handling (`drop_flags`, `moved_paths`,
-  deferred drops, `drop_live_locals`) can be deleted.
 - **Abort on unwind.** A drop in a cleanup block that unwinds should abort (rustc's
   `UnwindAction::Terminate`); it continues unwinding today, which is what codegen did before.
   `nounwind` callees do not yet get `Terminate` edges.

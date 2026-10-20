@@ -94,11 +94,6 @@ impl<'db> Ctx<'db> {
 /// `built` after the passes.
 fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
-    // The body of an `async` block keeps what it holds across a yield in the future, with the
-    // flags the code generator makes for it: it is not elaborated yet.
-    if body.coroutine.is_some() {
-        return Ok(body);
-    }
     let ctx = Ctx::new(db, body.owner);
     cleanup::hoist_indexing(&ctx, &mut body);
     cleanup::add_cleanup_paths(&ctx, &mut body);

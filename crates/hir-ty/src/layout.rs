@@ -350,37 +350,33 @@ pub fn layout_of_ty_query(
             cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?
         }
         TyKind::Coroutine(id, args) => {
-            // Laid out as rustc lays it out, which a program can tell by the size: what was
-            // captured and where the body left off, then for each place it yields what is kept
-            // there, one such set over another. `CoroutineFrame` says which field is which.
+            // Laid out as rustc's `coroutine_layout` lays it out: what was captured and where
+            // the body left off, then for each place it yields what is kept there, one such
+            // set over another, from the runtime body as rustc's coroutine transform has it.
+            // `CoroutineFrame` says which field is which.
             let args = args.as_coroutine();
             let parent_args = GenericArgs::new_from_slice(args.parent_args());
             let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
-                db.monomorphized_mir_body_for_coroutine_by_move(
+                db.monomorphized_runtime_mir_body_for_coroutine_by_move(
                     id.0,
                     parent_args.store(),
                     trait_env.clone(),
                 )
             } else {
-                db.monomorphized_mir_body_for_coroutine(
+                db.monomorphized_runtime_mir_body_for_coroutine(
                     id.0,
                     parent_args.store(),
                     trait_env.clone(),
                 )
             }
             .map_err(|_| LayoutError::Unknown)?;
-            let held = body.locals_held_across_yields(|local| {
-                crate::drop::has_drop_glue(
-                    &infer_ctxt,
-                    body.locals[local].ty.as_ref(),
-                    trait_env.param_env(db),
-                ) != crate::drop::DropGlue::None
-            });
+            let held = body.locals_held_across_yields();
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
                 .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
-            // A local only holds a value some of the time, so nothing of it is a niche.
+            // Each local is a `MaybeUninit` of its type, as rustc has it: nothing of it is a
+            // niche.
             let locals = held
                 .locals
                 .iter()
@@ -392,16 +388,7 @@ pub fn layout_of_ty_query(
                     Ok(layout)
                 })
                 .collect::<Result<Vec<_>, LayoutError>>()?;
-            let flags: Vec<Layout> = held
-                .flagged()
-                .map(|at| {
-                    let bits = Integer::from_size(Size::from_bytes(held.flag_bytes(at)))
-                        .expect("a flag of one to eight bytes");
-                    Layout::scalar(dl, scalar_unit(dl, Primitive::Int(bits, false)))
-                })
-                .collect();
-            let mut prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
-            prefix.extend(&flags);
+            let prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
             let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
             let locals = locals.iter().collect::<Vec<_>>();
             let locals = locals.iter().collect::<IndexVec<usize, _>>();
@@ -656,24 +643,19 @@ fn scalar_unit(dl: &TargetDataLayout, value: Primitive) -> Scalar {
 }
 
 /// Where an `async` block keeps what has to survive from one `poll` to the next. The fields of
-/// its layout are the captures, the drop flags of each held local that needs them, and
-/// the state: where the body left off. The held locals are fields of its variants, one for
-/// each place the body yields at.
+/// its layout are the captures and the state: where the body left off. The held locals are
+/// fields of its variants, one for each place the body yields at; the ones rustc's layout
+/// can't overlap with others are in the prefix after the state, and named by each variant
+/// that keeps them all the same.
 #[derive(Debug, Clone, Copy)]
 pub struct CoroutineFrame {
     pub upvars: usize,
-    pub flags: usize,
 }
 
 impl CoroutineFrame {
     /// The first of the states that are a place the body yielded at; before it come not yet
     /// started, returned and panicked.
     pub const SUSPENDED: usize = 3;
-
-    /// The flag of the `index`th of the locals that have one.
-    pub fn drop_flag(self, index: usize) -> usize {
-        self.upvars + index
-    }
 
     /// Where the `index`th of the held locals is in the future: among what is kept at any of
     /// the places it is kept at, which are one place.
@@ -706,6 +688,6 @@ impl CoroutineFrame {
     }
 
     pub fn state(self) -> usize {
-        self.upvars + self.flags
+        self.upvars
     }
 }
