@@ -478,7 +478,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.operand(op);
                 w!(self, ", {})", self.hir_display(&ty.as_ref()));
             }
-            Rvalue::CheckedBinaryOp(b, o1, o2) => {
+            Rvalue::CheckedBinaryOp(b, o1, o2) | Rvalue::BinaryOp(b, o1, o2) => {
                 self.operand(o1);
                 w!(self, " {b} ");
                 self.operand(o2);
@@ -503,7 +503,6 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
             }
             Rvalue::ThreadLocalRef(n)
             | Rvalue::AddressOf(n)
-            | Rvalue::BinaryOp(n)
             | Rvalue::NullaryOp(n) => match *n {},
         }
     }
