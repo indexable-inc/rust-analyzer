@@ -165,6 +165,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "inline" if !tt.syntax().text().contains_char('n') => {
                         attr_flags.insert(AttrFlags::IS_INLINE)
                     }
+                    "inline" if tt.syntax().text().to_string().contains("never") => {
+                        attr_flags.insert(AttrFlags::INLINE_NEVER)
+                    }
                     "doc" => extract_doc_tt_attr(attr_flags, tt),
                     "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
                     "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
@@ -381,6 +384,8 @@ bitflags::bitflags! {
         const IS_INLINE = 1 << 59;
         /// `#[used]`: kept in the object though nothing names it.
         const USED = 1 << 60;
+        /// `#[inline(never)]`: not built into its callers, also where they are optimized.
+        const INLINE_NEVER = 1 << 61;
     }
 }
 
