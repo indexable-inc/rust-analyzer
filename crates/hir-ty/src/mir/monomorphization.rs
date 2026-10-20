@@ -372,7 +372,7 @@ pub fn monomorphized_promoted_mir_body_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    let body = super::promoted_mir_body_query(db, owner, expr).map_err(Clone::clone)?;
+    let body = super::runtime_promoted_mir_body_query(db, owner, expr).map_err(Clone::clone)?;
     monomorphized(db, body, &subst, &trait_env)
 }
 

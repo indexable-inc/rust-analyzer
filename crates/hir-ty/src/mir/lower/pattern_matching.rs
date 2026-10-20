@@ -418,9 +418,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     )?;
                 }
                 for (i, &pat) in suffix.iter().enumerate() {
-                    // Offset 0 from the end is the last element.
+                    // Offset 1 from the end is the last element, as in rustc's MIR.
                     let next_place = cond_place.project(ProjectionElem::ConstantIndex {
-                        offset: (suffix.len() - 1 - i) as u64,
+                        offset: (suffix.len() - i) as u64,
                         from_end: true,
                     });
                     (current, current_else) =

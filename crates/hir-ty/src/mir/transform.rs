@@ -117,6 +117,18 @@ pub fn runtime_mir_body_query<'db>(
     run_passes(db, db.mir_body(def)?)
 }
 
+/// The constant behind a promoted `&expr` of `def` after the passes: what the code generator
+/// evaluates for it with the interpreter.
+#[salsa::tracked(returns(as_ref))]
+pub fn runtime_promoted_mir_body_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: InferBodyId<'db>,
+    expr: hir_def::hir::ExprId,
+) -> Result<'db, MirBody<'db>> {
+    let built = super::promoted_mir_body_query(db, def, expr).map_err(Clone::clone)?;
+    run_passes(db, built)
+}
+
 #[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_closure_cycle_result)]
 pub fn runtime_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,

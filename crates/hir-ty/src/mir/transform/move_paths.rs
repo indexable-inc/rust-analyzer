@@ -190,8 +190,7 @@ impl<'db> MoveData<'db> {
                 let Some(len) = try_const_usize(ctx.db, len).map(|it| it as u64) else {
                     return Tracked::No;
                 };
-                // Offset 0 from the end is the last element.
-                let index = if from_end { len.checked_sub(offset + 1) } else { Some(offset) };
+                let index = if from_end { len.checked_sub(offset) } else { Some(offset) };
                 match index {
                     Some(index) if index < len => Tracked::Step(Step::Element(index)),
                     _ => Tracked::No,

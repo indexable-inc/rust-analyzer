@@ -26,7 +26,8 @@ The code is `crates/hir-ty/src/mir/transform.rs` and `transform/`.
 
 The runtime bodies are separate salsa queries, so the IDE never computes them:
 `runtime_mir_body`, `runtime_mir_body_for_closure`, `runtime_mir_body_for_coroutine`,
-`runtime_mir_body_for_coroutine_by_move`, and the `monomorphized_runtime_mir_body*` variants
+`runtime_mir_body_for_coroutine_by_move`, `runtime_promoted_mir_body` (the constant behind a
+promoted `&expr`), and the `monomorphized_runtime_mir_body*` variants
 (the passes run on the generic body; monomorphization substitutes after, as it does for built
 bodies). Only codegen and the interpreter ask for them.
 
@@ -38,6 +39,9 @@ wrote `Copy` for every operand that reads a place. Now an operand whose place ty
 operand of `[CONSTANT; N]`: lowering reads the constant's temporary with `Copy` because each
 element is the constant made again, and `[CONSTANT; 0]` makes none. That `Copy` uses the
 temporary up, and the passes treat it as a move that drops nothing.
+
+**Constant indices from the end** count as rustc's do: `ConstantIndex { offset, from_end: true }`
+with offset 1 is the last element. RA's lowering used 0.
 
 ## The passes, in order
 
@@ -103,8 +107,9 @@ There are no optimization passes: no inlining, GVN, SROA, const propagation or s
 The flag-following machinery that tried to decide drops statically was deleted
 (`FlagEvent`, `Held`, `FlagFlow`, `follow_flags`, `forget_unread_flags`; 529 lines).
 
-**The interpreter** runs Runtime bodies: a `Drop` drops. It keeps its place-set drop tracking
-only for the built bodies it is still given (promoted constants).
+**The interpreter** runs Runtime bodies only, promoted constants included: a `Drop` drops. Its
+place-set drop tracking (`DropFlags`) is deleted, and a body that is not elaborated (an `async`
+body, which it can't run anyway) is reported as not supported.
 
 ## Not done yet
 
@@ -123,6 +128,13 @@ only for the built bodies it is still given (promoted constants).
 - **Abort on unwind.** A drop in a cleanup block that unwinds should abort (rustc's
   `UnwindAction::Terminate`); it continues unwinding today, which is what codegen did before.
   `nounwind` callees do not yet get `Terminate` edges.
+- **Panics inside statements.** RA's MIR has no `Assert` terminator: `CheckedBinaryOp`
+  panics on overflow and an `Index` projection panics out of bounds, in the middle of a
+  statement. rustc's MIR computes the overflow bit or `Len` and `Lt`, then branches with
+  `Assert`. Lowering both as rustc does would delete `panic_cleanup`, the
+  `hoist_indexing` pass, and codegen's `index_spans` and `FakeRead` of an indexed place.
+- **Subslices of arrays.** `Subslice { from, to }` always counts `to` from the end; rustc's
+  has `from_end` and counts from the start for arrays.
 - **Temporary drop order in lowering.** Temporaries are dropped where RA's lowering puts
   their scope ends. The differential tests and the fuzzer show no difference from rustc on
   the cases they cover, but no rustc-style scope tree was built.

@@ -30,13 +30,13 @@ enum EvalLangItem {
     DropInPlace,
 }
 
-impl<'a, 'db> Evaluator<'a, 'db> {
+impl<'db> Evaluator<'db> {
     pub(super) fn detect_and_exec_special_function(
         &mut self,
         def: FunctionId,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, bool> {
@@ -135,7 +135,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         def: FunctionId,
         args: &[IntervalAndTy<'db>],
         self_ty: Ty<'db>,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, ()> {
@@ -193,7 +193,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         layout: Arc<Layout>,
         addr: Address,
         def: FunctionId,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         destination: Interval,
         span: MirSpan,
     ) -> Result<'db, ()> {
@@ -299,7 +299,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         it: EvalLangItem,
         generic_args: GenericArgs<'db>,
         args: &[IntervalAndTy<'db>],
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         span: MirSpan,
     ) -> Result<'db, Vec<u8>> {
         use EvalLangItem::*;
@@ -371,7 +371,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         id: i64,
         args: &[IntervalAndTy<'db>],
         destination: Interval,
-        _locals: &Locals<'a, 'db>,
+        _locals: &Locals<'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         match id {
@@ -402,7 +402,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         args: &[IntervalAndTy<'db>],
         _generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         span: MirSpan,
     ) -> Result<'db, ()> {
         match as_str {
@@ -566,7 +566,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         span: MirSpan,
         needs_override: bool,
     ) -> Result<'db, bool> {
@@ -1506,7 +1506,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         &mut self,
         ty: Ty<'db>,
         metadata: Interval,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
     ) -> Result<'db, (usize, usize)> {
         Ok(match ty.kind() {
             TyKind::Str => (from_bytes!(usize, metadata.get(self)?), 1),
@@ -1566,7 +1566,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
-        locals: &Locals<'a, 'db>,
+        locals: &Locals<'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
         // We are a single threaded runtime with no UB checking and no optimization, so
