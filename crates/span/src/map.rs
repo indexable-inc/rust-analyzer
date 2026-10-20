@@ -282,6 +282,29 @@ impl RealSpanMap {
         Self { file_id, pairs, end }
     }
 
+    /// The anchor that the spans of what begins at `offset` are relative to, and where it begins.
+    pub fn anchor_at(&self, offset: TextSize) -> (TextSize, ErasedFileAstId) {
+        let idx = self
+            .pairs
+            .binary_search_by(|&(it, _)| it.cmp(&offset).then(std::cmp::Ordering::Less))
+            .unwrap_err();
+        self.pairs[idx - 1]
+    }
+
+    /// The map of `range` alone, as a file of its own: the spans it gives what is in `range`,
+    /// moved to begin at 0, are those this map gives it where it is. `range` has to begin with
+    /// an anchor ([`RealSpanMap::anchor_at`]).
+    pub fn within(&self, range: TextRange) -> RealSpanMap {
+        let pairs = self
+            .pairs
+            .iter()
+            .filter(|(offset, _)| range.contains(*offset))
+            .map(|&(offset, ast_id)| (offset - range.start(), ast_id))
+            .collect::<Box<[_]>>();
+        debug_assert_eq!(pairs.first().map(|it| it.0), Some(TextSize::new(0)));
+        RealSpanMap { file_id: self.file_id, pairs, end: range.len() }
+    }
+
     #[cfg(feature = "salsa")]
     pub fn span_for_range(&self, range: TextRange) -> Span {
         assert!(

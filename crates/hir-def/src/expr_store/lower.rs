@@ -23,6 +23,7 @@ use itertools::Itertools;
 use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use span::{AstIdMap, RealSpanMap};
 use stdx::never;
 use syntax::{
     AstNode, AstPtr, SyntaxNodePtr,
@@ -78,6 +79,7 @@ pub(super) fn lower_body(
     body: Option<ast::Expr>,
     is_async_fn: bool,
     is_gen_fn: bool,
+    maps: Option<(&RealSpanMap, &AstIdMap)>,
 ) -> (Body, BodySourceMap) {
     // We cannot leave the root span map empty and let any identifier from it be treated as root,
     // because when inside nested macros `SyntaxContextId`s from the outer macro will be interleaved
@@ -88,7 +90,8 @@ pub(super) fn lower_body(
     let mut self_param = None;
     let mut source_map_self_param = None;
     let mut params = vec![];
-    let mut collector = ExprCollector::new(db, module, current_file_id, LoweringMode::Analysis);
+    let mut collector =
+        ExprCollector::with_maps(db, module, current_file_id, LoweringMode::Analysis, maps);
 
     let skip_body = AttrFlags::query(
         db,
@@ -669,13 +672,30 @@ impl NamedLifetimeStore {
 
 impl<'db> ExprCollector<'db> {
     pub fn new(
-        db: &dyn SourceDatabase,
+        db: &'db dyn SourceDatabase,
         module: ModuleId,
         current_file_id: HirFileId,
         lowering_mode: LoweringMode,
-    ) -> ExprCollector<'_> {
+    ) -> ExprCollector<'db> {
+        Self::with_maps(db, module, current_file_id, lowering_mode, None)
+    }
+
+    /// With `maps`, what is collected is a part of `current_file_id` lowered as a tree of its
+    /// own, and these are the maps of that part ([`Expander::within`]).
+    fn with_maps(
+        db: &'db dyn SourceDatabase,
+        module: ModuleId,
+        current_file_id: HirFileId,
+        lowering_mode: LoweringMode,
+        maps: Option<(&'db RealSpanMap, &'db AstIdMap)>,
+    ) -> ExprCollector<'db> {
         let (def_map, local_def_map) = module.local_def_map(db);
-        let expander = Expander::new(db, current_file_id, def_map);
+        let expander = match maps {
+            Some((span_map, ast_id_map)) => {
+                Expander::within(db, current_file_id, def_map, span_map, ast_id_map)
+            }
+            None => Expander::new(db, current_file_id, def_map),
+        };
         let krate = module.krate(db);
         let mut result = ExprCollector {
             db,

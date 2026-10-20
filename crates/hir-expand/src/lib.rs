@@ -1463,6 +1463,12 @@ pub fn map_node_range_up_rooted(
     exp_map: &ExpansionSpanMap,
     range: TextRange,
 ) -> Option<FileRange> {
+    map_node_range_up_rooted_span(exp_map, range).map(|span| resolve_span(db, span))
+}
+
+/// [`map_node_range_up_rooted`] as a span, relative to its anchor: what does not change while
+/// edits around the anchor move it.
+pub fn map_node_range_up_rooted_span(exp_map: &ExpansionSpanMap, range: TextRange) -> Option<Span> {
     let mut spans = exp_map.spans_for_range(range).filter(|span| span.ctx.is_root());
     let Span { range, anchor, ctx } = spans.next()?;
     let mut start = range.start();
@@ -1475,7 +1481,7 @@ pub fn map_node_range_up_rooted(
         start = start.min(span.range.start());
         end = end.max(span.range.end());
     }
-    Some(resolve_span(db, Span { range: TextRange::new(start, end), anchor, ctx }))
+    Some(Span { range: TextRange::new(start, end), anchor, ctx })
 }
 
 /// Maps up the text range out of the expansion hierarchy back into the original file its from.

@@ -3691,7 +3691,10 @@ fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> R
 /// source map it reads changes with every edit above the body, and what it finds does not.
 #[salsa::tracked(returns(ref))]
 fn failed_expansion<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Option<String> {
-    let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+    let source_map = match owner.expression_store_owner(db) {
+        ExpressionStoreOwnerId::Body(def) => &Body::unmoved_source_map(db, def).store,
+        owner => ExpressionStore::with_source_map(db, owner).1,
+    };
     source_map.macro_calls().find_map(|(_, call)| {
         let error = call.parse_macro_expansion(db).err.as_ref()?;
         Some(error.render_to_string(db).message)

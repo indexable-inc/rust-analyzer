@@ -840,7 +840,7 @@ fn closures_around_query(
     owner: DefWithBodyId,
     target: ExprId,
 ) -> Option<Vec<(usize, ClosureKind)>> {
-    let (body, source_map) = Body::with_source_map(db, owner);
+    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
     let mut around = Vec::new();
     if !find_closures(body, body.root_expr(), target, &mut around) {
         return None;

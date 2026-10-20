@@ -742,6 +742,52 @@ impl AstIdMap {
             assert!(blocks.is_empty(), "didn't leave all BlockExprs");
         }
 
+        res.index();
+        return res;
+
+        fn parent_of(parent_idx: Option<ArenaId>, res: &AstIdMap) -> Option<&ErasedFileAstId> {
+            let mut parent = parent_idx.map(|parent_idx| &res.arena[parent_idx].1);
+            if parent.is_some_and(|parent| parent.kind() == ErasedFileAstIdKind::ExternBlock as u32)
+            {
+                // See the comment on `ErasedAssocItemFileAstId` for why is this.
+                // FIXME: Technically there could be an extern block inside another item, e.g.:
+                // ```
+                // fn foo() {
+                //     extern "C" {
+                //         fn bar();
+                //     }
+                // }
+                // ```
+                // Here we want to make `foo()` the parent of `bar()`, but we make it `None`.
+                // Shouldn't be a big deal though.
+                parent = None;
+            }
+            parent
+        }
+    }
+
+    /// The ids of the nodes of `node`, a node of the tree this map is of, as nodes of
+    /// `relative`: the same node, the root of a tree of its own. What a body is lowered from
+    /// when it is lowered without the rest of its file, so that the map stays the same while
+    /// the text around `node` moves it. The first entry is `node` itself.
+    pub fn relative_to(&self, node: &SyntaxNode, relative: &SyntaxNode) -> AstIdMap {
+        debug_assert_eq!(node.green(), relative.green());
+        let mut res = AstIdMap::default();
+        for (node, relative) in node.descendants().zip(relative.descendants()) {
+            let may_have_id = ast::BlockExpr::can_cast(node.kind())
+                || ErasedFileAstId::should_alloc(&node).is_some();
+            if let Some(id) =
+                may_have_id.then(|| self.try_erased_ast_id(SyntaxNodePtr::new(&node))).flatten()
+            {
+                res.arena.alloc((SyntaxNodePtr::new(&relative), id));
+            }
+        }
+        res.index();
+        res
+    }
+
+    fn index(&mut self) {
+        let res = self;
         res.ptr_map = hashbrown::HashTable::with_capacity(res.arena.len());
         res.id_map = hashbrown::HashTable::with_capacity(res.arena.len());
         for (idx, (ptr, ast_id)) in res.arena.iter() {
@@ -769,27 +815,6 @@ impl AstIdMap {
             }
         }
         res.arena.shrink_to_fit();
-        return res;
-
-        fn parent_of(parent_idx: Option<ArenaId>, res: &AstIdMap) -> Option<&ErasedFileAstId> {
-            let mut parent = parent_idx.map(|parent_idx| &res.arena[parent_idx].1);
-            if parent.is_some_and(|parent| parent.kind() == ErasedFileAstIdKind::ExternBlock as u32)
-            {
-                // See the comment on `ErasedAssocItemFileAstId` for why is this.
-                // FIXME: Technically there could be an extern block inside another item, e.g.:
-                // ```
-                // fn foo() {
-                //     extern "C" {
-                //         fn bar();
-                //     }
-                // }
-                // ```
-                // Here we want to make `foo()` the parent of `bar()`, but we make it `None`.
-                // Shouldn't be a big deal though.
-                parent = None;
-            }
-            parent
-        }
     }
 
     /// The root node.
@@ -843,6 +868,18 @@ impl AstIdMap {
         let ptr = self.get_erased(id.raw);
         AstPtr::try_from_raw(ptr)
             .unwrap_or_else(|| panic!("AstIdMap node mismatch with node `{ptr:?}`"))
+    }
+
+    /// The nodes this map has an id of: every item of the file, and the blocks with items.
+    pub fn ptrs(&self) -> impl Iterator<Item = SyntaxNodePtr> + '_ {
+        self.arena.iter().map(|(_, (ptr, _))| *ptr)
+    }
+
+    /// The node of `id`, when this map has it: a map [`AstIdMap::relative_to`] a node has only
+    /// the ids of what is in that node.
+    pub fn try_get_erased(&self, id: ErasedFileAstId) -> Option<SyntaxNodePtr> {
+        let hash = hash_ast_id(&id);
+        self.id_map.find(hash, |&idx| self.arena[idx].1 == id).map(|&idx| self.arena[idx].0)
     }
 
     pub fn get_erased(&self, id: ErasedFileAstId) -> SyntaxNodePtr {

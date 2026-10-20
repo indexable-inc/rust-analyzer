@@ -9,7 +9,7 @@ use hir_expand::{
     AstId, ExpandError, ExpandErrorKind, ExpandResult, HirFileId, InFile, Lookup, MacroCallId,
     eager::EagerCallBackFn, mod_path::ModPath, span_map::SpanMap,
 };
-use span::{AstIdMap, SyntaxContext};
+use span::{AstIdMap, RealSpanMap, SyntaxContext};
 use syntax::ast::HasAttrs;
 use syntax::{AstNode, Parse, ast};
 use tt::TextRange;
@@ -35,19 +35,41 @@ impl<'db> Expander<'db> {
         current_file_id: HirFileId,
         def_map: &'db DefMap,
     ) -> Expander<'db> {
+        Expander {
+            current_file_id,
+            macro_depth: current_file_id.macro_expansion_depth(db),
+            recursion_limit: Self::recursion_limit(def_map),
+            span_map: current_file_id.span_map(db),
+            ast_id_map: current_file_id.ast_id_map(db),
+        }
+    }
+
+    /// An expander of what is written in a part of `current_file_id` that is lowered as a tree
+    /// of its own, with the maps of that part ([`crate::expr_store::body::BodySyntax`]).
+    pub(super) fn within(
+        db: &'db dyn SourceDatabase,
+        current_file_id: HirFileId,
+        def_map: &'db DefMap,
+        span_map: &'db RealSpanMap,
+        ast_id_map: &'db AstIdMap,
+    ) -> Expander<'db> {
+        // Not `Expander::new`: what it reads of the whole file is what this leaves out.
+        Expander {
+            current_file_id,
+            macro_depth: current_file_id.macro_expansion_depth(db),
+            recursion_limit: Self::recursion_limit(def_map),
+            span_map: SpanMap::RealSpanMap(span_map),
+            ast_id_map,
+        }
+    }
+
+    fn recursion_limit(def_map: &DefMap) -> u32 {
         let recursion_limit = def_map.recursion_limit();
-        let recursion_limit = if cfg!(test) {
+        if cfg!(test) {
             // Without this, `body::tests::your_stack_belongs_to_me` stack-overflows in debug
             std::cmp::min(32, recursion_limit)
         } else {
             recursion_limit
-        };
-        Expander {
-            current_file_id,
-            macro_depth: current_file_id.macro_expansion_depth(db),
-            recursion_limit,
-            span_map: current_file_id.span_map(db),
-            ast_id_map: current_file_id.ast_id_map(db),
         }
     }
 

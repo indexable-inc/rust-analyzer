@@ -17,12 +17,12 @@ use std::{
 use base_db::SourceDatabase;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
-use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
+use hir_expand::{HirFileId, InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::{Arena, ArenaMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
-use syntax::{AstPtr, SyntaxNodePtr, ast};
+use syntax::{AstNode, AstPtr, SyntaxNodePtr, ast};
 use thin_vec::ThinVec;
 use tt::TextRange;
 
@@ -260,6 +260,119 @@ impl PartialEq for ExpressionStoreSourceMap {
         *expr_only == other.expr_only
             && *types_map_back == other.types_map_back
             && *lifetime_map_back == other.lifetime_map_back
+    }
+}
+
+/// Moves the pointers into `file` of a source map: [`ExpressionStoreSourceMap::moved`].
+pub(crate) struct Move<'a> {
+    pub(crate) file: HirFileId,
+    pub(crate) to: &'a dyn Fn(SyntaxNodePtr) -> SyntaxNodePtr,
+}
+
+impl Move<'_> {
+    fn ptr<N: AstNode>(&self, src: InFile<AstPtr<N>>) -> InFile<AstPtr<N>> {
+        if src.file_id != self.file {
+            return src;
+        }
+        let moved = (self.to)(src.value.syntax_node_ptr());
+        InFile::new(src.file_id, AstPtr::try_from_raw(moved).expect("moved to another kind"))
+    }
+
+    fn back<I, N: AstNode>(
+        &self,
+        map: &ArenaMap<la_arena::Idx<I>, InFile<AstPtr<N>>>,
+    ) -> ArenaMap<la_arena::Idx<I>, InFile<AstPtr<N>>> {
+        map.iter().map(|(id, &src)| (id, self.ptr(src))).collect()
+    }
+
+    fn forth<N: AstNode, V: Copy>(
+        &self,
+        map: &FxHashMap<InFile<AstPtr<N>>, V>,
+    ) -> FxHashMap<InFile<AstPtr<N>>, V> {
+        map.iter().map(|(&src, &id)| (self.ptr(src), id)).collect()
+    }
+
+    fn raw(&self, src: InFile<SyntaxNodePtr>) -> InFile<SyntaxNodePtr> {
+        match src.file_id == self.file {
+            true => InFile::new(src.file_id, (self.to)(src.value)),
+            false => src,
+        }
+    }
+}
+
+impl ExpressionStoreSourceMap {
+    /// The same map with what it points to in `mv.file` moved: what a body lowered as a tree of
+    /// its own maps to, as a map of where the body is in its file
+    /// ([`crate::expr_store::body::BodySyntax`]).
+    pub(crate) fn moved(&self, mv: &Move<'_>) -> ExpressionStoreSourceMap {
+        let types_map_back = mv.back(&self.types_map_back);
+        let lifetime_map_back = mv.back(&self.lifetime_map_back);
+        let expr_only = self.expr_only.as_deref().map(|it| {
+            let template_map = it.template_map.as_deref().map(|it| FormatTemplate {
+                format_args_to_captures: it.format_args_to_captures.clone(),
+                asm_to_captures: it.asm_to_captures.clone(),
+                implicit_capture_to_source: (it.implicit_capture_to_source.iter())
+                    .map(|(&expr, src)| {
+                        let (ptr, range) = src.value;
+                        let ptr = mv.ptr(InFile::new(src.file_id, ptr)).value;
+                        (expr, InFile::new(src.file_id, (ptr, range)))
+                    })
+                    .collect(),
+            });
+            Box::new(ExpressionOnlySourceMap {
+                expr_map: mv.forth(&it.expr_map),
+                expr_map_back: mv.back(&it.expr_map_back),
+                pat_map: mv.forth(&it.pat_map),
+                pat_map_back: mv.back(&it.pat_map_back),
+                label_map: mv.forth(&it.label_map),
+                label_map_back: mv.back(&it.label_map_back),
+                binding_definitions: it.binding_definitions.clone(),
+                field_map_back: (it.field_map_back.iter())
+                    .map(|(&id, &src)| (id, mv.ptr(src)))
+                    .collect(),
+                pat_field_map_back: (it.pat_field_map_back.iter())
+                    .map(|(&id, &src)| (id, mv.ptr(src)))
+                    .collect(),
+                template_map: template_map.map(Box::new),
+                expansions: mv.forth(&it.expansions),
+                diagnostics: it.diagnostics.iter().map(|it| it.moved(mv)).collect(),
+            })
+        });
+        ExpressionStoreSourceMap {
+            expr_only,
+            types_map: types_map_back.iter().map(|(id, &src)| (src, id)).collect(),
+            types_map_back,
+            lifetime_map: lifetime_map_back.iter().map(|(id, &src)| (src, id)).collect(),
+            lifetime_map_back,
+        }
+    }
+}
+
+impl ExpressionStoreDiagnostics {
+    fn moved(&self, mv: &Move<'_>) -> Self {
+        use ExpressionStoreDiagnostics::*;
+        match self {
+            InactiveCode { node, cfg, opts } => {
+                InactiveCode { node: mv.raw(*node), cfg: cfg.clone(), opts: opts.clone() }
+            }
+            UnresolvedMacroCall { node, path } => {
+                UnresolvedMacroCall { node: mv.ptr(*node), path: path.clone() }
+            }
+            UnreachableLabel { node, name } => {
+                UnreachableLabel { node: mv.ptr(*node), name: name.clone() }
+            }
+            AwaitOutsideOfAsync { node, location } => {
+                AwaitOutsideOfAsync { node: mv.ptr(*node), location: location.clone() }
+            }
+            UndeclaredLabel { node, name } => {
+                UndeclaredLabel { node: mv.ptr(*node), name: name.clone() }
+            }
+            PatternArgInExternFn { node } => PatternArgInExternFn { node: mv.ptr(*node) },
+            FruInDestructuringAssignment { node } => {
+                FruInDestructuringAssignment { node: mv.ptr(*node) }
+            }
+            MissingBody { node, kind } => MissingBody { node: mv.raw(*node), kind: *kind },
+        }
     }
 }
 
