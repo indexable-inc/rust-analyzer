@@ -157,7 +157,10 @@ building does, because it decides which locals are kept, in which order, in whic
   coroutines, and checks are `Assert`s with their own unwind edges, so what is in scope in one
   scope is never seen with what is in scope in another.
 - **Temporaries.** A temporary is made before what is lowered into it, as rustc's `as_temp`
-  does, and `into_future`'s destination before the awaited expression's temporaries.
+  does, and `into_future`'s destination before the awaited expression's temporaries. A
+  `let` that binds one name by value has its initializer lowered into the binding, as
+  rustc's `expr_into_pattern` does, not into a temporary copied after: `let x = f.await`
+  writes `x` before the awaitee is dropped, so `x` conflicts with it as in rustc.
 - **Promotion.** The promoted locals rustc promotes (nothing to drop, no cell) are never kept
   for a yield (`MirBody::promoted_constants`); rustc's `PromoteTemps` makes them constants.
 

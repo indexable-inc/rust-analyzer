@@ -2860,6 +2860,31 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 } => {
                     // rustc declares what the pattern binds before it lowers the initializer.
                     self.declare_bindings(*pat);
+                    // `let x = e` with `x` bound by value: rustc lowers `e` into `x` itself
+                    // (`expr_into_pattern`), so `x` holds the value before the temporaries of
+                    // `e` are dropped, which is what a coroutine's storage conflicts see.
+                    if let (Some(expr_id), None, false, Pat::Bind { id, subpat: None }) =
+                        (initializer, else_branch, *is_super, &self.store[*pat])
+                        && matches!(
+                            self.store[*id].mode,
+                            BindingAnnotation::Unannotated | BindingAnnotation::Mutable
+                        )
+                    {
+                        let binding = *id;
+                        self.extend_temporaries(*expr_id, *pat);
+                        self.push_storage_live(binding, current)?;
+                        let local = self.binding_local(binding)?;
+                        let temporaries = self.push_drop_scope();
+                        self.drop_scopes.last_mut().unwrap().temporaries = true;
+                        let Some(c) = self.lower_expr_to_place(*expr_id, local.into(), current)?
+                        else {
+                            temporaries.pop_assume_dropped(self);
+                            scope.pop_assume_dropped(self);
+                            return Ok(None);
+                        };
+                        current = temporaries.pop_and_drop(self, c, span);
+                        continue;
+                    }
                     if let Some(expr_id) = initializer {
                         let else_block;
                         let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
