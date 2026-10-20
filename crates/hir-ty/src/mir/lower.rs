@@ -107,6 +107,10 @@ struct MirLowerCtx<'a, 'db> {
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
     ends_temporaries: FxHashSet<ExprId>,
+    /// The bindings of the body that have no local yet. rustc declares a binding where its
+    /// pattern is lowered (a `let` before its initializer), so locals are numbered in that
+    /// order, which decides the order of what an `async` block keeps in its future.
+    undeclared: FxHashSet<BindingId>,
     /// The locals that hold an operand of an aggregate or a call lowered so far.
     operand_locals: FxHashSet<LocalId>,
     /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
@@ -255,6 +259,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             },
             phase: MirPhase::Built,
             panic_cleanup: None,
+            upvars_in_place: Vec::new(),
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -280,6 +285,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             super_let: None,
             inline_consts: 0,
             ends_temporaries: FxHashSet::default(),
+            undeclared: FxHashSet::default(),
             operand_locals: FxHashSet::default(),
             arm_unreached: false,
             or_choices: FxHashMap::default(),
@@ -1279,14 +1285,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // the same body (see inference, which infers the inner expression directly), so we
                 // lower that expression in place. Const-ness is irrelevant here: MIR evaluation
                 // already runs in a const context.
-                // The block owns its bindings, so the enclosing body gave them no locals.
+                // The block owns its bindings, so the enclosing body did not pick them: they
+                // are declared where the block binds them.
                 for (binding, _) in self.store.bindings() {
                     if self.store.binding_owner(binding) == Some(expr_id)
                         && !self.result.binding_locals.contains_idx(binding)
                     {
-                        let ty = self.infer.binding_ty(binding).store();
-                        let local = self.result.locals.alloc(Local { ty });
-                        self.result.binding_locals.insert(binding, local);
+                        self.undeclared.insert(binding);
                     }
                 }
                 self.inline_consts += 1;
@@ -2709,6 +2714,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     continue;
                 };
                 self.extend_temporaries(*initializer, *pat);
+                self.declare_bindings(*pat);
                 let Some((init_place, c)) =
                     self.lower_expr_as_place(current, *initializer, true)?
                 else {
@@ -2728,6 +2734,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 hir_def::hir::Statement::Let {
                     pat, initializer, else_branch, is_super, ..
                 } => {
+                    // rustc declares what the pattern binds before it lowers the initializer.
+                    self.declare_bindings(*pat);
                     if let Some(expr_id) = initializer {
                         let else_block;
                         let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
@@ -2907,16 +2915,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             local_id
         }));
-        // and then rest of bindings
+        // The rest of the bindings get a local where they are declared.
         for (id, _) in self.store.bindings() {
-            if !pick_binding(id) {
-                continue;
-            }
-            if !self.result.binding_locals.contains_idx(id) {
-                self.result.binding_locals.insert(
-                    id,
-                    self.result.locals.alloc(Local { ty: self.infer.binding_ty(id).store() }),
-                );
+            if pick_binding(id) && !self.result.binding_locals.contains_idx(id) {
+                self.undeclared.insert(id);
             }
         }
         let mut current = self.result.start_block;
@@ -2961,7 +2963,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok(current)
     }
 
-    fn binding_local(&self, b: BindingId) -> Result<'db, LocalId> {
+    /// Gives each binding of `pat` that has none a local, in the order of the pattern.
+    fn declare_bindings(&mut self, pat: PatId) {
+        let mut bindings = Vec::new();
+        self.store.walk_bindings_in_pat(pat, |b| bindings.push(b));
+        for b in bindings {
+            self.declare_binding(b);
+        }
+    }
+
+    fn declare_binding(&mut self, b: BindingId) {
+        if self.undeclared.remove(&b) {
+            let local = self.result.locals.alloc(Local { ty: self.infer.binding_ty(b).store() });
+            self.result.binding_locals.insert(b, local);
+        }
+    }
+
+    fn binding_local(&mut self, b: BindingId) -> Result<'db, LocalId> {
+        // A binding not declared by its `let` is declared where it is first bound or used:
+        // a match arm's when the arm binds, as rustc declares it.
+        self.declare_binding(b);
         match self.result.binding_locals.get(b) {
             Some(it) => Ok(*it),
             None => {
@@ -3080,11 +3101,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             scope.pop_assume_dropped(self);
             return Ok(None);
         };
+        // rustc's `match into_future(e) { mut __awaitee => loop { .. } }`: the future polled is
+        // a binding of its own, which takes it from the temporary `into_future` returned into.
+        let awaitee: Place<'db> = self.temp(future_ty, current, MirSpan::Unknown)?.into();
+        self.push_assignment(current, awaitee, moved(future).into(), span);
         let again = self.new_basic_block();
         self.set_goto(current, again, span);
 
         let future_ref: Place<'db> = self.temp(future_ref_ty, again, MirSpan::Unknown)?.into();
-        self.push_assignment(again, future_ref, Rvalue::Ref(mutable, future.store()), span);
+        self.push_assignment(again, future_ref, Rvalue::Ref(mutable, awaitee.store()), span);
         let pinned: Place<'db> = self.temp(pin_ty, again, MirSpan::Unknown)?.into();
         self.push_assignment(
             again,

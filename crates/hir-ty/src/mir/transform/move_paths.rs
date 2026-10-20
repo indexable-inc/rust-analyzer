@@ -502,7 +502,7 @@ impl InitAnalysis {
         let mut entry: Vec<Option<InitState>> = vec![None; body.basic_blocks.len()];
         let mut start = InitState::bottom(len);
         start.set(&(0..len).collect::<Vec<_>>(), false);
-        for &param in &body.param_locals {
+        for param in body.entry_locals() {
             if let Some(path) = data.for_local(param) {
                 start.set(&data.subtree(path), true);
             }

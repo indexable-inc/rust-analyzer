@@ -123,24 +123,39 @@ The layout (`layout.rs`) hands those to `rustc_abi`'s coroutine layout, with onl
 the prefix and each local a `MaybeUninit` of its type, as `rustc_ty_utils` does. The vendored
 `rustc_abi` coroutine layout is the same code as rustc 1.99's.
 
-So for the same MIR the layout is rustc's. The MIR is not the same yet, and these differences
-change which locals are kept, in which order, and in which variant:
-- **Locals.** RA declares every binding of a body before any temporary; rustc declares a
-  binding where its pattern is lowered. Saved locals are ordered by local index, and fields of
-  one variant with the same alignment are placed in that order.
-- **`await`.** rustc desugars it to `match into_future(e) { mut __awaitee => loop { match
-  poll(Pin::new_unchecked(&mut __awaitee), get_context(cx)) { .. } cx = yield () } }`; RA
-  lowers it directly, with other temporaries and no `__awaitee` binding.
-- **Captures.** RA moves each capture of an `async` block into a local at the start of the
-  body; rustc uses captures in place, so those locals are kept by RA and not by rustc, and
-  RA's future can be bigger. rustc does move the parameters of an `async fn` into locals
-  (`let x = x;` in its HIR lowering), which RA does not do the same way.
-- **Storage markers.** rustc emits `StorageDead` on coroutine unwind paths too; RA's cleanup
-  chain has none. Where markers are placed decides storage conflicts.
-- **Block order.** rustc's yields are numbered in block order after `SimplifyCfg`, which merges
-  blocks; RA's are numbered in lowering order.
-- **Promotion and cleanup.** rustc's body has had constants promoted, fake reads and fake
-  borrows removed, and `Derefer` run before the transform.
+So for the same MIR the layout is rustc's. What lowering and the passes now do as rustc's MIR
+building does, because it decides which locals are kept, in which order, in which variant:
+- **Declaring bindings.** A binding gets its local where rustc declares it: a `let`'s before
+  its initializer is lowered, a match arm's or an `if let`'s where it is bound (rustc declares
+  those after the tests, arm by arm). Locals were all allocated before the body before.
+- **`await`.** The future `into_future` returns is moved into a local of its own, rustc's
+  `__awaitee`, whose storage starts there; the loop borrows that one.
+- **Captures in place.** The pass `upvars::upvars_in_place` makes the locals lowering copies
+  an `async` body's captures into the captures themselves (`MirBody::upvars_in_place`): they
+  hold a value at entry, live in the future's prefix and are never kept for a yield, as rustc
+  uses `(_1.i)`. An `async fn`'s parameters are still moved into locals by the `let x = x;`
+  statements of its body, as in rustc's HIR.
+- **Drop flags.** They are made before any drop is elaborated, in rustc's order: for each drop
+  in block order, the paths under the dropped one that may and may not hold a value, depth
+  first, the child made last first (`collect_drop_flags`).
+- **Yields.** Numbered in block order, which is the order lowering makes them in. rustc numbers
+  them in block order after `SimplifyCfg`, which never moves a yield: its block is an arm of
+  the switch on the poll result, not the target of a `goto` it could be merged into.
+
+What still differs:
+- **Unwind paths.** rustc builds an unwind drop tree per scope, and in coroutines it emits
+  `StorageDead` on it. Here every call and panicking statement unwinds to one chain for the
+  whole body (`cleanup::add_cleanup_paths`), so the storage states of all unwind points meet
+  at its head, and two kept locals that rustc can overlap may be recorded as conflicting
+  there. Adding `StorageDead` to the chain does not change that. It needs per-scope unwind
+  trees from lowering, and, because statements that panic share `panic_cleanup`, `Assert`
+  terminators for overflow and bounds checks.
+- **Temporaries.** RA makes a temporary for a `let` initializer that rustc lowers straight
+  into the binding, allocates a call's argument temporaries before its destination where
+  rustc does the opposite, and so on. These are rarely kept across a yield, but where they
+  are, their order can differ.
+- **Promotion and cleanup.** rustc's body has had constants promoted, fake reads removed and
+  `Derefer` run before the transform.
 
 Until these match, ra-jit keeps a future and everything that makes, polls or drops it on one
 side (rustc's or its own); `RA_JIT_MIX_FUTURES=1` lifts that to measure how close the layouts

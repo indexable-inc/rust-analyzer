@@ -1305,6 +1305,11 @@ pub struct MirBody<'db> {
     /// index out of bounds, an overflow, a division by zero. rustc has an `Assert` terminator
     /// for each of these; here they stay inside the statement, so they share one target.
     pub panic_cleanup: Option<BasicBlockId>,
+    /// From [`MirPhase::Runtime`] on, in the body of an `async` block: the locals lowering
+    /// copied each capture into, which are the captures themselves, the field of the future
+    /// with the index next to each. They hold their value when the body starts and are kept in
+    /// the future's prefix, as rustc uses captures in place (`(_1.0)`).
+    pub upvars_in_place: Vec<(LocalId, u32)>,
 }
 
 /// What a body means, which depends on the passes it has been through. The IDE only ever
@@ -1348,6 +1353,12 @@ impl MirBody<'_> {
             Rvalue::Ref(_, future) => Some(future.local),
             _ => None,
         }
+    }
+
+    /// The locals that hold a value when the body starts: its parameters, and in an `async`
+    /// body the captures it uses in place.
+    pub fn entry_locals(&self) -> impl Iterator<Item = LocalId> + '_ {
+        self.param_locals.iter().copied().chain(self.upvars_in_place.iter().map(|it| it.0))
     }
 
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
@@ -1504,7 +1515,9 @@ impl MirBody<'_> {
             inherits_overflow_checks: _,
             phase: _,
             panic_cleanup: _,
+            upvars_in_place,
         } = self;
+        upvars_in_place.shrink_to_fit();
         unreached.shrink_to_fit();
         scope_ends.shrink_to_fit();
         promoted_locals.shrink_to_fit();

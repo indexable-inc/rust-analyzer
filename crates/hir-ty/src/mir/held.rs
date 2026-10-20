@@ -231,6 +231,10 @@ impl MirBody<'_> {
             if let Some(receiver) = receiver {
                 live.remove(receiver);
             }
+            // What the body uses in place of a capture is the future's own field.
+            for &(local, _) in &self.upvars_in_place {
+                live.remove(local_index(local));
+            }
             any.union(&live);
             at_yields.push((*resume, *drop, live));
         }

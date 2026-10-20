@@ -173,6 +173,24 @@ pub(super) fn elaborate_drops<'db>(
         span: MirSpan::Unknown,
         resume: None,
     };
+    // rustc makes every flag before it elaborates a drop (`collect_drop_flags`): for each drop
+    // in block order, each path under the dropped one that may and may not hold a value there,
+    // depth first and the child made last first, as rustc links a path's children. The flags
+    // are locals in that order, which is where an `async` block keeps them.
+    for site in &sites {
+        let ty = site.place.as_ref().ty(elaborator.body, &ctx.infcx, ctx.env).ty;
+        if !ctx.needs_drop(ty) {
+            continue;
+        }
+        let Lookup::Exact(path) = data.lookup(ctx, &site.place) else { continue };
+        let mut stack = vec![path];
+        while let Some(at) = stack.pop() {
+            if site.state.of(at) == (true, true) {
+                elaborator.flag(at);
+            }
+            stack.extend(data.paths[at].children.iter().map(|&(_, child)| child));
+        }
+    }
     // After a drop the place holds nothing, whichever way the drop went.
     let mut resets: Vec<(BasicBlockId, PathId)> = Vec::new();
     for site in sites {
@@ -282,7 +300,7 @@ pub(super) fn elaborate_drops<'db>(
     let mut flagged: Vec<PathId> = flags.keys().copied().collect();
     flagged.sort_unstable();
     let mut start = set(&flagged, false);
-    for &param in &body.param_locals {
+    for param in body.entry_locals() {
         if let Some(path) = data.for_local(param) {
             start.extend(set(&subtrees[path], true));
         }

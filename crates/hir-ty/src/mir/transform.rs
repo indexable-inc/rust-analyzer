@@ -14,6 +14,7 @@ mod cleanup;
 mod elaborate_drops;
 mod move_paths;
 mod packed_drops;
+mod upvars;
 
 use std::cell::RefCell;
 
@@ -95,6 +96,7 @@ impl<'db> Ctx<'db> {
 fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
     let ctx = Ctx::new(db, body.owner);
+    upvars::upvars_in_place(&mut body);
     cleanup::hoist_indexing(&ctx, &mut body);
     cleanup::add_cleanup_paths(&ctx, &mut body);
     elaborate_drops::elaborate_drops(&ctx, &mut body)?;

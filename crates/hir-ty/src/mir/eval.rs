@@ -58,8 +58,8 @@ use crate::{
 
 use super::{
     AggregateKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirLowerError, MirPhase,
-    MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue,
-    StatementKind, StoredPlace, TerminatorKind, UnOp, return_slot,
+    MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
+    StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 
 mod shim;
@@ -271,11 +271,7 @@ impl Interval {
         memory.read_memory(self.addr, self.size)
     }
 
-    fn write_from_bytes<'db>(
-        &self,
-        memory: &mut Evaluator<'db>,
-        bytes: &[u8],
-    ) -> Result<'db, ()> {
+    fn write_from_bytes<'db>(&self, memory: &mut Evaluator<'db>, bytes: &[u8]) -> Result<'db, ()> {
         memory.write_memory(self.addr, bytes)
     }
 
@@ -534,11 +530,8 @@ impl<'db> Evaluator<'db> {
             not_supported!("a constant computed from a `TypeId`");
         }
         let bytes = interval.get(self)?;
-        let mut memory_map = self.create_memory_map(
-            bytes,
-            ty,
-            &Locals { ptr: ArenaMap::new(), body },
-        )?;
+        let mut memory_map =
+            self.create_memory_map(bytes, ty, &Locals { ptr: ArenaMap::new(), body })?;
         let bytes = Box::from(bytes);
         let memory_map = if memory_map.memory.is_empty()
             && memory_map.statics.is_empty()
@@ -809,11 +802,7 @@ impl<'db> Evaluator<'db> {
         self.layout(Ty::new_adt(self.interner(), adt, subst))
     }
 
-    fn place_ty<'b>(
-        &'b self,
-        p: &StoredPlace,
-        locals: &'b Locals<'db>,
-    ) -> Result<'db, Ty<'db>> {
+    fn place_ty<'b>(&'b self, p: &StoredPlace, locals: &'b Locals<'db>) -> Result<'db, Ty<'db>> {
         Ok(self.place_addr_and_ty_and_metadata(p, locals)?.1)
     }
 
@@ -1901,11 +1890,7 @@ impl<'db> Evaluator<'db> {
         Ok(result)
     }
 
-    fn eval_operand(
-        &mut self,
-        it: &Operand,
-        locals: &mut Locals<'db>,
-    ) -> Result<'db, Interval> {
+    fn eval_operand(&mut self, it: &Operand, locals: &mut Locals<'db>) -> Result<'db, Interval> {
         Ok(match &it.kind {
             OperandKind::Copy(p) | OperandKind::Move(p) => self.eval_place(p, locals)?,
             OperandKind::Static(st) => {
