@@ -73,6 +73,9 @@ wasm-encoder = { version = "0.244", default-features = false, features = ["std"]
 # The LLVM backend. Needs LLVM 20 at build time: set `LLVM_SYS_201_PREFIX` to its prefix.
 inkwell = { version = "0.9.0", default-features = false, features = ["llvm20-1-prefer-dynamic", "target-x86", "target-aarch64"], optional = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+stacker = "0.1.17"
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

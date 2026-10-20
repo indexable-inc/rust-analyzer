@@ -61,6 +61,21 @@ pub type TypeError<'db> = rustc_type_ir::error::TypeError<DbInterner<'db>>;
 pub type QueryResult<'db> = rustc_type_ir::solve::QueryResult<DbInterner<'db>>;
 pub type FxIndexMap<K, V> = rustc_type_ir::data_structures::IndexMap<K, V>;
 
+/// Runs `f` with at least 100 KiB of stack left, on a new 1 MiB segment if this one has less,
+/// as rustc's `ensure_sufficient_stack` does: that of `rustc_type_ir` does nothing outside
+/// rustc. The solver recurses once per nested goal and once per level of a type it relates,
+/// both as deep as `recursion_limit`, and an unoptimized build overflows a 2 MB thread long
+/// before that.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(100 * 1024, 1024 * 1024, f)
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 pub struct DefaultTypes<'db> {
     pub usize: Ty<'db>,
     pub u8: Ty<'db>,

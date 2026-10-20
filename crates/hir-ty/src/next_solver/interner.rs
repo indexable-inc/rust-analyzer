@@ -1056,7 +1056,8 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex) {
-        (task(), DepNodeIndex)
+        // Every goal the solver computes runs in here, a nested goal inside its parent's.
+        (super::ensure_sufficient_stack(task), DepNodeIndex)
     }
 
     fn with_global_cache<R>(
@@ -1263,10 +1264,7 @@ impl<'db> Interner for DbInterner<'db> {
     fn recursion_limit(self) -> usize {
         // A lower limit than the crate's makes deeply nested but valid obligations (tower's
         // future types) ambiguous.
-        let limit = self.recursion_limit;
-        // FIXME: an unoptimized build overflows a 2 MB stack at that depth; grow the stack
-        // instead, as rustc does.
-        if cfg!(debug_assertions) { limit.min(50) as usize } else { limit as usize }
+        self.recursion_limit as usize
     }
 
     fn is_type_const(self, _def_id: Self::DefId) -> bool {

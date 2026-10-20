@@ -1094,7 +1094,7 @@ impl<'db> Relate<DbInterner<'db>> for Ty<'db> {
         a: Self,
         b: Self,
     ) -> rustc_type_ir::relate::RelateResult<DbInterner<'db>, Self> {
-        relation.tys(a, b)
+        super::ensure_sufficient_stack(|| relation.tys(a, b))
     }
 }
 
