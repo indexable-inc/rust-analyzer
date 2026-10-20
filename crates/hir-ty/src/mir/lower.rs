@@ -2862,18 +2862,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.declare_bindings(*pat);
                     // `let x = e` with `x` bound by value: rustc lowers `e` into `x` itself
                     // (`expr_into_pattern`), so `x` holds the value before the temporaries of
-                    // `e` are dropped, which is what a coroutine's storage conflicts see.
+                    // `e` are dropped, which is what a coroutine's storage conflicts see. A
+                    // value of a type without a size can't be a local, so that goes the other
+                    // way, which says so.
                     if let (Some(expr_id), None, false, Pat::Bind { id, subpat: None }) =
                         (initializer, else_branch, *is_super, &self.store[*pat])
                         && matches!(
                             self.store[*id].mode,
                             BindingAnnotation::Unannotated | BindingAnnotation::Mutable
                         )
+                        && !matches!(
+                            self.infer.binding_ty(*id).kind(),
+                            TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..)
+                        )
                     {
                         let binding = *id;
                         self.extend_temporaries(*expr_id, *pat);
-                        self.push_storage_live(binding, current)?;
                         let local = self.binding_local(binding)?;
+                        // rustc's storage_live_binding: the storage starts here, and the drop of
+                        // the value is scheduled only once it holds one, after the initializer
+                        // and the temporaries it extends, so that nothing unwinding out of the
+                        // initializer drops it.
+                        let at = MirSpan::BindingId(binding);
+                        self.push_statement(
+                            current,
+                            StatementKind::StorageLive(local).with_span(at),
+                        );
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
                         let Some(c) = self.lower_expr_to_place(*expr_id, local.into(), current)?
@@ -2883,6 +2897,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             return Ok(None);
                         };
                         current = temporaries.pop_and_drop(self, c, span);
+                        if let Some(scope) =
+                            self.drop_scopes.iter_mut().rev().find(|it| !it.temporaries)
+                            && !scope.locals.contains(&local)
+                        {
+                            scope.locals.push(local);
+                        }
                         continue;
                     }
                     if let Some(expr_id) = initializer {
