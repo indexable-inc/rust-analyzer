@@ -316,26 +316,38 @@ fn bounds_checks<'db>(
             projection: Projection::new_from_slice(&projection[..at]).store(),
         };
         let usize_ty = Ty::new_uint(ctx.infcx.interner, rustc_type_ir::UintTy::Usize);
-        let len = temp(body, usize_ty);
         let lt = temp(body, ctx.bool_ty());
         let index = Operand { kind: OperandKind::Copy(Place::from(*index).store()), span: None };
-        checks.push(Check {
-            setup: vec![
-                Statement {
+        // An array's length is its constant, as rustc has it (monomorphization fills in a
+        // generic one); a slice's is read from the place.
+        let base_ty = ctx.normalize(base.as_ref().ty(body, &ctx.infcx, ctx.env).ty);
+        let mut setup = Vec::new();
+        let len = match base_ty.kind() {
+            TyKind::Array(_, len) => Operand {
+                kind: OperandKind::Constant { konst: len.store(), ty: usize_ty.store() },
+                span: None,
+            },
+            _ => {
+                let len = temp(body, usize_ty);
+                setup.push(Statement {
                     kind: StatementKind::Assign(Place::from(len).store(), Rvalue::Len(base)),
                     span,
-                },
-                Statement {
-                    kind: StatementKind::Assign(
-                        Place::from(lt).store(),
-                        Rvalue::BinaryOp(BinOp::Lt, index.clone(), copy_of(len)),
-                    ),
-                    span,
-                },
-            ],
+                });
+                copy_of(len)
+            }
+        };
+        setup.push(Statement {
+            kind: StatementKind::Assign(
+                Place::from(lt).store(),
+                Rvalue::BinaryOp(BinOp::Lt, index.clone(), len.clone()),
+            ),
+            span,
+        });
+        checks.push(Check {
+            setup,
             cond: move_of(lt),
             expected: true,
-            msg: AssertKind::BoundsCheck { len: copy_of(len), index },
+            msg: AssertKind::BoundsCheck { len, index },
             // rustc reports it at the indexing expression, where the index's temporary starts.
             span: match elem {
                 ProjectionElem::Index(index) => index_spans.get(index).copied().unwrap_or(span),

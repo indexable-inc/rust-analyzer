@@ -2376,7 +2376,7 @@ pub struct CStr {
 }
 const GOAL: u8 = {
     let a = c"hello";
-    a.inner[6]
+    a.inner[5]
 };
     "#,
         0,
