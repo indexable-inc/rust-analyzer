@@ -560,7 +560,7 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
         .iter()
         .filter(|dep| {
             let data = dep.crate_id.data(db);
-            !(dep.is_sysroot() || data.origin.is_lang() || data.is_proc_macro)
+            !(dep.is_sysroot() || data.origin.is_lang() || data.target_kind.is_proc_macro())
         })
         .collect();
     // Few files name a dependency, and a file's text tells which may without its tree.
