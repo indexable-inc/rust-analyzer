@@ -1228,6 +1228,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 return Ok(None);
                             };
                             current = c;
+                            // What unwinds from the next field drops this one first.
+                            self.declare_operands_last(expr_id, declared, std::iter::once(&op));
                             operands[u32::from(field_id.into_raw()) as usize] = Some(op);
                         }
                         self.declare_operands_last(expr_id, declared, operands.iter().flatten());
@@ -1766,6 +1768,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             return Ok(None);
                         };
                         current = c;
+                        // What unwinds from the next operand drops this one first.
+                        self.declare_operands_last(expr_id, declared, std::iter::once(&o));
                         Ok(Some(o))
                     })
                     .collect::<Result<'_, Option<_>>>()?
@@ -1799,6 +1803,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 return Ok(None);
                             };
                             current = c;
+                            // What unwinds from the next element drops this one first.
+                            self.declare_operands_last(expr_id, declared, std::iter::once(&o));
                             Ok(Some(o))
                         })
                         .collect::<Result<'_, Option<_>>>()?
@@ -2232,6 +2238,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .map(|arg| {
                 if let Some((temp, c)) = self.lower_expr_to_some_operand(arg, current)? {
                     current = c;
+                    // What unwinds from the next argument drops this one first.
+                    self.declare_operands_last(call, declared, std::iter::once(&temp));
                     Ok(Some(temp))
                 } else {
                     Ok(None)
