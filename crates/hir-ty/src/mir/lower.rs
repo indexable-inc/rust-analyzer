@@ -3681,14 +3681,21 @@ fn mir_body_for_coroutine_cycle_result<'db>(
 /// Refuses a body with a macro call that failed to expand: what stands in for the expansion
 /// is a guess, where rustc stops.
 fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Result<'db, ()> {
-    let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
-    for (_, call) in source_map.macro_calls() {
-        if let Some(error) = &call.parse_macro_expansion(db).err {
-            let message = error.render_to_string(db).message;
-            not_supported!("macro call that failed to expand: {message}");
-        }
+    if let Some(message) = failed_expansion(db, owner) {
+        not_supported!("macro call that failed to expand: {message}");
     }
     Ok(())
+}
+
+/// Why the first macro call of the body that failed to expand did. A query of its own: the
+/// source map it reads changes with every edit above the body, and what it finds does not.
+#[salsa::tracked(returns(ref))]
+fn failed_expansion<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Option<String> {
+    let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
+    source_map.macro_calls().find_map(|(_, call)| {
+        let error = call.parse_macro_expansion(db).err.as_ref()?;
+        Some(error.render_to_string(db).message)
+    })
 }
 
 /// How the body of a closure gets at what the closure captured.

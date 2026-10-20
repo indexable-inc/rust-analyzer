@@ -829,6 +829,17 @@ fn closures_around(
     owner: DefWithBodyId,
     target: ExprId,
 ) -> Option<Vec<(usize, ClosureKind)>> {
+    closures_around_query(db, owner, target).clone()
+}
+
+/// [`closures_around`], kept: it reads the source map, which changes with every edit above
+/// the body, and what it finds does not.
+#[salsa::tracked(returns(ref))]
+fn closures_around_query(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    target: ExprId,
+) -> Option<Vec<(usize, ClosureKind)>> {
     let (body, source_map) = Body::with_source_map(db, owner);
     let mut around = Vec::new();
     if !find_closures(body, body.root_expr(), target, &mut around) {
