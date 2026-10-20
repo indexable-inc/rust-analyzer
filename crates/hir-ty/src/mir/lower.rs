@@ -48,9 +48,9 @@ use crate::{
     mir::{
         AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
         CoroutineLocals, Expr, FieldIndex, GenericArgs, Idx, InferenceResult, Local, LocalId,
-        MemoryMap, MirBody, MirSpan, Mutability, Operand, PlaceElem, PointerCast, Projection,
-        ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets, Terminator,
-        TerminatorKind, Ty, UnOp, VariantId, return_slot,
+        MemoryMap, MirBody, MirPhase, MirSpan, Mutability, Operand, PlaceElem, PointerCast,
+        Projection, ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, SwitchTargets,
+        Terminator, TerminatorKind, Ty, UnOp, VariantId, return_slot,
     },
     next_solver::{
         Const, DbInterner, ParamConst, ParamEnv, Region, StoredGenericArgs, StoredTy, TyKind,
@@ -253,6 +253,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 _ => false,
             },
+            phase: MirPhase::Built,
+            panic_cleanup: None,
         };
         let store_owner = owner.expression_store_owner(db);
         let resolver = owner.resolver(db);
@@ -3659,6 +3661,7 @@ fn lower_closure_body<'db>(
     if let Some(err) = err {
         return Err(MirLowerError::UnresolvedUpvar(err));
     }
+    ctx.result.mark_moves(&ctx.infcx, ctx.env);
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
 }
@@ -3772,6 +3775,7 @@ pub fn promoted_mir_body_query<'db>(
         let current = ctx.pop_drop_scope_assert_finished(current, expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(expr).end());
     }
+    ctx.result.mark_moves(&ctx.infcx, ctx.env);
     ctx.result.shrink_to_fit();
     Ok(ctx.result)
 }
@@ -3882,6 +3886,7 @@ pub fn lower_to_mir_with_store<'db>(
         let current = ctx.pop_drop_scope_assert_finished(current, root_expr.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root_expr).end());
     }
+    ctx.result.mark_moves(&ctx.infcx, ctx.env);
     Ok(ctx.result)
 }
 

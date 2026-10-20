@@ -128,6 +128,84 @@ pub trait HirDatabase: SourceDatabase + 'static {
             .map_err(|err| err.clone())
     }
 
+    /// The body as the interpreter and the code generator run it: after drop elaboration and
+    /// the other passes to `MirPhase::Runtime`. The IDE asks for [`HirDatabase::mir_body`].
+    fn runtime_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::runtime_mir_body_query(db, def).map_err(|err| err.clone())
+    }
+
+    fn runtime_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::runtime_mir_body_for_closure_query(db, def).map_err(|err| err.clone())
+    }
+
+    fn runtime_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::runtime_mir_body_for_coroutine_query(db, def).map_err(|err| err.clone())
+    }
+
+    fn runtime_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::runtime_mir_body_for_coroutine_by_move_query(db, def).map_err(|err| err.clone())
+    }
+
+    fn monomorphized_runtime_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_runtime_mir_body_query(db, def, subst, env)
+            .map_err(|err| err.clone())
+    }
+
+    fn monomorphized_runtime_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_runtime_mir_body_for_closure_query(db, def, subst, env)
+            .map_err(|err| err.clone())
+    }
+
+    fn monomorphized_runtime_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_runtime_mir_body_for_coroutine_query(db, def, subst, env)
+            .map_err(|err| err.clone())
+    }
+
+    fn monomorphized_runtime_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_runtime_mir_body_for_coroutine_by_move_query(db, def, subst, env)
+            .map_err(|err| err.clone())
+    }
+
     fn const_eval<'db>(
         &'db self,
         def: ConstId,

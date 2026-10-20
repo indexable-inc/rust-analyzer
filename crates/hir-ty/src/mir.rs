@@ -37,6 +37,7 @@ pub mod codegen;
 mod eval;
 mod lower;
 mod monomorphization;
+mod transform;
 mod type_name;
 
 pub use eval::{
@@ -52,6 +53,13 @@ pub use monomorphization::{
     monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
     monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
     monomorphized_promoted_mir_body_query,
+};
+pub use transform::{
+    monomorphized_runtime_mir_body_for_closure_query,
+    monomorphized_runtime_mir_body_for_coroutine_by_move_query,
+    monomorphized_runtime_mir_body_for_coroutine_query, monomorphized_runtime_mir_body_query,
+    runtime_mir_body_for_closure_query, runtime_mir_body_for_coroutine_by_move_query,
+    runtime_mir_body_for_coroutine_query, runtime_mir_body_query,
 };
 
 pub type BasicBlockId = Idx<BasicBlock>;
@@ -741,6 +749,21 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    /// Whether the operation panics for some operands: on overflow, when overflow is checked,
+    /// or when dividing by zero.
+    pub fn may_panic(&self) -> bool {
+        matches!(
+            self,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::Shl
+                | BinOp::Shr
+        )
+    }
+
     fn run_compare<T: PartialEq + PartialOrd>(&self, l: T, r: T) -> bool {
         match self {
             BinOp::Ge => l >= r,
@@ -1050,6 +1073,213 @@ pub struct BasicBlock {
     pub is_cleanup: bool,
 }
 
+impl StatementKind {
+    /// Whether the statement may panic: index out of bounds, overflow, division by zero. From
+    /// [`MirPhase::Runtime`] on such a panic unwinds to [`MirBody::panic_cleanup`]; no other
+    /// statement unwinds.
+    pub fn may_panic(&self) -> bool {
+        let indexes = |place: &StoredPlace| {
+            place.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Index(_)))
+        };
+        match self {
+            StatementKind::Assign(place, rvalue) => {
+                let mut panics = indexes(place);
+                rvalue.for_each_operand(&mut |operand| {
+                    if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+                        panics |= indexes(place);
+                    }
+                });
+                panics
+                    || match rvalue {
+                        Rvalue::CheckedBinaryOp(op, ..) => op.may_panic(),
+                        Rvalue::UnaryOp(UnOp::Neg, _) => true,
+                        Rvalue::Ref(_, place)
+                        | Rvalue::Len(place)
+                        | Rvalue::Discriminant(place)
+                        | Rvalue::CopyForDeref(place) => indexes(place),
+                        _ => false,
+                    }
+            }
+            StatementKind::FakeRead(place) => indexes(place),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
+        match self {
+            StatementKind::Assign(_, rvalue) => rvalue.for_each_operand_mut(f),
+            StatementKind::InlineAsm(asm) => {
+                for operand in &mut asm.operands {
+                    match operand {
+                        AsmOperand::Reg { input: Some(input), .. } => f(input),
+                        AsmOperand::Const(value) | AsmOperand::Sym(value) => f(value),
+                        AsmOperand::Reg { input: None, .. } | AsmOperand::Label => (),
+                    }
+                }
+            }
+            StatementKind::FakeRead(_)
+            | StatementKind::Deinit(_)
+            | StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_)
+            | StatementKind::Nop => (),
+        }
+    }
+
+    pub(crate) fn for_each_operand(&self, f: &mut impl FnMut(&Operand)) {
+        match self {
+            StatementKind::Assign(_, rvalue) => rvalue.for_each_operand(f),
+            StatementKind::InlineAsm(asm) => {
+                for operand in &asm.operands {
+                    match operand {
+                        AsmOperand::Reg { input: Some(input), .. } => f(input),
+                        AsmOperand::Const(value) | AsmOperand::Sym(value) => f(value),
+                        AsmOperand::Reg { input: None, .. } | AsmOperand::Label => (),
+                    }
+                }
+            }
+            StatementKind::FakeRead(_)
+            | StatementKind::Deinit(_)
+            | StatementKind::StorageLive(_)
+            | StatementKind::StorageDead(_)
+            | StatementKind::Nop => (),
+        }
+    }
+}
+
+impl Rvalue {
+    pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
+        match self {
+            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) => f(it),
+            Rvalue::UnaryOp(_, it) => f(it),
+            Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                f(lhs);
+                f(rhs);
+            }
+            Rvalue::Aggregate(_, operands) => operands.iter_mut().for_each(f),
+            Rvalue::Ref(..)
+            | Rvalue::Len(_)
+            | Rvalue::Discriminant(_)
+            | Rvalue::CopyForDeref(_) => (),
+            Rvalue::ThreadLocalRef(n)
+            | Rvalue::AddressOf(n)
+            | Rvalue::BinaryOp(n)
+            | Rvalue::NullaryOp(n) => match *n {},
+        }
+    }
+
+    pub(crate) fn for_each_operand(&self, f: &mut impl FnMut(&Operand)) {
+        match self {
+            Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) => f(it),
+            Rvalue::UnaryOp(_, it) => f(it),
+            Rvalue::CheckedBinaryOp(_, lhs, rhs) => {
+                f(lhs);
+                f(rhs);
+            }
+            Rvalue::Aggregate(_, operands) => operands.iter().for_each(f),
+            Rvalue::Ref(..)
+            | Rvalue::Len(_)
+            | Rvalue::Discriminant(_)
+            | Rvalue::CopyForDeref(_) => (),
+            Rvalue::ThreadLocalRef(n)
+            | Rvalue::AddressOf(n)
+            | Rvalue::BinaryOp(n)
+            | Rvalue::NullaryOp(n) => match *n {},
+        }
+    }
+}
+
+impl TerminatorKind {
+    pub(crate) fn for_each_operand_mut(&mut self, f: &mut impl FnMut(&mut Operand)) {
+        match self {
+            TerminatorKind::SwitchInt { discr: it, .. }
+            | TerminatorKind::Assert { cond: it, .. }
+            | TerminatorKind::Yield { value: it, .. }
+            | TerminatorKind::DropAndReplace { value: it, .. } => f(it),
+            TerminatorKind::Call { func, args, .. } => {
+                f(func);
+                args.iter_mut().for_each(f);
+            }
+            TerminatorKind::Goto { .. }
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::Abort
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Drop { .. }
+            | TerminatorKind::CoroutineDrop
+            | TerminatorKind::FalseEdge { .. }
+            | TerminatorKind::FalseUnwind { .. } => (),
+        }
+    }
+
+    pub(crate) fn for_each_operand(&self, f: &mut impl FnMut(&Operand)) {
+        match self {
+            TerminatorKind::SwitchInt { discr: it, .. }
+            | TerminatorKind::Assert { cond: it, .. }
+            | TerminatorKind::Yield { value: it, .. }
+            | TerminatorKind::DropAndReplace { value: it, .. } => f(it),
+            TerminatorKind::Call { func, args, .. } => {
+                f(func);
+                args.iter().for_each(f);
+            }
+            TerminatorKind::Goto { .. }
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::Abort
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Drop { .. }
+            | TerminatorKind::CoroutineDrop
+            | TerminatorKind::FalseEdge { .. }
+            | TerminatorKind::FalseUnwind { .. } => (),
+        }
+    }
+
+    /// The blocks control goes to from here when nothing unwinds, and the coroutine is not
+    /// dropped where it yields.
+    pub fn successors(&self) -> SmallVec<[BasicBlockId; 2]> {
+        match self {
+            TerminatorKind::Goto { target }
+            | TerminatorKind::Drop { target, .. }
+            | TerminatorKind::DropAndReplace { target, .. }
+            | TerminatorKind::Assert { target, .. }
+            | TerminatorKind::FalseEdge { real_target: target, .. }
+            | TerminatorKind::FalseUnwind { real_target: target, .. } => smallvec![*target],
+            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().into(),
+            TerminatorKind::Call { target, .. } => target.iter().copied().collect(),
+            TerminatorKind::Yield { resume, .. } => smallvec![*resume],
+            TerminatorKind::UnwindResume
+            | TerminatorKind::Abort
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable
+            | TerminatorKind::CoroutineDrop => smallvec![],
+        }
+    }
+
+    /// The cleanup block this terminator unwinds to, if it names one.
+    pub fn unwind(&self) -> Option<BasicBlockId> {
+        match self {
+            TerminatorKind::Drop { unwind, .. }
+            | TerminatorKind::DropAndReplace { unwind, .. }
+            | TerminatorKind::FalseUnwind { unwind, .. } => *unwind,
+            TerminatorKind::Call { cleanup, .. } | TerminatorKind::Assert { cleanup, .. } => {
+                *cleanup
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn unwind_mut(&mut self) -> Option<&mut Option<BasicBlockId>> {
+        match self {
+            TerminatorKind::Drop { unwind, .. }
+            | TerminatorKind::DropAndReplace { unwind, .. }
+            | TerminatorKind::FalseUnwind { unwind, .. } => Some(unwind),
+            TerminatorKind::Call { cleanup, .. } | TerminatorKind::Assert { cleanup, .. } => {
+                Some(cleanup)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub struct MirBody<'db> {
     pub basic_blocks: Arena<BasicBlock>,
@@ -1078,6 +1308,30 @@ pub struct MirBody<'db> {
     /// The body is written with `#[rustc_inherit_overflow_checks]`: its arithmetic is checked
     /// when the crate that compiles it checks, whatever the crate it is written in does.
     pub inherits_overflow_checks: bool,
+    /// Which passes the body has been through: see [`MirPhase`].
+    pub phase: MirPhase,
+    /// From [`MirPhase::Runtime`] on, the cleanup block a statement that panics unwinds to: an
+    /// index out of bounds, an overflow, a division by zero. rustc has an `Assert` terminator
+    /// for each of these; here they stay inside the statement, so they share one target.
+    pub panic_cleanup: Option<BasicBlockId>,
+}
+
+/// What a body means, which depends on the passes it has been through. The IDE only ever
+/// asks for [`MirPhase::Built`]; the interpreter and the code generator run
+/// [`MirPhase::Runtime`], which is computed on its own (`runtime_mir_body` and the like).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum MirPhase {
+    /// As lowering builds it. A `Drop` drops what the place holds if it holds anything, which
+    /// the code that runs it has to keep track of, and nothing unwinds: every `cleanup` and
+    /// `unwind` is `None`.
+    #[default]
+    Built,
+    /// After drop elaboration, as rustc's `MirPhase::Runtime`. Every `Drop` drops, and
+    /// whether it runs is decided by the blocks around it, which read drop flags that are
+    /// ordinary `bool` locals. Every call and drop outside a cleanup block names the cleanup
+    /// block it unwinds to, as does [`MirBody::panic_cleanup`] for statements; cleanup blocks
+    /// end in `UnwindResume`. A drop in a cleanup block that unwinds aborts.
+    Runtime,
 }
 
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
@@ -1722,7 +1976,41 @@ impl MirBody<'_> {
             }
         }
     }
+}
 
+impl<'db> MirBody<'db> {
+    /// Says `Move` for every operand that reads a place whose type is not `Copy`, as rustc's
+    /// MIR building does: lowering writes `Copy` for each, and whether a use of a place moves
+    /// out of it depends on its type alone. Not the operand of `[CONSTANT; N]`, which lowering
+    /// leaves `Copy`: each element is the constant made again, and `[CONSTANT; 0]` makes none.
+    pub(crate) fn mark_moves(&mut self, infcx: &InferCtxt<'db>, env: ParamEnv<'db>) {
+        let mut copy = FxHashMap::default();
+        let mut blocks = std::mem::take(&mut self.basic_blocks);
+        let mut mark = |operand: &mut Operand| {
+            let OperandKind::Copy(place) = &operand.kind else { return };
+            let ty = place.as_ref().ty(self, infcx, env).ty;
+            let is_copy =
+                *copy.entry(ty).or_insert_with(|| infcx.type_is_copy_modulo_regions(env, ty));
+            if !is_copy {
+                operand.kind = OperandKind::Move(place.clone());
+            }
+        };
+        for (_, block) in blocks.iter_mut() {
+            for statement in &mut block.statements {
+                if let StatementKind::Assign(_, Rvalue::Repeat(..)) = statement.kind {
+                    continue;
+                }
+                statement.kind.for_each_operand_mut(&mut mark);
+            }
+            if let Some(terminator) = &mut block.terminator {
+                terminator.kind.for_each_operand_mut(&mut mark);
+            }
+        }
+        self.basic_blocks = blocks;
+    }
+}
+
+impl MirBody<'_> {
     fn shrink_to_fit(&mut self) {
         let MirBody {
             basic_blocks,
@@ -1738,6 +2026,8 @@ impl MirBody<'_> {
             unreached,
             scope_ends,
             inherits_overflow_checks: _,
+            phase: _,
+            panic_cleanup: _,
         } = self;
         unreached.shrink_to_fit();
         scope_ends.shrink_to_fit();
