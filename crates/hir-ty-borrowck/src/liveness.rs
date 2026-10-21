@@ -534,6 +534,21 @@ fn live_regions_of<'db>(
                     }
                     None => (),
                 }
+                // What an `impl Trait` does not capture need not be live.
+                if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+                    && let Some(captured) = super::regions::opaque_captures(
+                        self.ctx.db,
+                        alias.kind.def_id(),
+                        alias.args.len(),
+                    )
+                {
+                    for (arg, captured) in alias.args.iter().zip(captured) {
+                        if captured {
+                            rustc_type_ir::TypeVisitable::visit_with(&arg, self);
+                        }
+                    }
+                    return;
+                }
             }
             rustc_type_ir::TypeSuperVisitable::super_visit_with(&ty, self)
         }

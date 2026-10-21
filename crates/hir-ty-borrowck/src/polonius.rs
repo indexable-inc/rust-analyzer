@@ -194,7 +194,27 @@ fn record_variances<'db>(
             }
         }
         TyKind::Alias(alias) => {
-            record_args(ctx, alias.args, None, variance.xform(Variance::Invariant), directions)
+            let variances = match alias.kind {
+                rustc_type_ir::AliasTyKind::Opaque { .. } => {
+                    super::regions::opaque_captures(ctx.db, alias.kind.def_id(), alias.args.len())
+                        .map(|it| {
+                            it.into_iter()
+                                .map(|captured| match captured {
+                                    true => Variance::Invariant,
+                                    false => Variance::Bivariant,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                }
+                _ => None,
+            };
+            record_args(
+                ctx,
+                alias.args,
+                variances.as_deref(),
+                variance.xform(Variance::Invariant),
+                directions,
+            )
         }
         TyKind::Closure(_, args)
         | TyKind::CoroutineClosure(_, args)

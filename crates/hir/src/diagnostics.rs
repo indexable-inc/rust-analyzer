@@ -1332,8 +1332,19 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             };
             Some(source.map(|it| it.syntax_node_ptr()))
         };
+        // rustc's span of a function's signature starts at `fn`, the line of its name.
+        let signature = || -> Option<InFile<SyntaxNodePtr>> {
+            let DefWithBodyId::FunctionId(function) = def else { return None };
+            let source = hir_def::src::HasSource::source(function.lookup(self.db), self.db);
+            let name = source.value.name()?;
+            Some(InFile::new(source.file_id, SyntaxNodePtr::new(syntax::AstNode::syntax(&name))))
+        };
         for diagnostic in &result.diagnostics {
-            let Some(node) = node_of(diagnostic.span) else { continue };
+            let node = match diagnostic.at_signature {
+                true => signature().or_else(|| node_of(diagnostic.span)),
+                false => node_of(diagnostic.span),
+            };
+            let Some(node) = node else { continue };
             self.acc.push(
                 BorrowckError {
                     node,

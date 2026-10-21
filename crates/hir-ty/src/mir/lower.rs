@@ -1087,19 +1087,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             let (then, otherwise) = matched?;
                             let otherwise = otherwise.unwrap_or_else(|| self.new_basic_block());
                             let bound = self.drop_scopes.last().map_or(0, |it| it.locals.len());
-                            let guarded = self.lower_guard(guard, then);
+                            let guarded = self.lower_guard(guard, then, expr_id.into());
                             self.guard_refs.clear();
-                            if let Some((discr, c)) = guarded? {
-                                let held = self.new_basic_block();
-                                let failed = self.new_basic_block();
-                                self.set_terminator(
-                                    c,
-                                    TerminatorKind::SwitchInt {
-                                        discr,
-                                        targets: SwitchTargets::static_if(1, held, failed),
-                                    },
-                                    expr_id.into(),
-                                );
+                            if let Some((held, failed)) = guarded? {
                                 self.guard_held(held, moves.unwrap_or_default());
                                 self.set_goto(held, body, expr_id.into());
                                 let failed = self.guard_failed(failed, bound, guard.into());
@@ -1128,19 +1118,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         let next = self.new_basic_block();
                         let o = *otherwise.get_or_insert_with(|| self.new_basic_block());
                         let bound = self.drop_scopes.last().map_or(0, |it| it.locals.len());
-                        let guarded = self.lower_guard(guard, then);
+                        let guarded = self.lower_guard(guard, then, expr_id.into());
                         self.guard_refs.clear();
-                        if let Some((discr, c)) = guarded? {
-                            let failed = self.new_basic_block();
-                            self.set_terminator(
-                                c,
-                                TerminatorKind::SwitchInt {
-                                    discr,
-                                    targets: SwitchTargets::static_if(1, next, failed),
-                                },
-                                expr_id.into(),
-                            );
-                            self.guard_held(next, moves.unwrap_or_default());
+                        if let Some((held, failed)) = guarded? {
+                            self.guard_held(held, moves.unwrap_or_default());
+                            self.set_goto(held, next, expr_id.into());
                             let failed = self.guard_failed(failed, bound, guard.into());
                             self.set_goto(failed, o, expr_id.into());
                         }
@@ -3122,7 +3104,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             return Ok(None);
                         };
                         current = c;
-                        self.push_fake_read(current, init_place, span);
+                        // rustc's `FakeReadCause::ForLet`, at the pattern, where the borrow
+                        // checker finds the place a `let _: T` ascribes.
+                        self.push_fake_read(current, init_place, MirSpan::PatId(*pat));
                         // Using the initializer for the resolver scope is good enough for us, as it cannot create new declarations
                         // and has all declarations of the `let`.
                         let resolver_guard = self.resolver.update_to_inner_scope(
@@ -3636,16 +3620,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
     }
 
-    /// Lowers the guard of a match arm.
+    /// Lowers a match arm's guard to the blocks where it holds and where it fails, switching
+    /// with the span `span`.
     fn lower_guard(
         &mut self,
         guard: ExprId,
         current: BasicBlockId,
-    ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
+        span: MirSpan,
+    ) -> Result<'db, Option<(BasicBlockId, BasicBlockId)>> {
         if self.has_let(guard) {
             // What a `let` binds lives to the end of the arm, and so do the temporaries of
-            // what it matched on.
-            return self.lower_expr_to_some_operand(guard, current);
+            // what it matched on. Each operand of a chain branches on its own, as in `if`, so
+            // what a `let` binds is initialized where the guard holds.
+            return self.lower_let_chain(guard, current);
         }
         let temporaries = self.push_drop_scope();
         self.drop_scopes.last_mut().unwrap().temporaries = true;
@@ -3662,7 +3649,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             self.drop_scopes.last_mut().unwrap().locals.retain(|&it| it != local);
         }
         let current = temporaries.pop_and_drop(self, current, guard.into());
-        Ok(Some((discr, current)))
+        let (held, failed) = (self.new_basic_block(), self.new_basic_block());
+        self.set_terminator(
+            current,
+            TerminatorKind::SwitchInt { discr, targets: SwitchTargets::static_if(1, held, failed) },
+            span,
+        );
+        Ok(Some((held, failed)))
     }
 
     fn push_drop_scope(&mut self) -> DropScopeToken {

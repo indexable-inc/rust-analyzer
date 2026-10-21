@@ -100,14 +100,18 @@ fn ignored<'db>(
 }
 
 /// Whether `expr` calls a function, which rustc does not promote, not even a `const fn` in a
-/// `const` block; a tuple struct's or variant's constructor is not one.
+/// `const` block; a tuple struct's or variant's constructor is not one, nor is a
+/// `#[rustc_promotable]` function such as `size_of`.
 fn is_call(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
     match ctx.store[expr] {
         Expr::MethodCall { .. } => true,
         Expr::Call { callee, .. } => !matches!(
             ctx.infer.expr_ty(callee).kind(),
-            TyKind::FnDef(def, _)
-                if matches!(def.0, hir_def::CallableDefId::StructId(_) | hir_def::CallableDefId::EnumVariantId(_))
+            TyKind::FnDef(def, _) if match def.0 {
+                hir_def::CallableDefId::StructId(_) | hir_def::CallableDefId::EnumVariantId(_) => true,
+                hir_def::CallableDefId::FunctionId(func) => hir_def::attrs::AttrFlags::query(ctx.db, func.into())
+                    .contains(hir_def::attrs::AttrFlags::RUSTC_PROMOTABLE),
+            }
         ),
         _ => false,
     }
