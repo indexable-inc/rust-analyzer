@@ -36,7 +36,7 @@ use crate::{
     db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     generics::generics,
     infer::{
-        CaptureSourceStack, CapturedPlace, UpvarCapture,
+        AllowTwoPhase, AutoBorrowMutability, CaptureSourceStack, CapturedPlace, UpvarCapture,
         cast::CastTy,
         closure::analysis::expr_use_visitor::{
             Place as HirPlace, PlaceBase as HirPlaceBase, ProjectionKind as HirProjectionKind,
@@ -433,15 +433,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     );
                     Ok(Some(current))
                 }
-                Adjust::Borrow(AutoBorrow::Ref(m)) => self.lower_expr_to_place_with_borrow_adjust(
-                    expr_id,
-                    place,
-                    current,
-                    rest,
-                    (*m).into(),
-                ),
+                Adjust::Borrow(AutoBorrow::Ref(m)) => {
+                    let bk = match m {
+                        AutoBorrowMutability::Mut { allow_two_phase_borrow: AllowTwoPhase::Yes } => {
+                            BorrowKind::Mut { kind: super::MutBorrowKind::TwoPhasedBorrow }
+                        }
+                        _ => BorrowKind::from_rustc_mutability((*m).into()),
+                    };
+                    self.lower_expr_to_place_with_borrow_adjust(expr_id, place, current, rest, bk)
+                }
                 Adjust::Borrow(AutoBorrow::RawPtr(m)) => {
-                    self.lower_expr_to_place_with_borrow_adjust(expr_id, place, current, rest, *m)
+                    let bk = BorrowKind::from_rustc_mutability(*m);
+                    self.lower_expr_to_place_with_borrow_adjust(expr_id, place, current, rest, bk)
                 }
                 Adjust::Pointer(cast) => {
                     let Some((p, current)) =
@@ -472,7 +475,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         current: BasicBlockId,
         rest: &[Adjustment],
-        m: Mutability,
+        bk: BorrowKind,
     ) -> Result<'db, Option<BasicBlockId>> {
         let locals = self.result.locals.len();
         let Some((p, current)) =
@@ -481,7 +484,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             return Ok(None);
         };
         // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does.
-        if m.is_not()
+        if bk == BorrowKind::Shared
             && rest.is_empty()
             && p.local.into_raw().into_u32() as usize >= locals
             && p.projection.as_slice().is_empty()
@@ -489,7 +492,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         {
             self.result.promoted_locals.push((p.local, expr_id));
         }
-        let bk = BorrowKind::from_rustc_mutability(m);
         self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
         Ok(Some(current))
     }
@@ -810,6 +812,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let branches = match self.store[*condition] {
                     Expr::Let { pat, expr } => {
                         Some(self.lower_if_let(*condition, pat, expr, current)?)
+                    }
+                    Expr::BinaryOp { .. } if self.has_let(*condition) => {
+                        Some(self.lower_let_chain(*condition, current)?)
                     }
                     _ => None,
                 };
@@ -2192,6 +2197,60 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let (matched, unmatched) = self.pattern_match(current, None, place, pat)?;
         self.resolver.reset_to_guard(resolver_guard);
         Ok(Some((matched, unmatched.unwrap_or_else(|| self.new_basic_block()))))
+    }
+
+    /// Lowers a condition that binds names, `a && let P = e && ..`, to the blocks where it
+    /// holds and where it does not, as rustc's `then_else_break`: each operand branches on its
+    /// own, so what a `let` binds is initialized where the condition holds.
+    fn lower_let_chain(
+        &mut self,
+        condition: ExprId,
+        current: BasicBlockId,
+    ) -> Result<'db, Option<(BasicBlockId, BasicBlockId)>> {
+        match self.store[condition] {
+            Expr::Let { pat, expr } => self.lower_if_let(condition, pat, expr, current),
+            Expr::BinaryOp {
+                lhs,
+                rhs,
+                op: Some(hir_def::hir::BinaryOp::LogicOp(syntax::ast::LogicOp::And)),
+            } => {
+                let Some((holds, fails)) = self.lower_let_chain(lhs, current)? else {
+                    return Ok(None);
+                };
+                let (holds, also_fails) = match self.lower_let_chain(rhs, holds)? {
+                    Some((holds, fails)) => (holds, Some(fails)),
+                    None => (self.new_basic_block(), None),
+                };
+                let Some(also_fails) = also_fails else { return Ok(Some((holds, fails))) };
+                let joined = self.new_basic_block();
+                self.set_goto(fails, joined, condition.into());
+                self.set_goto(also_fails, joined, condition.into());
+                Ok(Some((holds, joined)))
+            }
+            _ => {
+                // The operand's temporaries are dropped before the next one runs.
+                let ty = Ty::new_bool(self.interner());
+                let result: Place<'db> = self.temp(ty, current, MirSpan::Unknown)?.into();
+                let scope = self.push_drop_scope();
+                let Some(end) = self.lower_expr_to_place(condition, result, current)? else {
+                    scope.pop_assume_dropped(self);
+                    return Ok(None);
+                };
+                let end = scope.pop_and_drop(self, end, condition.into());
+                let discr =
+                    Operand { kind: OperandKind::Copy(result.store()), span: Some(condition.into()) };
+                let (holds, fails) = (self.new_basic_block(), self.new_basic_block());
+                self.set_terminator(
+                    end,
+                    TerminatorKind::SwitchInt {
+                        discr,
+                        targets: SwitchTargets::static_if(1, holds, fails),
+                    },
+                    condition.into(),
+                );
+                Ok(Some((holds, fails)))
+            }
+        }
     }
 
     /// Hands what the innermost scope has declared to the scope around it. Before the 2024

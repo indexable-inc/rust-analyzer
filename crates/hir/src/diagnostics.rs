@@ -131,6 +131,8 @@ macro_rules! diagnostics {
 diagnostics![AnyDiagnostic<'db> ->
     ArrayPatternWithoutFixedLength,
     AwaitOutsideOfAsync,
+    BorrowckError,
+    BorrowckSkipped,
     BreakOutsideOfLoop,
     CannotBeDereferenced<'db>,
     UnaryOperatorCannotBeApplied<'db>,
@@ -395,6 +397,24 @@ pub struct CannotIndexInto<'db> {
 #[derive(Debug)]
 pub struct ExplicitDropMethodUse {
     pub expr_or_path: Either<InFile<AstPtr<ast::MethodCallExpr>>, InFile<AstPtr<ast::Path>>>,
+}
+
+/// An error of rustc's borrow checker.
+#[derive(Debug)]
+pub struct BorrowckError {
+    pub node: InFile<SyntaxNodePtr>,
+    /// The span is the brace that closes `node`, where rustc has a scope end.
+    pub at_end: bool,
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// A body the borrow checker skipped, because MIR lowering does not support something in it.
+/// Reported only when `RA_JIT_BORROWCK_SKIPPED` is set, for the borrow checker's test harness.
+#[derive(Debug)]
+pub struct BorrowckSkipped {
+    pub node: InFile<SyntaxNodePtr>,
+    pub reason: String,
 }
 
 #[derive(Debug)]
@@ -1281,6 +1301,50 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         for diagnostic in BodyValidationDiagnostic::collect(self.db, def, self.style_lints) {
             self.acc
                 .extend(AnyDiagnostic::body_validation_diagnostic(self.db, diagnostic, source_map));
+        }
+        self.collect_borrowck(def, body, source_map);
+    }
+
+    fn collect_borrowck(
+        &mut self,
+        def: DefWithBodyId,
+        body: &Body,
+        source_map: &hir_def::expr_store::BodySourceMap,
+    ) {
+        use hir_ide::mir::{MirSpan, borrowck};
+        let result = borrowck::borrowck(self.db, def);
+        let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
+            let source = match span {
+                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr).ok()?,
+                MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+                MirSpan::BindingId(binding) => {
+                    let pat = *source_map.patterns_for_binding(binding).first()?;
+                    source_map.pat_syntax(pat).ok()?
+                }
+                MirSpan::SelfParam => {
+                    return source_map.self_param_syntax().map(|it| it.map(|it| it.syntax_node_ptr()));
+                }
+                MirSpan::Unknown => source_map.expr_syntax(body.root_expr()).ok()?,
+            };
+            Some(source.map(|it| it.syntax_node_ptr()))
+        };
+        for diagnostic in &result.diagnostics {
+            let Some(node) = node_of(diagnostic.span) else { continue };
+            self.acc.push(
+                BorrowckError {
+                    node,
+                    at_end: matches!(diagnostic.span, MirSpan::ExprEnd(_)),
+                    code: diagnostic.code,
+                    message: diagnostic.message.clone(),
+                }
+                .into(),
+            );
+        }
+        if let Some(reason) = &result.skipped
+            && std::env::var_os("RA_JIT_BORROWCK_SKIPPED").is_some()
+            && let Some(node) = node_of(MirSpan::Unknown)
+        {
+            self.acc.push(BorrowckSkipped { node, reason: reason.clone() }.into());
         }
     }
 

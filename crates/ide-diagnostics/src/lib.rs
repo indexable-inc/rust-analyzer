@@ -32,6 +32,7 @@ mod handlers {
     pub(crate) mod array_pattern_without_fixed_length;
     pub(crate) mod await_outside_of_async;
     pub(crate) mod bad_rtn;
+    pub(crate) mod borrowck;
     pub(crate) mod break_outside_of_loop;
     pub(crate) mod cannot_be_dereferenced;
     pub(crate) mod cannot_implicitly_deref_trait_object;
@@ -547,6 +548,8 @@ pub fn semantic_diagnostics(
             AnyDiagnostic::UnimplementedTrait(d) => handlers::unimplemented_trait::unimplemented_trait(&ctx, &d),
             AnyDiagnostic::FruInDestructuringAssignment(d) => handlers::fru_in_destructuring_assignment::fru_in_destructuring_assignment(&ctx, &d),
             AnyDiagnostic::MissingBody(d) => handlers::missing_body::missing_body(&ctx, &d),
+            AnyDiagnostic::BorrowckError(d) => handlers::borrowck::borrowck_error(&ctx, &d),
+            AnyDiagnostic::BorrowckSkipped(d) => handlers::borrowck::borrowck_skipped(&ctx, &d),
             AnyDiagnostic::ExplicitDropMethodUse(d) => handlers::explicit_drop_method_use::explicit_drop_method_use(&ctx, &d),
             AnyDiagnostic::YieldOutsideCoroutine(d) => handlers::yield_outside_coroutine::yield_outside_coroutine(&ctx, &d),
             AnyDiagnostic::ReturnOutsideFunction(d) => handlers::return_outside_function::return_outside_function(&ctx, &d),

@@ -31,6 +31,9 @@ use crate::{
     },
 };
 
+// The borrow checker, in the repository this one is a submodule of.
+#[path = "../../../../../crates/hir-ty-borrowck/mod.rs"]
+pub mod borrowck;
 // rustd's code generator, in the repository this one is a submodule of.
 #[path = "../../../../../crates/hir-ty-codegen/mod.rs"]
 pub mod codegen;

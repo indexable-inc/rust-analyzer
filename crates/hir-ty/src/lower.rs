@@ -1068,8 +1068,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     self.interner,
                     Binder::dummy(rustc_type_ir::PredicateKind::Clause(
                         rustc_type_ir::ClauseKind::RegionOutlives(OutlivesPredicate(
-                            self.lower_lifetime(bound),
                             self.lower_lifetime(target),
+                            self.lower_lifetime(bound),
                         )),
                     )),
                 )),
