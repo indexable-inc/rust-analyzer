@@ -5,7 +5,9 @@
 //! the fields themselves (RFC 2093), which is every `T: 'a` and never `T: 'static`. A trait
 //! impl's associated types must be well-formed given the impl's where clauses and what its
 //! header's types imply, and the impl must satisfy the outlives bounds of the trait, as
-//! `trait Foo: 'static`. Each item is a query of its own, as the borrow checker's bodies are;
+//! `trait Foo: 'static`. The where clauses of an ADT, impl, trait or function must be
+//! well-formed given its bounds and what the types it assumes well-formed imply (a
+//! function's signature, an impl's header). Each item is a query of its own, as the borrow checker's bodies are;
 //! `docs/borrowck.md` in the repository describes what is checked.
 
 extern crate ra_ap_rustc_type_ir as rustc_type_ir;
@@ -13,16 +15,25 @@ extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 mod outlives;
 
 use hir_def::{
-    AdtId, AssocItemId, GenericDefId, ImplId, LocalFieldId, TypeAliasId, VariantId,
-    hir::generics::GenericParams,
+    AdtId, AssocItemId, CallableDefId, FunctionId, GenericDefId, ImplId, ItemContainerId,
+    LocalFieldId, Lookup as _, TraitId, TypeAliasId, VariantId,
+    expr_store::ExpressionStore,
+    hir::{
+        generics::{GenericParams, WherePredicate},
+        type_ref::{TypeBound, TypeRef},
+    },
+    signatures::TraitSignature,
 };
-use rustc_type_ir::{RegionKind, TypeVisitableExt as _, inherent::IntoKind};
+use rustc_type_ir::{
+    ClauseKind, RegionKind, TypeVisitableExt as _,
+    inherent::{IntoKind, Term as _},
+};
 use salsa::SalsaValue;
 
 use hir_ty::{
     GenericPredicates,
     db::HirDatabase,
-    next_solver::{Clause, DbInterner, GenericArgKind, Ty, TyKind},
+    next_solver::{Clause, DbInterner, GenericArgKind, TermId, Ty, TyKind},
 };
 
 use outlives::{Inferred, Known, Needs};
@@ -36,6 +47,9 @@ pub enum Site {
     AssocType(TypeAliasId),
     /// The trait an impl implements.
     ImplTrait(ImplId),
+    /// The bound of a where clause of an item, by its index among the item's where
+    /// predicates (a bound written on a generic parameter is one too).
+    Bound(GenericDefId, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
@@ -51,7 +65,7 @@ pub struct WfResult {
     pub diagnostics: Vec<WfDiagnostic>,
 }
 
-/// The well-formedness errors of the item `def`: an ADT or an impl.
+/// The well-formedness errors of the item `def`: an ADT, an impl, a trait or a function.
 #[salsa::tracked(returns(ref))]
 pub fn wfcheck(db: &dyn HirDatabase, def: GenericDefId) -> WfResult {
     let mut result = WfResult::default();
@@ -62,6 +76,8 @@ pub fn wfcheck(db: &dyn HirDatabase, def: GenericDefId) -> WfResult {
     match def {
         GenericDefId::AdtId(adt) => check.adt(adt),
         GenericDefId::ImplId(impl_) => check.impl_(impl_),
+        GenericDefId::TraitId(trait_) => check.trait_(trait_),
+        GenericDefId::FunctionId(function) => check.function(function),
         _ => (),
     }
     result
@@ -83,9 +99,24 @@ impl<'db> Check<'_, 'db> {
     }
 
     /// Every field must be well-formed. What it needs of a lifetime parameter rustc infers,
-    /// so only what it needs of `'static` can fail.
+    /// so only what it needs of `'static` can fail. Its where clauses must be well-formed
+    /// given its bounds, those rustc infers included.
     fn adt(&mut self, adt: AdtId) {
-        let known = Known::new(&self.clauses(adt.into()));
+        let mut known = Known::new(&self.clauses(adt.into()));
+        let inferred = self
+            .inferred
+            .of(self.db, adt)
+            .into_iter()
+            .filter_map(|it| {
+                let rustc_type_ir::OutlivesPredicate(arg, region) = it;
+                match arg.kind() {
+                    GenericArgKind::Type(ty) => Some(Needs::Type(ty, region)),
+                    GenericArgKind::Lifetime(longer) => Some(Needs::Region(longer, region)),
+                    GenericArgKind::Const(_) => None,
+                }
+            })
+            .collect();
+        known.add(inferred);
         let mut needs = Vec::new();
         for variant in outlives::variants(self.db, adt) {
             for (field, ty) in self.db.field_types(variant).iter() {
@@ -107,71 +138,230 @@ impl<'db> Check<'_, 'db> {
                 );
             }
         }
+        needs.extend(self.where_needs(adt.into()));
         self.resolve(&known, needs);
+    }
+
+    /// The self type and trait arguments of an impl, which it and its items assume
+    /// well-formed. `None` when they have an error or an associated type: what normalizing
+    /// them would imply is not known here.
+    fn header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
+        let db = self.db;
+        let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
+        let mut header = vec![self_ty];
+        if let Some(trait_ref) = db.impl_trait(impl_) {
+            let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
+            header.extend(trait_ref.args.iter().skip(1).filter_map(|arg| match arg.kind() {
+                GenericArgKind::Type(ty) => Some(ty),
+                _ => None,
+            }));
+        }
+        if header.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
+            return None;
+        }
+        Some(header)
+    }
+
+    /// What an item knows: its where clauses and what the types it assumes well-formed imply.
+    fn known(&mut self, def: GenericDefId, assumed: &[Ty<'db>]) -> Known<'db> {
+        let mut known = Known::new(&self.clauses(def));
+        let mut implied = Vec::new();
+        for &ty in assumed {
+            outlives::wf(self.db, &mut self.inferred, ty, &mut implied);
+        }
+        known.add(implied);
+        known
     }
 
     fn impl_(&mut self, impl_: ImplId) {
         let db = self.db;
-        let Some(trait_ref) = db.impl_trait(impl_) else { return };
-        let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
-        let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
-        let header: Vec<Ty<'db>> = trait_ref
-            .args
-            .iter()
-            .filter_map(|arg| match arg.kind() {
-                GenericArgKind::Type(ty) => Some(ty),
-                _ => None,
-            })
-            .chain([self_ty])
-            .collect();
-        // What normalizing the header would imply, or an error in it, is not known here.
-        if header.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
-            return;
-        }
-        let mut known = Known::new(&self.clauses(impl_.into()));
-        let mut implied = Vec::new();
-        for &ty in &header {
-            outlives::wf(db, &mut self.inferred, ty, &mut implied);
-        }
-        known.add(implied);
+        let Some(header) = self.header(impl_) else { return };
+        let known = self.known(impl_.into(), &header);
+        let mut needs = self.where_needs(impl_.into());
 
         // The trait's outlives bounds hold of the impl's arguments.
-        let trait_clauses: Vec<Clause<'db>> =
-            GenericPredicates::query_all(db, trait_ref.def_id.0.into())
-                .iter_instantiated(self.interner(), trait_ref.args.as_slice())
-                .map(|it| it.skip_norm_wip())
-                .collect();
-        let mut needs = Vec::new();
-        outlives::clause_needs(&trait_clauses, &mut needs);
-        needs.retain(|it| match *it {
-            Needs::Type(ty, region) => {
-                !ty.has_escaping_bound_vars() && !region.has_escaping_bound_vars()
-            }
-            Needs::Region(longer, shorter) => {
-                !longer.has_escaping_bound_vars() && !shorter.has_escaping_bound_vars()
-            }
-        });
-        self.resolve(&known, needs.into_iter().map(|it| (it, Site::ImplTrait(impl_))).collect());
+        if let Some(trait_ref) = db.impl_trait(impl_) {
+            let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
+            let trait_clauses: Vec<Clause<'db>> =
+                GenericPredicates::query_all(db, trait_ref.def_id.0.into())
+                    .iter_instantiated(self.interner(), trait_ref.args.as_slice())
+                    .map(|it| it.skip_norm_wip())
+                    .collect();
+            let mut found = Vec::new();
+            outlives::clause_needs(&trait_clauses, &mut found);
+            found.retain(|it| match *it {
+                Needs::Type(ty, region) => {
+                    !ty.has_escaping_bound_vars() && !region.has_escaping_bound_vars()
+                }
+                Needs::Region(longer, shorter) => {
+                    !longer.has_escaping_bound_vars() && !shorter.has_escaping_bound_vars()
+                }
+            });
+            needs.extend(found.into_iter().map(|it| (it, Site::ImplTrait(impl_))));
+        }
+        self.resolve(&known, needs);
 
-        // Each associated type is well-formed.
+        // Each associated type is well-formed, given what the impl knows and, for a generic
+        // one, its own where clauses (not the trait's).
         for &(_, item) in impl_.impl_items(db).items.iter() {
             let AssocItemId::TypeAliasId(alias) = item else { continue };
-            // A generic associated type assumes what the trait's where clauses on it say,
-            // which is not reasoned about here.
-            if !GenericParams::of(db, alias.into()).is_empty() {
-                continue;
-            }
             let ty = db.ty(alias.into()).instantiate_identity().skip_norm_wip();
             if ty.references_error() {
                 continue;
             }
-            let mut needs = Vec::new();
-            outlives::wf(db, &mut self.inferred, ty, &mut needs);
-            self.resolve(
-                &known,
-                needs.into_iter().map(|it| (it, Site::AssocType(alias))).collect(),
-            );
+            let known = self.known(alias.into(), &header);
+            let mut found = Vec::new();
+            outlives::wf(db, &mut self.inferred, ty, &mut found);
+            let mut needs: Vec<_> =
+                found.into_iter().map(|it| (it, Site::AssocType(alias))).collect();
+            needs.extend(self.where_needs(alias.into()));
+            self.resolve(&known, needs);
         }
+    }
+
+    fn trait_(&mut self, trait_: TraitId) {
+        let known = self.known(trait_.into(), &[]);
+        let needs = self.where_needs(trait_.into());
+        self.resolve(&known, needs);
+    }
+
+    /// A function's where clauses must be well-formed given its bounds and what the types
+    /// of its signature, and of its impl's header, imply.
+    fn function(&mut self, function: FunctionId) {
+        let db = self.db;
+        let sig = db
+            .callable_item_signature(CallableDefId::FunctionId(function))
+            .instantiate_identity()
+            .skip_norm_wip()
+            .skip_binder();
+        let mut assumed: Vec<Ty<'db>> = sig.inputs_and_output.iter().collect();
+        if assumed.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
+            return;
+        }
+        if let ItemContainerId::ImplId(impl_) = function.lookup(db).container {
+            let Some(header) = self.header(impl_) else { return };
+            assumed.extend(header);
+        }
+        let known = self.known(function.into(), &assumed);
+        let needs = self.where_needs(function.into());
+        self.resolve(&known, needs);
+    }
+
+    /// What the well-formedness of `def`'s own where clauses needs: of each type in them,
+    /// and of a trait bound the trait's outlives bounds.
+    fn where_needs(&mut self, def: GenericDefId) -> Vec<(Needs<'db>, Site)> {
+        let db = self.db;
+        let interner = self.interner();
+        let clauses: Vec<Clause<'db>> = GenericPredicates::query_own_explicit(db, def)
+            .iter_identity()
+            .map(|it| it.skip_norm_wip())
+            .collect();
+        let mut needs = Vec::new();
+        for clause in clauses {
+            let mut found = Vec::new();
+            let mut tys = Vec::new();
+            let mut self_ty = None;
+            let mut trait_ = None;
+            match clause.kind().skip_binder() {
+                ClauseKind::Trait(predicate) => {
+                    let trait_ref = predicate.trait_ref;
+                    self_ty = Some(trait_ref.self_ty());
+                    trait_ = Some(trait_ref.def_id.0);
+                    tys.extend(trait_ref.args.iter().filter_map(|arg| match arg.kind() {
+                        GenericArgKind::Type(ty) => Some(ty),
+                        _ => None,
+                    }));
+                    let trait_clauses: Vec<Clause<'db>> =
+                        GenericPredicates::query_all(db, trait_ref.def_id.0.into())
+                            .iter_instantiated(interner, trait_ref.args.as_slice())
+                            .map(|it| it.skip_norm_wip())
+                            .collect();
+                    outlives::clause_needs(&trait_clauses, &mut found);
+                }
+                ClauseKind::Projection(predicate) => {
+                    let TermId::TypeAliasId(item) = predicate.def_id().0 else { continue };
+                    let ItemContainerId::TraitId(it) = item.lookup(db).container else {
+                        continue;
+                    };
+                    trait_ = Some(it);
+                    self_ty = predicate.projection_term.args.iter().next().and_then(|it| match it
+                        .kind()
+                    {
+                        GenericArgKind::Type(ty) => Some(ty),
+                        _ => None,
+                    });
+                    tys.extend(predicate.projection_term.args.iter().filter_map(|arg| {
+                        match arg.kind() {
+                            GenericArgKind::Type(ty) => Some(ty),
+                            _ => None,
+                        }
+                    }));
+                    tys.extend(predicate.term.as_type());
+                }
+                ClauseKind::TypeOutlives(rustc_type_ir::OutlivesPredicate(ty, _)) => {
+                    self_ty = Some(ty);
+                    tys.push(ty);
+                }
+                _ => continue,
+            }
+            if tys.iter().any(|ty| ty.references_error()) {
+                continue;
+            }
+            for ty in tys {
+                outlives::wf(db, &mut self.inferred, ty, &mut found);
+            }
+            found.retain(|it| match *it {
+                Needs::Type(ty, region) => {
+                    !ty.has_escaping_bound_vars() && !region.has_escaping_bound_vars()
+                }
+                Needs::Region(longer, shorter) => {
+                    !longer.has_escaping_bound_vars() && !shorter.has_escaping_bound_vars()
+                }
+            });
+            if found.is_empty() {
+                continue;
+            }
+            let Some(site) = self.bound_site(def, self_ty, trait_) else { continue };
+            needs.extend(found.into_iter().map(|it| (it, site)));
+        }
+        needs
+    }
+
+    /// The where predicate of `def` a clause comes from: the one on `self_ty` naming the
+    /// trait `trait_`, or with no trait an outlives bound on `self_ty`.
+    fn bound_site(
+        &self,
+        def: GenericDefId,
+        self_ty: Option<Ty<'db>>,
+        trait_: Option<TraitId>,
+    ) -> Option<Site> {
+        let db = self.db;
+        let params = GenericParams::of(db, def);
+        let store = ExpressionStore::of(db, def.into());
+        let trait_name = trait_.map(|it| TraitSignature::of(db, it).name.clone());
+        let param = match self_ty.map(|it| it.kind()) {
+            Some(TyKind::Param(param)) => Some(param.id),
+            _ => None,
+        };
+        let found = params.where_predicates().iter().position(|predicate| {
+            let WherePredicate::TypeBound { target, bound, .. } = predicate else {
+                return false;
+            };
+            let on_target = match (&store[*target], param) {
+                (TypeRef::TypeParam(id), Some(param)) => *id == param,
+                (TypeRef::TypeParam(_), None) | (_, Some(_)) => false,
+                (_, None) => true,
+            };
+            let names = match (bound, &trait_name) {
+                (TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path), Some(name)) => {
+                    store[*path].segments().last().is_some_and(|it| it.name == name)
+                }
+                (TypeBound::Lifetime(_), None) => true,
+                _ => false,
+            };
+            on_target && names
+        })?;
+        Some(Site::Bound(def, found as u32))
     }
 
     /// E0309 or E0310 for each type parameter not known to outlive a region it must, unless a

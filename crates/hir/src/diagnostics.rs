@@ -936,6 +936,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         let items = TraitItems::query_with_diagnostics(self.db, def);
 
         self.collect_generic_def(&signature.store, source_map, def.into());
+        self.collect_wfcheck(def.into());
         self.emit_def_diagnostics(&items.1);
         items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
         self.collect_assoc_items(&items.0.items, def_map);
@@ -1423,6 +1424,9 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
 
         let def_with_body: DefWithBodyId = def.into();
         self.collect_def_with_body(def_with_body, generic_def.into());
+        if let GenericDefId::FunctionId(_) = generic_def {
+            self.collect_wfcheck(generic_def);
+        }
     }
 
     fn collect_generic_variant(&mut self, def: impl Into<GenericDefId> + Into<VariantId> + Copy) {
@@ -1453,6 +1457,22 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         .target_trait
                         .as_ref()
                         .and_then(|it| source_map.type_syntax(it.path.type_ref()).ok())
+                }
+                Site::Bound(owner, index) => {
+                    use hir_def::hir::{
+                        generics::{GenericParams, WherePredicate},
+                        type_ref::TypeBound,
+                    };
+                    let (_, source_map) = ExpressionStore::with_source_map(db, owner.into());
+                    match GenericParams::of(db, owner).where_predicates().get(index as usize) {
+                        Some(WherePredicate::TypeBound { target, bound, .. }) => match bound {
+                            TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path) => {
+                                source_map.type_syntax(path.type_ref()).ok()
+                            }
+                            _ => source_map.type_syntax(*target).ok(),
+                        },
+                        _ => None,
+                    }
                 }
             };
             let Some(source) = source else { continue };
