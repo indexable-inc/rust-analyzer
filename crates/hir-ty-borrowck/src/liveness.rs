@@ -602,7 +602,7 @@ fn alias_bound<'db>(
 
 /// `ty`, its regions all `'static`, normalized as far as the solver goes: rustc normalizes the
 /// outlives clauses of the parameter environment before alias liveness matches them.
-fn normalize_erased<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
+pub(super) fn normalize_erased<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
     use hir_ty::next_solver::{infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt};
     if !rustc_type_ir::TypeVisitableExt::has_aliases(&ty) {
         return None;

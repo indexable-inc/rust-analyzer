@@ -954,6 +954,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             } else if !self.regions.is_impl_item
                 && !in_closure
                 && (named_anon(kind, shorter_kind) || named_anon(shorter_kind, kind))
+                && !self.regions.unsuggested.contains(&if kind == UniversalKind::AnonParam {
+                    longer
+                } else {
+                    shorter
+                })
             {
                 ("E0621", "explicit lifetime required in the type of a parameter".to_owned())
             } else if blamed.category == Category::CallArgument
