@@ -1,6 +1,6 @@
 //! This module generates a polymorphic MIR from a hir body
 
-use std::{iter, mem};
+use std::{borrow::Cow, iter, mem};
 
 use arrayvec::ArrayVec;
 use base_db::Crate;
@@ -81,6 +81,26 @@ struct DropScope {
     /// Whether this scope only holds the temporaries of a `let` initializer. The bindings the
     /// `let` declares outlive it.
     temporaries: bool,
+    /// While the tail of a block before the 2024 edition is lowered: how many locals the block
+    /// had declared before it. What the tail declares that is not an operand outlives the
+    /// block's locals (`outlive_block`), also when the tail panics or leaves early.
+    tail: Option<usize>,
+}
+
+impl DropScope {
+    /// The locals in the order they were declared, which is the reverse of the order they are
+    /// dropped in. The temporaries of a tail before the 2024 edition come before the block's
+    /// locals, as `outlive_block` leaves them once the tail is lowered.
+    fn in_order(&self, operands: &FxHashSet<LocalId>) -> Cow<'_, [LocalId]> {
+        match self.tail {
+            Some(declared) if declared < self.locals.len() => {
+                let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
+                    self.locals[declared..].iter().partition(|it| operands.contains(it));
+                Cow::Owned([temporaries, self.locals[..declared].to_vec(), operands].concat())
+            }
+            _ => Cow::Borrowed(&self.locals),
+        }
+    }
 }
 
 struct MirLowerCtx<'a, 'db> {
@@ -2512,17 +2532,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     /// The unwind drop tree's way out from where lowering is: every scope's drops.
     fn unwind_here(&mut self) -> Option<BasicBlockId> {
-        let in_scope: Vec<LocalId> =
-            self.drop_scopes.iter().flat_map(|it| it.locals.iter().copied()).collect();
+        let in_scope = self.in_scope();
         self.unwind_through(&in_scope, None)
+    }
+
+    /// What every scope has declared, outermost first, in the order it was declared.
+    fn in_scope(&self) -> Vec<LocalId> {
+        let operands = &self.operand_locals;
+        self.drop_scopes.iter().flat_map(|it| it.in_order(operands).into_owned()).collect()
     }
 
     /// The way out of a drop of `locals[at]` of a scope that drops `locals`: what is declared
     /// before it, then, in a coroutine, its own storage.
     fn unwind_from_drop(&mut self, locals: &[LocalId], at: usize) -> Option<BasicBlockId> {
         let local = locals[at];
-        let mut in_scope: Vec<LocalId> =
-            self.drop_scopes.iter().flat_map(|it| it.locals.iter().copied()).collect();
+        let mut in_scope = self.in_scope();
         match in_scope.iter().position(|&it| it == local) {
             Some(position) => in_scope.truncate(position),
             None => in_scope.extend_from_slice(&locals[..at]),
@@ -3041,6 +3065,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.ends_temporaries.insert(tail);
             }
             let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
+            if !edition.at_least_2024()
+                && let Some(scope) = self.drop_scopes.last_mut()
+            {
+                scope.tail = Some(declared);
+            }
             let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
                 scope.pop_assume_dropped(self);
                 return Ok(None);
@@ -3060,6 +3089,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// are dropped before the locals of the block.
     fn outlive_block(&mut self, declared: usize) {
         let Some((scope, outer)) = self.drop_scopes.split_last_mut() else { return };
+        scope.tail = None;
         if declared > scope.locals.len() {
             return;
         }
@@ -3090,8 +3120,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         };
         let extended = block.locals.split_off(declared.min(block.locals.len()));
         let held = [
-            DropScope { locals: extended, temporaries: true },
-            DropScope { locals: std::mem::take(&mut temporaries.locals), temporaries: true },
+            DropScope { locals: extended, temporaries: true, tail: None },
+            DropScope { locals: std::mem::take(&mut temporaries.locals), temporaries: true, tail: None },
         ];
         for scope in held.iter().rev() {
             self.emit_drop_and_storage_dead_for_scope(scope, &mut else_block, span);
@@ -3442,6 +3472,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             let by_guard = DropScope {
                 locals: arm.locals.get(bound_by_pattern..).unwrap_or_default().to_vec(),
                 temporaries: false,
+                tail: None,
             };
             self.emit_drop_and_storage_dead_for_scope(&by_guard, &mut current, span);
         }
@@ -3550,9 +3581,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         current: &mut Idx<BasicBlock>,
         span: MirSpan,
     ) {
-        for (at, &l) in scope.locals.iter().enumerate().rev() {
+        let locals = scope.in_order(&self.operand_locals).into_owned();
+        for (at, &l) in locals.iter().enumerate().rev() {
             if !self.is_copy(self.result.locals[l].ty.as_ref()) {
-                let unwind = self.unwind_from_drop(&scope.locals, at);
+                let unwind = self.unwind_from_drop(&locals, at);
                 let prev = std::mem::replace(current, self.new_basic_block());
                 self.set_terminator(
                     prev,
