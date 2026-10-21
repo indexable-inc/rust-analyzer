@@ -22,7 +22,7 @@ use rustc_type_ir::{
 
 use hir_ty::{
     GenericPredicates, InferBodyId,
-    db::{GeneralConstId, InternedClosureId},
+    db::GeneralConstId,
     mir::{
         AggregateKind, BorrowKind, CastKind, LocalId, MirBody, MirSpan, Operand, OperandKind,
         PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
@@ -391,7 +391,7 @@ pub(super) fn build<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     cfg: &Cfg,
-    requirements: &FxHashMap<InternedClosureId<'db>, (usize, Vec<Requirement<'db>>)>,
+    requirements: &FxHashMap<hir_def::hir::ExprId, (usize, Vec<Requirement<'db>>)>,
 ) -> Regions<'db> {
     let mut builder = Builder {
         ctx,
@@ -446,7 +446,7 @@ struct Builder<'c, 'a, 'db> {
     regions: Regions<'db>,
     /// What each closure checked so far needs of the body that creates it, with how many
     /// regions the closure's type has.
-    requirements: &'c FxHashMap<InternedClosureId<'db>, (usize, Vec<Requirement<'db>>)>,
+    requirements: &'c FxHashMap<hir_def::hir::ExprId, (usize, Vec<Requirement<'db>>)>,
     /// The universal region of each lifetime parameter, by its index.
     early: FxHashMap<u32, Region<'db>>,
     /// The universal region of each of the signature's late-bound lifetimes.
@@ -1321,12 +1321,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// rustc's `prove_closure_bounds` where the closure `ty` is made: its enclosing item's
     /// arguments are this body's parameters, and what the closure needs of this body's
     /// regions holds, blamed on what in the closure needs it.
-    fn closure_requirements(
-        &mut self,
-        closure: InternedClosureId<'db>,
-        ty: Ty<'db>,
-        span: MirSpan,
-    ) {
+    fn closure_requirements(&mut self, closure: hir_def::hir::ExprId, ty: Ty<'db>, span: MirSpan) {
         let TyKind::Closure(_, args) = ty.kind() else { return };
         let at = At { category: Category::Boring, span };
         for (index, arg) in args.as_closure().parent_args().iter().enumerate() {
@@ -1848,7 +1843,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             }
                         }
                     }
-                    self.closure_requirements(def.0, ty, span);
+                    self.closure_requirements(def.0.loc(self.ctx.db).expr, ty, span);
                 }
                 Some(ty)
             }

@@ -8,7 +8,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
-    db::InternedClosureId,
     mir::{
         AsmOperand, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, Operand, OperandKind,
         PlaceElem, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
@@ -32,7 +31,7 @@ use super::{
 pub(super) fn check<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
-    requirements: &FxHashMap<InternedClosureId<'db>, (usize, Vec<regions::Requirement<'db>>)>,
+    requirements: &FxHashMap<ExprId, (usize, Vec<regions::Requirement<'db>>)>,
     out: &mut Vec<BorrowckDiagnostic>,
 ) -> (usize, Vec<regions::Requirement<'db>>) {
     let cfg = Cfg::new(body);

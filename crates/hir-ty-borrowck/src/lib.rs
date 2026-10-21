@@ -1,7 +1,7 @@
 //! The borrow checker: rustc's `rustc_borrowck` over the bodies MIR lowering builds.
 //!
-//! Each body is checked on its own, closures with it, as rustc checks a body and the closures
-//! in it together, and the result is a query of the body's owner, so an edit checks again
+//! Each body is checked on its own, closures and coroutines with it, as rustc checks a body
+//! and the closures in it together, and the result is a query of the body's owner, so an edit checks again
 //! only the bodies it changes. What it reports carries rustc's error codes and the span rustc
 //! points at; `docs/borrowck.md` in the repository describes what is checked and how.
 
@@ -32,7 +32,7 @@ use salsa::SalsaValue;
 use hir_ty::{
     InferBodyId, InferenceResult,
     closure_analysis::CapturedPlace,
-    db::{HirDatabase, InternedClosureId},
+    db::{HirDatabase, InternedCoroutineId},
     next_solver::{
         DbInterner, ParamEnv, Ty, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
@@ -109,9 +109,19 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
         index += 1;
         for &closure in &body.closures {
             match db.mir_body_for_closure(closure) {
-                Ok(it) => bodies.push((it, Some(closure))),
+                Ok(it) => bodies.push((it, Some(closure.loc(db).expr))),
                 Err(error) => {
                     result.skipped.get_or_insert_with(|| format!("closure: {error:?}"));
+                }
+            }
+        }
+        // The body of an `async` block or `async fn`, checked as rustc checks a coroutine: as
+        // a closure of the body that makes it.
+        for coroutine in coroutines(body) {
+            match db.mir_body_for_coroutine(coroutine) {
+                Ok(it) => bodies.push((it, Some(coroutine.loc(db).expr))),
+                Err(error) => {
+                    result.skipped.get_or_insert_with(|| format!("coroutine: {error:?}"));
                 }
             }
         }
@@ -131,6 +141,26 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     }
     result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
     result
+}
+
+/// The coroutines `body` makes, in the order it makes them.
+fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
+    use hir_ty::mir::{AggregateKind, Rvalue, StatementKind};
+    use hir_ty::next_solver::TyKind;
+    use rustc_type_ir::inherent::IntoKind;
+    let mut out = Vec::new();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Closure(ty), _)) =
+                &statement.kind
+                && let TyKind::Coroutine(id, _) = ty.as_ref().kind()
+                && !out.contains(&id.0)
+            {
+                out.push(id.0);
+            }
+        }
+    }
+    out
 }
 
 /// What the checks ask of the types and the source of a body.
@@ -175,7 +205,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
         store: &'a ExpressionStore,
         infer: &'a InferenceResult<'db>,
         body: &MirBody<'db>,
-        closure: Option<InternedClosureId<'db>>,
+        closure: Option<ExprId>,
         mode: Mode,
     ) -> Self {
         let krate = owner.krate(db);
@@ -187,8 +217,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
         let mut upvars = Vec::new();
         let mut closure_kind = None;
         let mut closure_local = None;
-        if let Some(closure) = closure {
-            let expr = closure.loc(db).expr;
+        if let Some(expr) = closure {
             closure_kind = closure_kind_of(infer, expr);
             closure_local = body.param_locals.first().copied();
             if let Some(data) = infer.closures_data.get(&expr) {
