@@ -3031,14 +3031,13 @@ impl<'db> Evaluator<'db> {
         locals: &Locals<'db>,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
-        let mir_body = self
-            .db
-            .monomorphized_runtime_mir_body_for_closure(
-                closure,
-                generic_args.store(),
-                self.param_env.store(),
-            )
-            .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
+        let mir_body = super::optimize::interpreted_closure_body(
+            self.db,
+            closure,
+            generic_args.store(),
+            self.param_env.store(),
+        )
+        .map_err(|it| MirEvalError::MirLowerErrorForClosure(closure, it))?;
         let closure_data =
             if mir_body.locals[mir_body.param_locals[0]].ty.as_ref().as_reference().is_some() {
                 closure_data.addr.to_bytes().to_vec()
@@ -3146,19 +3145,18 @@ impl<'db> Evaluator<'db> {
                 not_supported!("evaluating builtin derive impls is not supported")
             };
 
-            let mir_body = self
-                .db
-                .monomorphized_runtime_mir_body(
-                    imp.into(),
-                    generic_args.store(),
-                    self.param_env.store(),
+            let mir_body = super::optimize::interpreted_body(
+                self.db,
+                imp.into(),
+                generic_args.store(),
+                self.param_env.store(),
+            )
+            .map_err(|e| {
+                MirEvalError::InFunction(
+                    Box::new(MirEvalError::MirLowerError(imp, e)),
+                    vec![(Either::Left(imp), span, locals.body.owner)],
                 )
-                .map_err(|e| {
-                    MirEvalError::InFunction(
-                        Box::new(MirEvalError::MirLowerError(imp, e)),
-                        vec![(Either::Left(imp), span, locals.body.owner)],
-                    )
-                })?;
+            })?;
             MirOrDynIndex::Mir(mir_body)
         };
         self.mir_or_dyn_index_cache.borrow_mut().insert((def, generic_args), r.clone());
@@ -3443,7 +3441,8 @@ impl<'db> Evaluator<'db> {
         );
         if let Either::Left(drop_impl) = drop_impl
             && matches!(drop_impl.lookup(self.db).container, ItemContainerId::ImplId(_))
-            && let Ok(body) = self.db.monomorphized_runtime_mir_body(
+            && let Ok(body) = super::optimize::interpreted_body(
+                self.db,
                 drop_impl.into(),
                 drop_args.store(),
                 self.param_env.store(),

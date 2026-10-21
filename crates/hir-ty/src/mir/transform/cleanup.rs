@@ -7,7 +7,7 @@ use rustc_hash::FxHashSet;
 
 use crate::mir::{BasicBlockId, MirBody, StatementKind, TerminatorKind};
 
-pub(super) fn remove_noop_landing_pads(body: &mut MirBody<'_>) {
+pub(in crate::mir) fn remove_noop_landing_pads(body: &mut MirBody<'_>) {
     let mut noop: FxHashSet<BasicBlockId> = FxHashSet::default();
     loop {
         let before = noop.len();

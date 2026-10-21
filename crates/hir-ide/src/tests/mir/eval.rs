@@ -9,9 +9,32 @@ use crate::{
     mir_pretty::MirEvalErrorPretty as _, next_solver::GenericArgs, setup_tracing, test_db::TestDB,
 };
 
-use crate::mir::{MirEvalError, interpret_mir};
+use crate::mir::{MirEvalError, MirOptLevel, interpret_mir, set_interpreter_mir_opt_level};
 
 fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError<'_>> {
+    let unoptimized = eval_main_at(db, file_id, MirOptLevel::Off);
+    // rustc's MIR optimizations change nothing a program does.
+    for level in [MirOptLevel::Debug, MirOptLevel::Release] {
+        let optimized = eval_main_at(db, file_id, level);
+        match (&unoptimized, &optimized) {
+            (Ok(expected), Ok(got)) => {
+                assert_eq!(expected, got, "at MIR optimization level {level:?}")
+            }
+            (Err(_), Err(_)) => (),
+            (Ok(_), Err(e)) => panic!("at MIR optimization level {level:?}: {e:?}"),
+            (Err(e), Ok(_)) => {
+                panic!("only at MIR optimization level {level:?} does it run: {e:?}")
+            }
+        }
+    }
+    unoptimized
+}
+
+fn eval_main_at(
+    db: &TestDB,
+    file_id: EditionedFileId,
+    level: MirOptLevel,
+) -> Result<(String, String), MirEvalError<'_>> {
     crate::attach_db(db, || {
         let module_id = db.module_for_file(file_id.file_id(db));
         let def_map = module_id.def_map(db);
@@ -31,19 +54,21 @@ fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), 
                 _ => None,
             })
             .expect("no main function found");
-        let body = db
-            .monomorphized_runtime_mir_body(
-                func_id.into(),
-                GenericArgs::empty().store(),
-                crate::ParamEnvAndCrate {
-                    param_env: db.trait_environment(func_id.into()),
-                    krate: func_id.krate(db),
-                }
-                .store(),
-            )
-            .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
-
-        let (result, output) = interpret_mir(db, body, false, None)?;
+        let env = crate::ParamEnvAndCrate {
+            param_env: db.trait_environment(func_id.into()),
+            krate: func_id.krate(db),
+        }
+        .store();
+        let args = GenericArgs::empty().store();
+        let body = match level {
+            MirOptLevel::Off => db.monomorphized_runtime_mir_body(func_id.into(), args, env),
+            level => db.monomorphized_optimized_mir_body(func_id.into(), level, args, env),
+        }
+        .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
+        set_interpreter_mir_opt_level(level);
+        let ran = interpret_mir(db, body, false, None);
+        set_interpreter_mir_opt_level(MirOptLevel::Off);
+        let (result, output) = ran?;
         result?;
         Ok((output.stdout().into_owned(), output.stderr().into_owned()))
     })
@@ -53,7 +78,7 @@ fn check_pass(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     check_pass_and_stdio(ra_fixture, "", "");
 }
 
-fn check_pass_and_stdio(
+pub(super) fn check_pass_and_stdio(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     expected_stdout: &str,
     expected_stderr: &str,

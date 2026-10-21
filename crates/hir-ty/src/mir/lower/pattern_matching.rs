@@ -287,7 +287,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         ),
                         pattern.into(),
                     );
-                    let discr = Operand { kind: OperandKind::Copy(discr.store()), span: None };
+                    let discr = Operand { kind: OperandKind::Move(discr.store()), span: None };
                     self.set_terminator(
                         current,
                         TerminatorKind::SwitchInt {
@@ -378,7 +378,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                                 pattern.into(),
                             );
                             let discr =
-                                Operand { kind: OperandKind::Copy(discr.store()), span: None };
+                                Operand { kind: OperandKind::Move(discr.store()), span: None };
                             self.set_terminator(
                                 current,
                                 TerminatorKind::SwitchInt {
@@ -525,7 +525,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     self.set_terminator(
                         current,
                         TerminatorKind::SwitchInt {
-                            discr: Operand { kind: OperandKind::Copy(tmp2.store()), span: None },
+                            discr: Operand { kind: OperandKind::Move(tmp2.store()), span: None },
                             targets: SwitchTargets::static_if(1, next, else_target),
                         },
                         span,
@@ -705,7 +705,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             ),
             pattern.into(),
         );
-        let discr = Operand { kind: OperandKind::Copy(discr.store()), span: None };
+        let discr = Operand { kind: OperandKind::Move(discr.store()), span: None };
         self.set_terminator(
             current,
             TerminatorKind::SwitchInt {
@@ -769,7 +769,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     self.set_terminator(
                         current,
                         TerminatorKind::SwitchInt {
-                            discr: Operand { kind: OperandKind::Copy(tmp.store()), span: None },
+                            discr: Operand { kind: OperandKind::Move(tmp.store()), span: None },
                             targets: SwitchTargets::static_if(e, next, *else_target),
                         },
                         span,

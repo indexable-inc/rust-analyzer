@@ -19,6 +19,8 @@ mod move_paths;
 mod packed_drops;
 mod upvars;
 
+pub(super) use cleanup::remove_noop_landing_pads;
+
 use std::cell::RefCell;
 
 use base_db::Crate;
@@ -44,15 +46,15 @@ type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
 /// What the passes ask of the types of a body.
 pub(super) struct Ctx<'db> {
-    db: &'db dyn HirDatabase,
-    infcx: InferCtxt<'db>,
-    env: ParamEnv<'db>,
+    pub(super) db: &'db dyn HirDatabase,
+    pub(super) infcx: InferCtxt<'db>,
+    pub(super) env: ParamEnv<'db>,
     krate: Crate,
     needs_drop: RefCell<FxHashMap<Ty<'db>, bool>>,
 }
 
 impl<'db> Ctx<'db> {
-    fn new(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Self {
+    pub(super) fn new(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Self {
         let krate = owner.krate(db);
         let env = db.trait_environment(owner.generic_def(db));
         let interner = DbInterner::new_with(db, krate);
@@ -61,7 +63,7 @@ impl<'db> Ctx<'db> {
     }
 
     /// Whether a value of `ty` may have something to drop: a type parameter may.
-    fn needs_drop(&self, ty: Ty<'db>) -> bool {
+    pub(super) fn needs_drop(&self, ty: Ty<'db>) -> bool {
         if let Some(&known) = self.needs_drop.borrow().get(&ty) {
             return known;
         }
@@ -70,7 +72,7 @@ impl<'db> Ctx<'db> {
         needs
     }
 
-    fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+    pub(super) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
         if !matches!(ty.kind(), TyKind::Alias(..)) {
             return ty;
         }

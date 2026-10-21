@@ -211,6 +211,46 @@ place-set drop tracking (`DropFlags`) is deleted, and a body that is not elabora
 body, which it can't run anyway) is reported as not supported. A failed `Assert` is a panic
 with the words its own checks used (`Overflow in Add`, `index out of bounds: ..`).
 
+## Optimizations
+
+The code is `crates/hir-ty/src/mir/optimize.rs` and `optimize/`: rustc's
+`run_optimization_passes`, ported pass by pass in its order, on top of the runtime
+body: `optimized_mir_body(def, level)`, `optimized_mir_body_for_closure` and their
+`monomorphized_optimized_*` variants, again separate salsa queries so nothing else computes
+them. `MirOptLevel` is rustc's `-Zmir-opt-level`: `Off` is the runtime body unchanged,
+`Debug` is level 1 (what `-Copt-level=0` gets), `Release` level 2 (above `-Copt-level=0`).
+ra-jit picks the level from `RA_JIT_MIR_OPT` (0, the default, 1 or 2); the interpreter takes
+it from `set_interpreter_mir_opt_level`.
+
+- Level 1: `CleanupPostBorrowck` (fake reads, false edges, `CopyForDeref`; also the storage
+  markers lowering gives parameters), `LowerSliceLenCalls`, `InstSimplify` (bool comparisons,
+  `&*` of a reference, casts to the same type, `[x; 1]`, `Clone::clone` of a primitive,
+  duplicate switch targets), `RemoveStorageMarkers`, `RemoveUnneededDrops`, `SimplifyCfg`,
+  `SimplifyConstCondition`, `SimplifyLocals`, `SingleUseConsts`, `RemoveNoopLandingPads`,
+  `CopyProp`, `CriticalCallEdges`.
+- Level 2 adds `UnreachablePropagation` and both `DeadStoreElimination`s, and keeps storage
+  markers, as rustc does when LLVM gets lifetime markers.
+- Not ported: `passes_not_ported(level)` lists them. The large ones are the inliner, `GVN`,
+  `ReferencePropagation`, `ScalarReplacementOfAggregates`, `JumpThreading` and
+  `DestinationPropagation`, and the debug-build UB checks (`CheckAlignment`, `CheckNull`,
+  `CheckEnums`).
+
+Where a port differs from rustc:
+
+- Coroutine bodies are not optimized: `held.rs` computes a future's layout from the runtime
+  body, and the layout has to stay what rustc's is.
+- Promoted locals, upvars, parameters, the return slot and every local a binding's debug info
+  names are kept, as nothing here rewrites debug info the way rustc's `SimplifyLocals` does.
+- Dead-store elimination ends a local's life at a write only, not at its `StorageDead`. For MIR
+  rustc builds that's the same; for MIR where lowering put a `StorageDead` before a read it
+  keeps the store.
+- In a debug build of the fork every pass is followed by a check of the body (locals, blocks
+  and terminators in range), which names the pass that broke it.
+
+The interpreter's tests run every program at all three levels and require the same output
+(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`). `harness/mirparity.py` in ra-jit
+compares the result with rustc's `-Zunpretty=mir`.
+
 ## Not done yet
 
 - **Abort on unwind.** A drop in a cleanup block that unwinds should abort (rustc's

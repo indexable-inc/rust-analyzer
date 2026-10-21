@@ -162,6 +162,50 @@ pub trait HirDatabase: SourceDatabase + 'static {
         crate::mir::runtime_mir_body_for_coroutine_by_move_query(db, def).map_err(|err| err.clone())
     }
 
+    /// The runtime body after rustc's MIR optimizations at `level`
+    /// (`crate::mir::MirOptLevel`). A coroutine body is the runtime body.
+    fn optimized_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        level: crate::mir::MirOptLevel,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::optimized_mir_body_query(db, def, level).map_err(|err| err.clone())
+    }
+
+    fn optimized_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        level: crate::mir::MirOptLevel,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::optimized_mir_body_for_closure_query(db, def, level).map_err(|err| err.clone())
+    }
+
+    fn monomorphized_optimized_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        level: crate::mir::MirOptLevel,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_optimized_mir_body_query(db, def, level, subst, env)
+            .map_err(|err| err.clone())
+    }
+
+    fn monomorphized_optimized_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        level: crate::mir::MirOptLevel,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        let db = self.as_dyn();
+        crate::mir::monomorphized_optimized_mir_body_for_closure_query(db, def, level, subst, env)
+            .map_err(|err| err.clone())
+    }
+
     fn monomorphized_runtime_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,

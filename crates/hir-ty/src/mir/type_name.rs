@@ -62,6 +62,19 @@ pub(crate) fn rustc_closure_name<'db>(
     Some(out.text)
 }
 
+/// What rustc writes after the path of the function a closure is written in: `::{closure#0}`,
+/// the closures it is in first.
+pub(crate) fn rustc_closure_suffix(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+) -> Option<String> {
+    let around = closures_around(db, owner, expr)?;
+    let mut out = Spelled::new(Spelling::Symbol);
+    out.closures(&around);
+    Some(out.text)
+}
+
 /// The path rustc tells a debugger the code of that closure or `async` block by.
 pub(crate) fn rustc_debug_closure<'db>(
     db: &'db dyn HirDatabase,
