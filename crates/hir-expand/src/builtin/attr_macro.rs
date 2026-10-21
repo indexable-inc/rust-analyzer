@@ -64,7 +64,7 @@ register_builtin! {
     (derive, Derive) => derive_expand,
     // derive const is equivalent to derive for our proposes.
     (derive_const, DeriveConst) => derive_expand,
-    (global_allocator, GlobalAllocator) => dummy_attr_expand,
+    (global_allocator, GlobalAllocator) => global_allocator_expand,
     (test, Test) => dummy_gate_test_expand,
     (test_case, TestCase) => dummy_gate_test_expand,
     (define_opaque, DefineOpaque) => define_opaque_expand,
@@ -81,6 +81,76 @@ fn dummy_attr_expand(
     _span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     ExpandResult::ok(tt.clone())
+}
+
+/// The static, and what calls it in the allocator's place: rustc's expansion defines `__rg_alloc`
+/// and the others, which its allocator shim calls. These have names of ra-jit's, which the
+/// stand-in rustc builds for a crate whose code is ra-jit's calls from a `#[global_allocator]`
+/// of its own (ra-jit's `stub.rs`).
+fn global_allocator_expand(
+    _db: &dyn SourceDatabase,
+    _id: MacroCallId,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    let ident = |it: tt::TtElement<'_>| match it {
+        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident.clone()),
+        _ => None,
+    };
+    let mut idents = tt.iter().filter_map(ident);
+    idents.find(|it| it.sym.as_str() == "static");
+    let Some(name) = idents.find(|it| it.sym.as_str() != "mut") else {
+        return ExpandResult::ok(tt.clone());
+    };
+    let name = &name;
+    let result = quote::quote! { span=>
+        #tt
+        #[export_name = "__ra_jit_global_alloc"]
+        unsafe extern "C" fn __ra_jit_global_alloc(size: usize, align: usize) -> *mut u8 {
+            unsafe {
+                ::core::alloc::GlobalAlloc::alloc(
+                    &#name,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                )
+            }
+        }
+        #[export_name = "__ra_jit_global_dealloc"]
+        unsafe extern "C" fn __ra_jit_global_dealloc(ptr: *mut u8, size: usize, align: usize) {
+            unsafe {
+                ::core::alloc::GlobalAlloc::dealloc(
+                    &#name,
+                    ptr,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                )
+            }
+        }
+        #[export_name = "__ra_jit_global_realloc"]
+        unsafe extern "C" fn __ra_jit_global_realloc(
+            ptr: *mut u8,
+            size: usize,
+            align: usize,
+            new_size: usize,
+        ) -> *mut u8 {
+            unsafe {
+                ::core::alloc::GlobalAlloc::realloc(
+                    &#name,
+                    ptr,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                    new_size,
+                )
+            }
+        }
+        #[export_name = "__ra_jit_global_alloc_zeroed"]
+        unsafe extern "C" fn __ra_jit_global_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+            unsafe {
+                ::core::alloc::GlobalAlloc::alloc_zeroed(
+                    &#name,
+                    ::core::alloc::Layout::from_size_align_unchecked(size, align),
+                )
+            }
+        }
+    };
+    ExpandResult::ok(result)
 }
 
 /// The item keeps the list as a tool attribute, which type inference reads and name resolution

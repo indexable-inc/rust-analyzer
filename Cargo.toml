@@ -37,8 +37,9 @@ inherits = "release"
 debug = 2
 
 [patch.'crates-io']
-# rustc's layout code, from the tag of the stable in `harness/toolchain`.
-ra-ap-rustc_abi = { path = "lib/rustc_abi" }
+# rustc's layout code, from the tag of the stable in `harness/toolchain`: ra-jit's
+# vendor/rustc_abi, which its own workspace patches in by path.
+ra-ap-rustc_abi = { git = "https://github.com/indexable-inc/rustc_abi", branch = "main" }
 # rowan = { path = "../rowan" }
 
 # line-index = { path = "lib/line-index" }

@@ -356,7 +356,7 @@ impl<'db> Filler<'db> {
 
 /// `body` with `subst` in place of its generic parameters. The queries below keep the result;
 /// a caller that needs it once asks here instead.
-pub(crate) fn monomorphized<'db>(
+pub fn monomorphized<'db>(
     db: &'db dyn HirDatabase,
     body: &MirBody<'db>,
     subst: &StoredGenericArgs,

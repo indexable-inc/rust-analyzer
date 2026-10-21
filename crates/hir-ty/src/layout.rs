@@ -594,7 +594,7 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
     }
 }
 
-pub(crate) fn struct_tail_erasing_lifetimes<'a>(
+pub fn struct_tail_erasing_lifetimes<'a>(
     db: &'a dyn HirDatabase,
     pointee: Ty<'a>,
     normalize: &dyn Fn(Ty<'a>) -> Ty<'a>,

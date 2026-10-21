@@ -170,7 +170,7 @@ impl ComplexMemoryMap<'_> {
 
 impl<'db> MemoryMap<'db> {
     /// The static whose memory holds `addr`, and the offset of `addr` in it.
-    pub(crate) fn static_at(&self, addr: usize) -> Option<(hir_def::StaticId, usize)> {
+    pub fn static_at(&self, addr: usize) -> Option<(hir_def::StaticId, usize)> {
         let MemoryMap::Complex(map) = self else { return None };
         map.statics.iter().find_map(|it| {
             let offset = addr.checked_sub(it.start)?;
@@ -179,7 +179,7 @@ impl<'db> MemoryMap<'db> {
     }
 
     /// The memory that holds `addr`, with the address it starts at.
-    pub(crate) fn memory_at(&self, addr: usize) -> Option<(usize, &[u8])> {
+    pub fn memory_at(&self, addr: usize) -> Option<(usize, &[u8])> {
         match self {
             MemoryMap::Empty => None,
             MemoryMap::Simple(memory) => (addr == 0).then_some((0, &**memory)),
@@ -194,7 +194,7 @@ impl<'db> MemoryMap<'db> {
 
     /// What the piece of memory at `start` was aligned to where it was made, if that was
     /// recorded.
-    pub(crate) fn align_at(&self, start: usize) -> Option<usize> {
+    pub fn align_at(&self, start: usize) -> Option<usize> {
         match self {
             MemoryMap::Empty | MemoryMap::Simple(_) => None,
             MemoryMap::Complex(map) => map.aligns.get(&start).copied(),

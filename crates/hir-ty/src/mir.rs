@@ -31,28 +31,30 @@ use crate::{
     },
 };
 
-// rustd's code generator, in the repository this one is a submodule of.
-#[path = "../../../../../crates/hir-ty-codegen/mod.rs"]
-pub mod codegen;
 mod eval;
 mod held;
+pub mod location;
 mod lower;
 mod monomorphization;
 mod optimize;
+pub mod overflow;
 mod pretty;
+pub mod target;
 mod transform;
-mod type_name;
+pub mod type_name;
 
 pub use eval::{
     Evaluator, IsSigned, MirEvalError, VTableMap, interpret_mir, pad16,
     render_const_using_debug_impl,
 };
 pub use held::{HeldLocals, YieldPoint};
+pub use lower::is_builtin_index;
 pub use lower::{
     MirLowerError, is_by_move_coroutine, lower_body_to_mir, lower_to_mir_with_store,
     mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
     mir_body_query, promoted_mir_body_query,
 };
+pub use monomorphization::monomorphized;
 pub use monomorphization::{
     monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
     monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,
@@ -1455,7 +1457,7 @@ impl MirBody<'_> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }
 
-    pub(crate) fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
+    pub fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
         fn for_operand(op: &mut Operand, f: &mut impl FnMut(&mut StoredPlace)) {
             match &mut op.kind {
                 OperandKind::Copy(p) | OperandKind::Move(p) => {

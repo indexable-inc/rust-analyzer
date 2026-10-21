@@ -581,7 +581,7 @@ pub(crate) fn find_matching_impl<'db>(
 /// Named is by the identifiers of `krate`'s files, which is more than rustc resolves (a local
 /// of the same name does) and less where a macro of another crate alone names the dependency.
 #[salsa::tracked(returns(deref))]
-pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
     let data = krate.data(db);
     let mut unnamed: Vec<_> = data
@@ -592,9 +592,14 @@ pub(crate) fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> 
             !(dep.is_sysroot() || data.origin.is_lang() || data.target_kind.is_proc_macro())
         })
         .collect();
-    // Few files name a dependency, and a file's text tells which may without its tree.
-    let mut files =
-        crate_def_map(db, krate).modules(db).filter_map(|(_, module)| module.origin.file_id());
+    // Few files name a dependency, and a file's text tells which may without its tree. A file
+    // `include!` puts among the items is one of the crate's as well: a root that is only
+    // `include!("../../app/main.rs");` names its dependencies there.
+    let included = hir_def::include_macro_invoc(db, krate);
+    let mut files = crate_def_map(db, krate)
+        .modules(db)
+        .filter_map(|(_, module)| module.origin.file_id())
+        .chain(included.iter().map(|&(_, file)| file));
     while !unnamed.is_empty()
         && let Some(file) = files.next()
     {

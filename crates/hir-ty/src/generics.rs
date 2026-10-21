@@ -199,7 +199,7 @@ impl<'db> Generics<'db> {
         self.owner().store
     }
 
-    pub(crate) fn iter_self(
+    pub fn iter_self(
         &self,
     ) -> impl Iterator<Item = (GenericParamId, GenericParamDataRef<'db>)> {
         self.owner().iter(false)
@@ -252,7 +252,7 @@ impl<'db> Generics<'db> {
     }
 
     #[inline]
-    pub(crate) fn len_parent(&self) -> usize {
+    pub fn len_parent(&self) -> usize {
         // add `consider_late_bound` arg if needed in future, currently it's not needed.
         self.parent().map_or(0, |p| p.len(true))
     }

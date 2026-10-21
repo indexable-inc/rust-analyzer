@@ -33,14 +33,14 @@ use crate::{
 };
 
 /// `None` is a type whose rustc spelling this does not reproduce.
-pub(crate) fn rustc_type_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+pub fn rustc_type_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::TypeName);
     write_ty(db, &mut out, ty)?;
     Some(out.text)
 }
 
 /// What the symbol of `func` with `args` demangles to, which is how a backtrace names it.
-pub(crate) fn rustc_function_name<'db>(
+pub fn rustc_function_name<'db>(
     db: &'db dyn HirDatabase,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -51,7 +51,7 @@ pub(crate) fn rustc_function_name<'db>(
 }
 
 /// The same of the closure or `async` block written at `expr` of `func`.
-pub(crate) fn rustc_closure_name<'db>(
+pub fn rustc_closure_name<'db>(
     db: &'db dyn HirDatabase,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -64,7 +64,7 @@ pub(crate) fn rustc_closure_name<'db>(
 
 /// What rustc writes after the path of the function a closure is written in: `::{closure#0}`,
 /// the closures it is in first.
-pub(crate) fn rustc_closure_suffix(
+pub fn rustc_closure_suffix(
     db: &dyn HirDatabase,
     owner: DefWithBodyId,
     expr: ExprId,
@@ -76,7 +76,7 @@ pub(crate) fn rustc_closure_suffix(
 }
 
 /// The path rustc tells a debugger the code of that closure or `async` block by.
-pub(crate) fn rustc_debug_closure<'db>(
+pub fn rustc_debug_closure<'db>(
     db: &'db dyn HirDatabase,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -88,7 +88,7 @@ pub(crate) fn rustc_debug_closure<'db>(
 }
 
 /// The same of a type, as it stands among the generic arguments of a symbol.
-pub(crate) fn rustc_symbol_type<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+pub fn rustc_symbol_type<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_ty(db, &mut out, ty)?;
     Some(out.text)
@@ -97,7 +97,7 @@ pub(crate) fn rustc_symbol_type<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> O
 /// What rustc calls a type where it tells a debugger of it: every generic argument that is
 /// not a lifetime, a closure `{closure_env#0}` and an `async fn` `{async_fn_env#0}` after
 /// what they are written in.
-pub(crate) fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
+pub fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::Debug);
     write_ty(db, &mut out, ty)?;
     Some(out.text)
@@ -107,7 +107,7 @@ pub(crate) fn rustc_debug_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Op
 /// type an `impl` of its own is of, `{impl#0}` for any other `impl` by its place in the
 /// module, or the trait, and last the name with what the function and the `impl` are
 /// generic over.
-pub(crate) fn rustc_debug_function<'db>(
+pub fn rustc_debug_function<'db>(
     db: &'db dyn HirDatabase,
     func: FunctionId,
     args: &[GenericArg<'db>],
@@ -151,7 +151,7 @@ fn write_container<'db>(
 
 /// The body a block is written in, and the module that body's owner is declared in: a
 /// function, constant or static of the module, or of an `impl` or a trait of it.
-pub(crate) fn block_owner<'db>(
+pub fn block_owner<'db>(
     db: &'db dyn HirDatabase,
     block: hir_def::BlockIdLt<'db>,
 ) -> Option<(DefWithBodyId, ModuleIdLt<'db>)> {
@@ -190,7 +190,7 @@ pub(crate) fn block_owner<'db>(
 }
 
 /// Whether `block` of `owner` is written in no closure or `async` block of it.
-pub(crate) fn is_outside_closures<'db>(
+pub fn is_outside_closures<'db>(
     db: &'db dyn HirDatabase,
     owner: DefWithBodyId,
     block: hir_def::BlockIdLt<'db>,

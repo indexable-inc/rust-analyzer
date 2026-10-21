@@ -336,7 +336,7 @@ fn heap_offset() -> usize {
 
 /// How many bytes an address of the target takes.
 fn target_word() -> usize {
-    crate::mir::codegen::Target::current().word()
+    crate::mir::target::word()
 }
 
 /// The `usize` of the target that `bytes` are.
@@ -809,7 +809,7 @@ impl<'db> Evaluator<'db> {
     /// Whether arithmetic of the body being evaluated panics when it overflows, which is
     /// what the code compiled from the body does: a constant is what running it would give.
     fn checks_overflow(&self, locals: &Locals<'db>) -> bool {
-        crate::mir::codegen::body_checks_overflow(self.db, locals.body).unwrap_or(true)
+        crate::mir::overflow::body_checks_overflow(self.db, locals.body).unwrap_or(true)
     }
 
     fn operand_ty(&self, o: &Operand, locals: &Locals<'db>) -> Result<'db, Ty<'db>> {
@@ -1966,13 +1966,13 @@ impl<'db> Evaluator<'db> {
         ty: Ty<'db>,
         locals: &Locals<'db>,
     ) -> Result<'db, Option<Interval>> {
-        use crate::mir::codegen::Placed;
+        use crate::mir::location::Placed;
         let (Some(MirSpan::ExprId(expr)), InferBodyId::DefWithBodyId(owner)) =
             (it.span, locals.body.owner)
         else {
             return Ok(None);
         };
-        Ok(match (crate::mir::codegen::placed(self.db, owner, expr), ty.kind()) {
+        Ok(match (crate::mir::location::placed(self.db, owner, expr), ty.kind()) {
             (Some(Placed::Number(number)), TyKind::Uint(rustc_type_ir::UintTy::U32)) => {
                 let addr = self.heap_allocate(4, 4)?;
                 self.write_memory(addr, &number.to_le_bytes())?;
