@@ -798,7 +798,11 @@ impl<'db> Elaborator<'_, 'db> {
                 Part::Element(at, element) => (
                     Self::project(
                         &place,
-                        ProjectionElem::ConstantIndex { offset: at, from_end: false },
+                        ProjectionElem::ConstantIndex {
+                            offset: at,
+                            min_length: at + 1,
+                            from_end: false,
+                        },
                     ),
                     Some(element),
                 ),

@@ -711,7 +711,7 @@ impl<'db> Evaluator<'db> {
                     let ty_size = self.size_of_sized(ty.ty, locals, "array inner type")?;
                     addr = addr.offset(ty_size * offset);
                 }
-                &ProjectionElem::ConstantIndex { from_end, offset } => {
+                &ProjectionElem::ConstantIndex { from_end, offset, .. } => {
                     let offset = if from_end {
                         let len = match prev_ty.ty.kind() {
                             TyKind::Array(_, c) => match try_const_usize(self.db, c) {

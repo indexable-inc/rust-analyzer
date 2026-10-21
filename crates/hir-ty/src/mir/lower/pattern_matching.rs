@@ -394,6 +394,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 for (i, &pat) in prefix.iter().enumerate() {
                     let next_place = cond_place.project(ProjectionElem::ConstantIndex {
                         offset: i as u64,
+                        min_length: (prefix.len() + suffix.len()) as u64,
                         from_end: false,
                     });
                     (current, current_else) =
@@ -421,6 +422,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     // Offset 1 from the end is the last element, as in rustc's MIR.
                     let next_place = cond_place.project(ProjectionElem::ConstantIndex {
                         offset: (suffix.len() - i) as u64,
+                        min_length: (prefix.len() + suffix.len()) as u64,
                         from_end: true,
                     });
                     (current, current_else) =
@@ -646,18 +648,32 @@ impl<'db> MirLowerCtx<'_, 'db> {
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
         let target_place = self.binding_local(id)?;
         self.push_storage_live(id, current)?;
+        let ty = self.result.locals[target_place].ty.as_ref();
         if let BindingMode(ByRef::No, _) = mode
             && self.guarded_moves.is_some()
-            && !self.is_copy(self.result.locals[target_place].ty.as_ref())
-            && let Some(moves) = &mut self.guarded_moves
+            && !self.is_copy(ty)
         {
-            moves.push((target_place, cond_place));
+            let interner = self.interner();
+            let erased = crate::next_solver::Region::new_erased(interner);
+            let ref_ty = Ty::new_ref(interner, erased, ty, rustc_ast_ir::Mutability::Not);
+            let reference = self.temp(ref_ty, current, span)?;
+            self.push_assignment(
+                current,
+                reference.into(),
+                Rvalue::Ref(BorrowKind::Shared, cond_place.store()),
+                span,
+            );
+            self.guard_refs.insert(id, reference);
+            if let Some(moves) = &mut self.guarded_moves {
+                moves.push(super::GuardedMove { local: target_place, place: cond_place, span });
+            }
+            return Ok((current, current_else));
         }
         self.push_match_assignment(current, target_place, mode, cond_place, span);
         Ok((current, current_else))
     }
 
-    fn push_match_assignment(
+    pub(super) fn push_match_assignment(
         &mut self,
         current: BasicBlockId,
         target_place: LocalId,

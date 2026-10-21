@@ -148,9 +148,13 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     return try_rvalue(self);
                 };
                 match pr {
-                    ValueNs::LocalBinding(pat_id) => {
-                        Ok(Some((self.binding_local(pat_id)?.into(), current)))
-                    }
+                    ValueNs::LocalBinding(pat_id) => match self.guard_refs.get(&pat_id) {
+                        Some(&reference) => Ok(Some((
+                            Place::from(reference).project(ProjectionElem::Deref),
+                            current,
+                        ))),
+                        None => Ok(Some((self.binding_local(pat_id)?.into(), current))),
+                    },
                     ValueNs::StaticId(s) => {
                         let ty = self.expr_ty_without_adjust(expr_id);
                         let ref_ty = Ty::new_ref(

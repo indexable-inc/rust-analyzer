@@ -108,10 +108,10 @@ impl<'db> Printer<'_, 'db> {
                     format!("({text}.{}: {})", field.0, self.ty(next.ty))
                 }
                 ProjectionElem::Index(local) => format!("{text}[{}]", self.local(*local)),
-                ProjectionElem::ConstantIndex { offset, from_end: false } => {
+                ProjectionElem::ConstantIndex { offset, from_end: false, .. } => {
                     format!("{text}[{offset} of ?]")
                 }
-                ProjectionElem::ConstantIndex { offset, from_end: true } => {
+                ProjectionElem::ConstantIndex { offset, from_end: true, .. } => {
                     format!("{text}[-{offset} of ?]")
                 }
                 ProjectionElem::Subslice { from, to } => format!("{text}[{from}:-{to}]"),

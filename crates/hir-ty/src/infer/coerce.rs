@@ -506,7 +506,14 @@ where
             }
         };
 
-        if ty == a && mt_a.mutbl.is_not() && autoderef.step_count() == 1 {
+        // An error or erased region stands for a region rust-analyzer does not infer; rustc has a
+        // fresh variable there, so two of them being equal does not make the reborrow a no-op.
+        if ty == a
+            && !r_a.is_error()
+            && !r_a.is_erased()
+            && mt_a.mutbl.is_not()
+            && autoderef.step_count() == 1
+        {
             // As a special case, if we would produce `&'a *x`, that's
             // a total no-op. We end up with the type `&'a T` just as
             // we started with. In that case, just skip it

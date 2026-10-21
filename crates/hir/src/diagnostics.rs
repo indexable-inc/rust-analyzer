@@ -1311,18 +1311,22 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         body: &Body,
         source_map: &hir_def::expr_store::BodySourceMap,
     ) {
-        use hir_ide::mir::{MirSpan, borrowck};
-        let result = borrowck::borrowck(self.db, def);
+        use hir_ide::mir::MirSpan;
+        let result = hir_ty_borrowck::borrowck(self.db, def);
         let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
             let source = match span {
-                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr).ok()?,
+                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
+                    source_map.expr_syntax(expr).ok()?
+                }
                 MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
                 MirSpan::BindingId(binding) => {
                     let pat = *source_map.patterns_for_binding(binding).first()?;
                     source_map.pat_syntax(pat).ok()?
                 }
                 MirSpan::SelfParam => {
-                    return source_map.self_param_syntax().map(|it| it.map(|it| it.syntax_node_ptr()));
+                    return source_map
+                        .self_param_syntax()
+                        .map(|it| it.map(|it| it.syntax_node_ptr()));
                 }
                 MirSpan::Unknown => source_map.expr_syntax(body.root_expr()).ok()?,
             };

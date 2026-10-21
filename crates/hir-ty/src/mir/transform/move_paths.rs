@@ -186,7 +186,7 @@ impl<'db> MoveData<'db> {
             {
                 Tracked::Step(Step::Variant(*variant))
             }
-            (&ProjectionElem::ConstantIndex { offset, from_end }, TyKind::Array(_, len)) => {
+            (&ProjectionElem::ConstantIndex { offset, from_end, .. }, TyKind::Array(_, len)) => {
                 let Some(len) = try_const_usize(ctx.db, len).map(|it| it as u64) else {
                     return Tracked::No;
                 };
@@ -210,9 +210,11 @@ impl<'db> MoveData<'db> {
             Step::Field(field) => ProjectionElem::Field(field),
             Step::Variant(variant) => ProjectionElem::Downcast(variant),
             Step::BoxContents => ProjectionElem::Deref,
-            Step::Element(index) => {
-                ProjectionElem::ConstantIndex { offset: index, from_end: false }
-            }
+            Step::Element(index) => ProjectionElem::ConstantIndex {
+                offset: index,
+                min_length: index + 1,
+                from_end: false,
+            },
         };
         let ty = self.paths[parent].ty.projection_ty(&ctx.infcx, &elem, ctx.env);
         let place = Place {
