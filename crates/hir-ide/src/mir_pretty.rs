@@ -501,9 +501,7 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
                 self.place(p);
                 w!(self, ")");
             }
-            Rvalue::ThreadLocalRef(n)
-            | Rvalue::AddressOf(n)
-            | Rvalue::NullaryOp(n) => match *n {},
+            Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => match *n {},
         }
     }
 

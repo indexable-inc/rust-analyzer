@@ -15,12 +15,7 @@ pub(crate) fn borrowck_error(
         "" => DiagnosticCode::Ra("borrowck", crate::Severity::Error),
         code => DiagnosticCode::RustcHardError(code),
     };
-    let mut diagnostic = Diagnostic::new_with_syntax_node_ptr(
-        ctx,
-        code,
-        d.message.clone(),
-        d.node,
-    );
+    let mut diagnostic = Diagnostic::new_with_syntax_node_ptr(ctx, code, d.message.clone(), d.node);
     if d.at_end {
         let range = diagnostic.range.range;
         if let Some(last) = range.end().checked_sub(TextSize::new(1))

@@ -9,8 +9,8 @@
 mod confirm;
 mod probe;
 
-use either::Either;
 use crate::next_solver::StoredGenericArgs;
+use either::Either;
 use hir_expand::name::Name;
 use intern::Symbol;
 use salsa::SalsaValue;

@@ -199,9 +199,7 @@ impl<'db> Generics<'db> {
         self.owner().store
     }
 
-    pub fn iter_self(
-        &self,
-    ) -> impl Iterator<Item = (GenericParamId, GenericParamDataRef<'db>)> {
+    pub fn iter_self(&self) -> impl Iterator<Item = (GenericParamId, GenericParamDataRef<'db>)> {
         self.owner().iter(false)
     }
 
