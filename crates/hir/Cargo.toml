@@ -33,6 +33,7 @@ hir-def.workspace = true
 hir-expand.workspace = true
 hir-ide.workspace = true
 hir-ty-borrowck.workspace = true
+hir-ty-wfcheck.workspace = true
 intern.workspace = true
 stdx.workspace = true
 syntax.workspace = true

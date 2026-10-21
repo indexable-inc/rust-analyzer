@@ -964,6 +964,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             // FIXME: Once we diagnose the inputs to builtin derives, we should at least extract those diagnostics somehow
             return;
         }
+        self.collect_wfcheck(def.into());
 
         let ast_id_map = file_id.ast_id_map(self.db);
 
@@ -1204,6 +1205,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
 
     fn collect_enum(&mut self, def: EnumId) {
         self.collect_only_generic_def(def);
+        self.collect_wfcheck(def.into());
 
         let variants = def.enum_variants_with_diagnostics(self.db);
         variants.0.variants.values().for_each(|&(def, _)| self.collect_enum_variant(def));
@@ -1428,6 +1430,42 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         let (store, source_map) = ExpressionStore::with_source_map(self.db, generic_def.into());
         self.collect_generic_def(store, source_map, generic_def);
         self.collect_variant(def.into());
+        self.collect_wfcheck(generic_def);
+    }
+
+    /// rustc's well-formedness errors of an ADT or an impl, reported as the borrow checker's.
+    fn collect_wfcheck(&mut self, def: GenericDefId) {
+        use hir_ty_wfcheck::Site;
+        let db = self.db;
+        for diagnostic in &hir_ty_wfcheck::wfcheck(db, def).diagnostics {
+            let source = match diagnostic.site {
+                Site::Field(variant, field) => {
+                    let (fields, source_map) = variant.fields_with_source_map(db);
+                    source_map.type_syntax(fields.fields()[field].type_ref).ok()
+                }
+                Site::AssocType(alias) => {
+                    let (signature, source_map) = TypeAliasSignature::with_source_map(db, alias);
+                    signature.ty.and_then(|ty| source_map.type_syntax(ty).ok())
+                }
+                Site::ImplTrait(impl_) => {
+                    let (signature, source_map) = ImplSignature::with_source_map(db, impl_);
+                    signature
+                        .target_trait
+                        .as_ref()
+                        .and_then(|it| source_map.type_syntax(it.path.type_ref()).ok())
+                }
+            };
+            let Some(source) = source else { continue };
+            self.acc.push(
+                BorrowckError {
+                    node: source.map(|it| it.syntax_node_ptr()),
+                    at_end: false,
+                    code: diagnostic.code,
+                    message: diagnostic.message.clone(),
+                }
+                .into(),
+            );
+        }
     }
 
     fn collect_only_generic_def(&mut self, def: impl Into<GenericDefId>) {
