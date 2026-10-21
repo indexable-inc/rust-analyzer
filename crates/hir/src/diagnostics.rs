@@ -1316,7 +1316,22 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
             let source = match span {
                 MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
-                    source_map.expr_syntax(expr).ok()?
+                    match source_map.expr_syntax(expr) {
+                        Ok(it) => it,
+                        // A borrow `format_args!` lowers to is at what it borrows, and a
+                        // variable its template names at the template.
+                        Err(_) => match &body[expr] {
+                            hir_def::hir::Expr::Ref { expr: inner, .. } => {
+                                match source_map.expr_syntax(*inner) {
+                                    Ok(it) => it,
+                                    Err(_) => source_map
+                                        .format_args_implicit_capture(*inner)?
+                                        .map(|(template, _)| template.wrap_left()),
+                                }
+                            }
+                            _ => return None,
+                        },
+                    }
                 }
                 MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
                 MirSpan::BindingId(binding) => {

@@ -1788,10 +1788,18 @@ impl<'db> Builder<'_, '_, 'db> {
                 Some(target)
             }
             Rvalue::Aggregate(AggregateKind::Adt(variant, args), operands) => {
+                let store = self.ctx.store;
+                let spelled = |expr| match &store[expr] {
+                    hir_def::hir::Expr::RecordLit { path, .. } | hir_def::hir::Expr::Path(path) => {
+                        spells_generics(path)
+                    }
+                    _ => false,
+                };
                 let args = match span {
                     MirSpan::ExprId(expr)
-                        if matches!(&self.ctx.store[expr],
-                            hir_def::hir::Expr::RecordLit { path, .. } if spells_generics(path)) =>
+                        if spelled(expr)
+                            || matches!(store[expr],
+                                hir_def::hir::Expr::Call { callee, .. } if spelled(callee)) =>
                     {
                         self.written(args.as_ref())
                     }
