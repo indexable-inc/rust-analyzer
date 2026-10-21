@@ -85,6 +85,10 @@ struct DropScope {
     /// had declared before it. What the tail declares that is not an operand outlives the
     /// block's locals (`outlive_block`), also when the tail panics or leaves early.
     tail: Option<usize>,
+    /// The blocks where leaving early (`break`, `continue`, `return`, a future dropped at an
+    /// `await`) dropped this scope's locals. Those drops are written at the end of the scope
+    /// once it is popped, as rustc writes every drop it schedules.
+    exits: Vec<BasicBlockId>,
 }
 
 impl DropScope {
@@ -3120,8 +3124,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         };
         let extended = block.locals.split_off(declared.min(block.locals.len()));
         let held = [
-            DropScope { locals: extended, temporaries: true, tail: None },
-            DropScope { locals: std::mem::take(&mut temporaries.locals), temporaries: true, tail: None },
+            DropScope { locals: extended, temporaries: true, ..Default::default() },
+            DropScope {
+                locals: std::mem::take(&mut temporaries.locals),
+                temporaries: true,
+                ..Default::default()
+            },
         ];
         for scope in held.iter().rev() {
             self.emit_drop_and_storage_dead_for_scope(scope, &mut else_block, span);
@@ -3452,10 +3460,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         mut current: BasicBlockId,
         span: MirSpan,
     ) -> BasicBlockId {
-        for scope in self.drop_scopes[scope_index..].to_vec().iter().rev() {
-            self.emit_drop_and_storage_dead_for_scope(scope, &mut current, span);
+        for index in (scope_index..self.drop_scopes.len()).rev() {
+            let scope = self.drop_scopes[index].clone();
+            let written = self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span);
+            self.drop_scopes[index].exits.extend(written);
         }
         current
+    }
+
+    /// Writes the drops that left `scope` early at its `end`.
+    fn exits_end_at(&mut self, scope: &DropScope, end: MirSpan) {
+        for &block in &scope.exits {
+            let block = &mut self.result.basic_blocks[block];
+            for statement in &mut block.statements {
+                if let StatementKind::StorageDead(local) = statement.kind
+                    && scope.locals.contains(&local)
+                {
+                    statement.span = end;
+                }
+            }
+            if let Some(Terminator { span, kind: TerminatorKind::Drop { place, .. } }) =
+                &mut block.terminator
+                && scope.locals.contains(&place.local)
+            {
+                *span = end;
+            }
+        }
     }
 
     /// The way out of a match arm whose guard was false. What the guard bound is dropped, and
@@ -3471,8 +3501,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if let Some(arm) = self.drop_scopes.last() {
             let by_guard = DropScope {
                 locals: arm.locals.get(bound_by_pattern..).unwrap_or_default().to_vec(),
-                temporaries: false,
-                tail: None,
+                ..Default::default()
             };
             self.emit_drop_and_storage_dead_for_scope(&by_guard, &mut current, span);
         }
@@ -3524,6 +3553,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     ) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
         self.result.scope_ends.extend(scope.locals.iter().rev());
+        self.exits_end_at(&scope, span.end());
         self.emit_drop_and_storage_dead_for_scope(&scope, &mut current, span.end());
         current
     }
@@ -3580,12 +3610,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         scope: &DropScope,
         current: &mut Idx<BasicBlock>,
         span: MirSpan,
-    ) {
+    ) -> Vec<BasicBlockId> {
         let locals = scope.in_order(&self.operand_locals).into_owned();
+        let mut written = vec![*current];
         for (at, &l) in locals.iter().enumerate().rev() {
             if !self.is_copy(self.result.locals[l].ty.as_ref()) {
                 let unwind = self.unwind_from_drop(&locals, at);
                 let prev = std::mem::replace(current, self.new_basic_block());
+                written.push(*current);
                 self.set_terminator(
                     prev,
                     TerminatorKind::Drop {
@@ -3598,6 +3630,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             self.push_statement(*current, StatementKind::StorageDead(l).with_span(span));
         }
+        written
     }
 }
 
