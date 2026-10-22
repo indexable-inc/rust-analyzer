@@ -2558,12 +2558,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg,
             } => scalar(self, expr) && self.is_promotable(expr),
             &Expr::Cast { expr: inner, .. } => {
+                let from = self.expr_ty_without_adjust(inner);
+                let to = self.expr_ty_without_adjust(expr);
                 // `function as fn()` is the function's address, as the coercion to it is.
                 let is_fn_address = matches!(self.store[inner], Expr::Path(_))
-                    && matches!(self.expr_ty_without_adjust(inner).kind(), TyKind::FnDef(..))
-                    && matches!(self.expr_ty_without_adjust(expr).kind(), TyKind::FnPtr(..));
-                is_fn_address
-                    || scalar(self, expr) && scalar(self, inner) && self.is_promotable(inner)
+                    && matches!(from.kind(), TyKind::FnDef(..))
+                    && matches!(to.kind(), TyKind::FnPtr(..));
+                // rustc's `promote_consts::Validator::validate_rvalue` lets every cast through
+                // but of a pointer to an integer, `b"node" as &[u8]` as much as `1 as char`.
+                let exposes_address =
+                    matches!(from.kind(), TyKind::RawPtr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..))
+                        && matches!(to.kind(), TyKind::Int(_) | TyKind::Uint(_));
+                is_fn_address || !exposes_address && self.is_promotable(inner)
             }
             &Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
                 let promoted = match op {

@@ -2731,7 +2731,9 @@ impl ModCollector<'_, '_> {
         // scopes without eager expansion.
 
         let mut eager_callback_buffer = vec![];
-        // Case 1: try to resolve macro calls with single-segment name and expand macro_rules
+        // Case 1: try to resolve macro calls with single-segment name, or with a path to a macro
+        // of another crate, and expand them, so that the `macro_rules!` they define are in the
+        // textual scope of what follows, child modules included.
         if let Ok(res) = macro_call_as_call_id(
             db,
             ast_id.ast_id,
@@ -2742,21 +2744,42 @@ impl ModCollector<'_, '_> {
             self.macro_depth + 1,
             self.def_collector.def_map.recursion_limit(),
             |path| {
-                path.as_ident().and_then(|name| {
-                    let def_map = &self.def_collector.def_map;
-                    def_map
-                        .legacy_macro_in_textual_scope(db, self.module_id, name)
-                        .or_else(|| {
-                            def_map
-                                .module(db, self.module_id)
-                                .scope(self.def_collector.db)
-                                .get(name)
-                                .take_macros()
-                        })
-                        .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
-                        .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                        .map(|it| it.definition(self.def_collector.db))
-                })
+                let def_map = &self.def_collector.def_map;
+                let Some(name) = path.as_ident() else {
+                    // Where the path goes on in another crate, that crate is collected in full,
+                    // so what it names there it will still name once this crate is.
+                    let local_def_map = self
+                        .def_collector
+                        .crate_local_def_map
+                        .unwrap_or(&self.def_collector.local_def_map);
+                    let resolved = def_map.resolve_path_fp_with_macro(
+                        local_def_map,
+                        db,
+                        ResolveMode::Other,
+                        self.module_id,
+                        path,
+                        BuiltinShadowMode::Module,
+                        Some(MacroSubNs::Bang),
+                    );
+                    let whole = resolved.segment_index.is_none() && resolved.prefix_info.differing_crate;
+                    return resolved
+                        .resolved_def
+                        .take_macros()
+                        .filter(|&id| whole && sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                        .map(|it| it.definition(db));
+                };
+                def_map
+                    .legacy_macro_in_textual_scope(db, self.module_id, name)
+                    .or_else(|| {
+                        def_map
+                            .module(db, self.module_id)
+                            .scope(self.def_collector.db)
+                            .get(name)
+                            .take_macros()
+                    })
+                    .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
+                    .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                    .map(|it| it.definition(self.def_collector.db))
             },
             &mut |ptr, call_id| eager_callback_buffer.push((ptr, call_id)),
         ) {

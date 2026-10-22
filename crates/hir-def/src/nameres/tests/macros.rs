@@ -113,6 +113,51 @@ macro_rules! structs {
 }
 
 #[test]
+fn macro_rules_defined_by_a_macro_of_another_crate_are_visible_in_child_modules() {
+    check(
+        r#"
+//- /main.rs crate:main deps:foo
+mod before {}
+foo::define!(structs);
+mod bar {
+    structs!(Inner);
+}
+mod baz;
+
+//- /baz.rs
+structs!(InFile);
+
+//- /lib.rs crate:foo
+#[macro_export]
+macro_rules! define {
+    ($mac:ident) => {
+        macro_rules! $mac {
+            ($i:ident) => { pub struct $i; }
+        }
+    }
+}
+"#,
+        expect![[r#"
+            crate
+            - bar : type
+            - baz : type
+            - before : type
+            - (legacy) structs : macro!
+
+            crate::bar
+            - Inner : type value
+            - (legacy) structs : macro!
+
+            crate::baz
+            - InFile : type value
+            - (legacy) structs : macro!
+
+            crate::before
+        "#]],
+    );
+}
+
+#[test]
 fn macro_rules_export_with_local_inner_macros_are_visible() {
     check(
         r#"

@@ -76,8 +76,8 @@ pub struct Files {
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
     included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
-    /// Files an `include!` named that are not in the VFS, with the source root of the file
-    /// that includes them.
+    /// Files an `include!` or a module declaration named that are not in the VFS, with the
+    /// source root of the file that names them.
     included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
     /// Directories whose files are read from another directory: a checkout that is looked at
     /// as the one it was loaded as with other contents.
@@ -187,8 +187,8 @@ impl Files {
         std::fs::read(self.on_disk(path.as_ref())).ok().map(Into::into)
     }
 
-    /// Notes a file an `include!` names that the VFS has not: whoever owns the VFS puts it
-    /// in the source root, see [`Files::included_sources`].
+    /// Notes a file an `include!` or a module declaration names that the VFS has not: whoever
+    /// owns the VFS puts it in the source root, see [`Files::included_sources`].
     pub fn include_source(&self, path: &AbsPath, root: SourceRootId) {
         self.included_sources.entry(path.to_path_buf()).or_insert(root);
     }
@@ -436,8 +436,9 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
         None
     }
 
-    /// Notes that `include!` names a file `resolve_path` has nothing for: a file that is not
-    /// source by its extension, say, which the VFS does not load until it is asked to.
+    /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing
+    /// for: a file that is not source by its extension, or one outside its package, which the
+    /// VFS does not load until it is asked to.
     fn include_source(&self, _path: AnchoredPath<'_>) {}
 
     /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.

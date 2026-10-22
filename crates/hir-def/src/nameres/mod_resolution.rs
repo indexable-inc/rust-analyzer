@@ -98,6 +98,13 @@ impl ModDir {
                 }
             }
         }
+        // A `#[path]` can name a file outside the package, which its source root does not have.
+        for candidate in &candidate_files {
+            db.include_source(AnchoredPath {
+                anchor: orig_file_id.file_id(db),
+                path: candidate.as_str(),
+            });
+        }
         Err(candidate_files.into_iter().collect())
     }
 }
