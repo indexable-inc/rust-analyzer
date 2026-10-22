@@ -5,14 +5,17 @@
 
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_type_ir::inherent::IntoKind;
+use rustc_type_ir::{
+    ClauseKind, OutlivesPredicate, RegionKind,
+    inherent::{Clause as _, IntoKind, Region as _},
+};
 
 use hir_ty::{
     mir::{
         AsmOperand, BinOp, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, Operand,
         OperandKind, PlaceElem, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     },
-    next_solver::{Ty, TyKind},
+    next_solver::{GenericArgKind, Region, Ty, TyKind},
 };
 
 use super::{
@@ -1308,20 +1311,24 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     continue;
                 }
                 if reported.insert((test.ty, test.span)) {
+                    let what = match test.ty.kind() {
+                        TyKind::Alias(_) => "associated type",
+                        _ => "parameter type",
+                    };
                     let (code, message) = match kind {
-                        _ if test.forall => ("", "the parameter type does not live long enough"),
+                        _ if test.forall => ("", format!("the {what} does not live long enough")),
                         UniversalKind::Static => {
-                            ("E0310", "the parameter type may not live long enough")
+                            ("E0310", format!("the {what} may not live long enough"))
                         }
                         UniversalKind::Named => {
-                            ("E0309", "the parameter type may not live long enough")
+                            ("E0309", format!("the {what} may not live long enough"))
                         }
-                        _ => ("E0311", "the parameter type may not live long enough"),
+                        _ => ("E0311", format!("the {what} may not live long enough")),
                     };
                     self.errors.push(Some(BorrowckDiagnostic {
                         code,
                         span: test.span,
-                        message: message.to_owned(),
+                        message,
                         at_signature: false,
                     }));
                 }
@@ -1457,6 +1464,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// or the function body every parameter outlives, outlives `lower` as region inference
     /// left them.
     fn type_test_holds(&self, ty: Ty<'db>, lower: usize) -> bool {
+        if let TyKind::Alias(alias) = ty.kind() {
+            return self.alias_test_holds(ty, alias, lower, 0);
+        }
         let fn_body = self.regions.universals[1].0;
         let needed: Vec<usize> = self.values.universals_of(lower).collect();
         self.regions.type_bounds_of(ty).into_iter().chain([fn_body]).any(|bound| {
@@ -1465,6 +1475,92 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 .iter()
                 .all(|&shorter| have.iter().any(|&longer| self.regions.knows(longer, shorter)))
         })
+    }
+
+    /// rustc's `alias_bound`: an associated type outlives `lower` where a where clause or the
+    /// trait says it outlives a region that does, or where all its arguments do.
+    fn alias_test_holds(
+        &self,
+        ty: Ty<'db>,
+        alias: rustc_type_ir::AliasTy<hir_ty::next_solver::DbInterner<'db>>,
+        lower: usize,
+        depth: usize,
+    ) -> bool {
+        let interner = self.ctx.infcx.interner;
+        let needed: Vec<usize> = self.values.universals_of(lower).collect();
+        let outlives = |bound: usize| {
+            let have: Vec<usize> = self.values.universals_of(bound).collect();
+            needed
+                .iter()
+                .all(|&shorter| have.iter().any(|&longer| self.regions.knows(longer, shorter)))
+        };
+        let erase = |ty: Ty<'db>| {
+            rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
+        };
+        let erased = erase(ty);
+        let regions_of = |ty: Ty<'db>| {
+            let mut out = Vec::new();
+            rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                out.push(match region.kind() {
+                    RegionKind::ReStatic => Some(self.regions.static_rv),
+                    _ => regions::rv_of(region),
+                });
+                region
+            });
+            out
+        };
+        let knows_all = |longer: usize, shorter: usize| {
+            let have: Vec<usize> = self.values.universals_of(longer).collect();
+            self.values
+                .universals_of(shorter)
+                .all(|it| have.iter().any(|&longer| self.regions.knows(longer, it)))
+        };
+        // rustc's `VerifyIfEq`: a bound on the same associated type, with equal regions.
+        let mine = regions_of(ty);
+        if self.regions.type_bounds.iter().any(|&(bounded, region)| {
+            erase(bounded) == erased
+                && regions_of(bounded).iter().zip(&mine).all(|pair| match pair {
+                    (Some(x), Some(y)) => x == y || (knows_all(*x, *y) && knows_all(*y, *x)),
+                    _ => false,
+                })
+                && outlives(region)
+        }) {
+            return true;
+        }
+        for clause in rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+            .iter_instantiated(interner, alias.args)
+        {
+            if let ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region)) =
+                clause.skip_norm_wip().kind().skip_binder()
+                && erase(bounded) == erased
+            {
+                match region.kind() {
+                    RegionKind::ReStatic => return true,
+                    _ if regions::rv_of(region).is_some_and(outlives) => return true,
+                    _ => (),
+                }
+            }
+        }
+        if depth > 4 {
+            return false;
+        }
+        let mut components = Vec::new();
+        let mut params = Vec::new();
+        for arg in alias.args.iter() {
+            match arg.kind() {
+                GenericArgKind::Lifetime(region) => components.extend(regions::rv_of(region)),
+                GenericArgKind::Type(it) => {
+                    regions::outlives_components(it, &mut components, &mut params);
+                    regions::alias_components(it, &mut params);
+                }
+                GenericArgKind::Const(_) => (),
+            }
+        }
+        components.into_iter().all(outlives)
+            && params.into_iter().all(|it| match it.kind() {
+                TyKind::Alias(inner) => self.alias_test_holds(it, inner, lower, depth + 1),
+                _ => self.type_test_holds(it, lower),
+            })
     }
 
     fn check_access_permissions(
