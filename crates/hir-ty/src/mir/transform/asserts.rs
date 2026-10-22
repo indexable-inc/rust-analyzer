@@ -213,11 +213,14 @@ fn binary_op<'db>(
             let field = |index| {
                 Place::from(result).project(ProjectionElem::Field(FieldIndex(index))).store()
             };
+            // The panic takes the operands as they are, moved out of their temporaries, where
+            // rustc's checks of the other operations read them: what a future keeps of them
+            // is gone once the check is done.
             checks.push(Check {
                 setup: vec![setup],
                 cond: Operand { kind: OperandKind::Move(field(1)), span: None },
                 expected: false,
-                msg: AssertKind::Overflow(op, copy(&a), copy(&b)),
+                msg: AssertKind::Overflow(op, a, b),
                 span,
             });
             Rvalue::Use(Operand { kind: OperandKind::Move(field(0)), span: None })

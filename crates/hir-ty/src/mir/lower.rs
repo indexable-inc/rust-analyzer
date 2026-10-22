@@ -151,6 +151,10 @@ struct MirLowerCtx<'a, 'db> {
     unwind_resume: Option<BasicBlockId>,
     /// The locals that hold an operand of an aggregate or a call lowered so far.
     operand_locals: FxHashSet<LocalId>,
+    /// The temporaries an expression is being written to. rustc's `as_temp` schedules the drop
+    /// of a temporary's value once the expression is done, so what unwinds out of it, the drops
+    /// of its own temporaries after it wrote the value say, ends their storage only.
+    unscheduled: FxHashSet<LocalId>,
     /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
     /// way into.
     arm_unreached: bool,
@@ -335,6 +339,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             unwind_nodes: FxHashMap::default(),
             unwind_resume: None,
             operand_locals: FxHashSet::default(),
+            unscheduled: FxHashSet::default(),
             arm_unreached: false,
             or_choices: FxHashMap::default(),
             guarded_moves: None,
@@ -983,6 +988,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 let callee_ty = self.expr_ty_after_adjustments(*callee);
                 match callee_ty.kind() {
+                    TyKind::FnDef(def, _)
+                        if let CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) =
+                            def.0 =>
+                    {
+                        self.lower_constructor(def.0, args, place, current, expr_id)
+                    }
                     TyKind::FnDef(def, _) => {
                         let func = Operand::from_bytes(Box::default(), callee_ty);
                         // `#[rustc_legacy_const_generics]`: those are generic arguments.
@@ -2144,6 +2155,47 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         Ok(())
     }
 
+    /// `S(a, b)` or `E::V(a, b)`: rustc builds the value from its fields as it does a record
+    /// literal (THIR's `ExprKind::Adt`). Nothing is called, so nothing unwinds out of it once
+    /// the fields are moved in.
+    fn lower_constructor(
+        &mut self,
+        def: CallableDefId,
+        args: &[ExprId],
+        place: Place<'db>,
+        mut current: BasicBlockId,
+        expr_id: ExprId,
+    ) -> Result<'db, Option<BasicBlockId>> {
+        let variant: VariantId = match def {
+            CallableDefId::StructId(id) => id.into(),
+            CallableDefId::EnumVariantId(id) => id.into(),
+            CallableDefId::FunctionId(_) => implementation_error!("constructor of a function"),
+        };
+        let subst = match self.expr_ty_without_adjust(expr_id).kind() {
+            TyKind::Adt(_, subst) => subst,
+            _ => implementation_error!("constructor of a type that is not an ADT"),
+        };
+        let declared = self.declared_locals();
+        let mut operands = Vec::with_capacity(args.len());
+        for &arg in args {
+            let Some((operand, c)) = self.lower_expr_to_some_operand(arg, current)? else {
+                return Ok(None);
+            };
+            current = c;
+            // What unwinds from the next field drops this one first.
+            self.declare_operands_last(expr_id, declared, std::iter::once(&operand));
+            operands.push(operand);
+        }
+        self.declare_operands_last(expr_id, declared, operands.iter());
+        self.push_assignment(
+            current,
+            place,
+            Rvalue::Aggregate(AggregateKind::Adt(variant, subst.store()), operands.into()),
+            expr_id.into(),
+        );
+        Ok(Some(current))
+    }
+
     fn lower_enum_variant(
         &mut self,
         variant_id: EnumVariantId,
@@ -2690,7 +2742,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             if storage {
                 at = Some(self.unwind_node(at, local, false));
             }
-            if !self.is_copy(self.result.locals[local].ty.as_ref()) {
+            if !self.is_copy(self.result.locals[local].ty.as_ref())
+                && !self.unscheduled.contains(&local)
+            {
                 at = Some(self.unwind_node(at, local, true));
             }
         }
@@ -3500,6 +3554,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let again = self.new_basic_block();
         self.set_goto(current, again, span);
 
+        // rustc's `loop { match poll(..) { Ready(result) => break result, Pending => {} } yield }`:
+        // what one poll makes belongs to the `match` statement and is gone before the body
+        // yields, so the future does not keep it.
+        let polling = self.push_drop_scope();
         let future_ref: Place<'db> = self.temp(future_ref_ty, again, MirSpan::Unknown)?.into();
         self.push_assignment(again, future_ref, Rvalue::Ref(mutable, awaitee.store()), span);
         let pinned: Place<'db> = self.temp(pin_ty, again, MirSpan::Unknown)?.into();
@@ -3530,6 +3588,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             span,
         )?
         else {
+            polling.pop_assume_dropped(self);
             scope.pop_assume_dropped(self);
             return Ok(None);
         };
@@ -3544,6 +3603,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             },
             span,
         );
+
+        let Some(ready_variant) = lang_items.PollReady else {
+            return Err(MirLowerError::LangItemNotFound);
+        };
+        let value = polled
+            .project(ProjectionElem::Downcast(ready_variant.into()))
+            .project(ProjectionElem::Field(FieldIndex(0)));
+        self.push_assignment(ready, place, moved(value).into(), span);
+        let ready = self.drop_until_scope(self.drop_scopes.len() - 1, ready, span);
+        let pending = polling.pop_and_drop(self, pending, span);
 
         let poll = Place::from(poll);
         self.push_assignment(
@@ -3567,14 +3636,6 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             },
             span,
         );
-
-        let Some(ready_variant) = lang_items.PollReady else {
-            return Err(MirLowerError::LangItemNotFound);
-        };
-        let value = polled
-            .project(ProjectionElem::Downcast(ready_variant.into()))
-            .project(ProjectionElem::Field(FieldIndex(0)));
-        self.push_assignment(ready, place, moved(value).into(), span);
         Ok(Some(scope.pop_and_drop(self, ready, span)))
     }
 

@@ -99,7 +99,12 @@ pub(super) fn elaborate_drops<'db>(
 ) -> Result<(), MirLowerError<'db>> {
     let live = super::move_paths::live_blocks(body);
     let data = MoveData::gather(ctx, body, &live);
-    let analysis = InitAnalysis::run(ctx, &data, body, &live);
+    let analysis = InitAnalysis::run(ctx, &data, body, &live, &Default::default());
+    let dead_unwinds = analysis.dead_unwinds(ctx, &data, body);
+    let analysis = match dead_unwinds.is_empty() {
+        true => analysis,
+        false => InitAnalysis::run(ctx, &data, body, &live, &dead_unwinds),
+    };
     let subtrees: Vec<Vec<PathId>> = (0..data.paths.len()).map(|it| data.subtree(it)).collect();
     let index = |id: BasicBlockId| id.into_raw().into_u32() as usize;
 
@@ -731,6 +736,13 @@ impl<'db> Elaborator<'_, 'db> {
             }
         }
         if !otherwise {
+            // When every variant drops the same way, rustc reads no discriminant
+            // (`adt_switch_block`): a future would keep the enum for that read.
+            if let Some(&first) = blocks.first()
+                && blocks.iter().all(|&it| it == first)
+            {
+                return Ok(self.flag_test_block(path, first, succ, unwind));
+            }
             values.pop();
         } else if !otherwise_needs_drop {
             blocks.push(succ);

@@ -10,7 +10,7 @@
 //! is the union.
 
 use la_arena::ArenaMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
 
@@ -18,7 +18,7 @@ use crate::{
     consteval::try_const_usize,
     mir::{
         BasicBlockId, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem, PlaceTy,
-        Projection, ProjectionElem, StatementKind, StoredPlace, TerminatorKind,
+        Projection, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     },
     next_solver::TyKind,
 };
@@ -286,6 +286,105 @@ impl<'db> MoveData<'db> {
         }
         all
     }
+
+    /// Whether no part of `place` may hold a value in `state`: rustc's `is_unwind_dead`.
+    pub(super) fn holds_nothing(
+        &self,
+        ctx: &Ctx<'db>,
+        place: &StoredPlace,
+        state: &InitState,
+    ) -> bool {
+        match self.lookup(ctx, place) {
+            Lookup::Exact(path) => {
+                self.subtree(path).iter().all(|&it| !state.maybe_init.contains(it))
+            }
+            Lookup::Untracked => false,
+        }
+    }
+
+    /// The enum that the `SwitchInt` ending `block` switches on the variant of, when the
+    /// block's last statement reads its discriminant: rustc's `MaybePlacesSwitchIntData`.
+    pub(super) fn switch_on_variant(
+        &self,
+        ctx: &Ctx<'db>,
+        body: &MirBody<'db>,
+        block: BasicBlockId,
+    ) -> Option<VariantSwitch> {
+        let block = &body.basic_blocks[block];
+        let Some(TerminatorKind::SwitchInt { discr, .. }) =
+            block.terminator.as_ref().map(|it| &it.kind)
+        else {
+            return None;
+        };
+        let (OperandKind::Copy(discr) | OperandKind::Move(discr)) = &discr.kind else {
+            return None;
+        };
+        let StatementKind::Assign(read, Rvalue::Discriminant(place)) =
+            &block.statements.last()?.kind
+        else {
+            return None;
+        };
+        if read != discr {
+            return None;
+        }
+        let ty = ctx.normalize(place.as_ref().ty(body, &ctx.infcx, ctx.env).ty);
+        let TyKind::Adt(adt, _) = ty.kind() else { return None };
+        let hir_def::AdtId::EnumId(id) = adt.def_id() else { return None };
+        let Lookup::Exact(path) = self.lookup(ctx, place) else { return None };
+        let width = ctx.size_of(ctx.normalize(discr.as_ref().ty(body, &ctx.infcx, ctx.env).ty));
+        let mask = match width {
+            Some(bytes @ ..16) => (1u128 << (bytes * 8)) - 1,
+            _ => u128::MAX,
+        };
+        let mut variants = Vec::new();
+        for &(variant, _) in id.enum_variants(ctx.db).variants.values() {
+            let value = ctx.db.const_eval_discriminant(variant).ok()?;
+            variants.push((hir_def::VariantId::from(variant), value as u128 & mask));
+        }
+        Some(VariantSwitch {
+            variants,
+            children: self.paths[path]
+                .children
+                .iter()
+                .filter_map(|&(step, child)| match step {
+                    Step::Variant(variant) => Some((variant, child)),
+                    _ => None,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// A `SwitchInt` on the variant of an enum, with the paths of the enum's variants.
+pub(super) struct VariantSwitch {
+    variants: Vec<(hir_def::VariantId, u128)>,
+    children: Vec<(hir_def::VariantId, PathId)>,
+}
+
+impl VariantSwitch {
+    /// Each edge of the switch with the paths of the variants that are not the one the enum
+    /// holds along it, which hold nothing there (`on_all_inactive_variants`): every variant but
+    /// a value's own, and on the `otherwise` edge those of the values the switch names.
+    pub(super) fn edges(
+        &self,
+        targets: &crate::mir::SwitchTargets,
+    ) -> Vec<(BasicBlockId, Vec<PathId>)> {
+        let variant_of =
+            |value: u128| self.variants.iter().find(|&&(_, it)| it == value).map(|&(it, _)| it);
+        let mut edges = Vec::new();
+        let mut named = Vec::new();
+        for (value, to) in targets.iter() {
+            let Some(active) = variant_of(value) else {
+                return targets.all_targets().iter().map(|&to| (to, Vec::new())).collect();
+            };
+            named.push(active);
+            let inactive = self.children.iter().filter(|&&(it, _)| it != active);
+            edges.push((to, inactive.map(|&(_, path)| path).collect()));
+        }
+        let inactive = self.children.iter().filter(|(it, _)| named.contains(it));
+        edges.push((targets.otherwise(), inactive.map(|&(_, path)| path).collect()));
+        edges
+    }
 }
 
 /// A set of move paths.
@@ -490,11 +589,15 @@ pub(super) struct InitAnalysis {
 }
 
 impl InitAnalysis {
+    /// The analysis, which does not go into cleanup from the drops in `dead_unwinds` with what
+    /// may be uninitialized there, as rustc's `MaybeUninitializedPlaces` skips their unwind
+    /// edges (`skipping_unreachable_unwind`).
     pub(super) fn run<'db>(
         ctx: &Ctx<'db>,
         data: &MoveData<'db>,
         body: &MirBody<'db>,
         live: &[bool],
+        dead_unwinds: &FxHashSet<BasicBlockId>,
     ) -> Self {
         let index = |id: BasicBlockId| id.into_raw().into_u32() as usize;
         let len = data.paths.len();
@@ -544,6 +647,15 @@ impl InitAnalysis {
                 }
             }
             let Some(terminator) = &block.terminator else { continue };
+            // rustc's `skipping_unreachable_unwind`: a drop of a place that holds nothing does
+            // nothing, so nothing unwinds out of it. `MaybeInitializedPlaces` finds that as it
+            // goes, `MaybeUninitializedPlaces` takes the drops the first found.
+            let (skip_init, skip_uninit) = match &terminator.kind {
+                TerminatorKind::Drop { place, unwind: Some(_), .. } => {
+                    (data.holds_nothing(ctx, place, &state), dead_unwinds.contains(&id))
+                }
+                _ => (false, false),
+            };
             let at = block.statements.len();
             let here =
                 effects.entry((id, at)).or_insert_with(|| effects_at(ctx, data, body, id, at));
@@ -551,7 +663,29 @@ impl InitAnalysis {
                 state.set(&subtrees[effect.path], effect.init);
             }
             if let Some(cleanup) = terminator.kind.unwind() {
-                flow(cleanup, &state, &mut entry, &mut pending);
+                let mut unwound = state.clone();
+                if skip_init {
+                    unwound.maybe_init = Bits::new(len);
+                }
+                if skip_uninit {
+                    unwound.maybe_uninit = Bits::new(len);
+                }
+                flow(cleanup, &unwound, &mut entry, &mut pending);
+            }
+            if let TerminatorKind::SwitchInt { targets, .. } = &terminator.kind
+                && let Some(switch) = data.switch_on_variant(ctx, body, id)
+            {
+                for (to, inactive) in switch.edges(targets) {
+                    if unreached.contains(&to) {
+                        continue;
+                    }
+                    let mut state = state.clone();
+                    for path in inactive {
+                        state.set(&subtrees[path], false);
+                    }
+                    flow(to, &state, &mut entry, &mut pending);
+                }
+                continue;
             }
             for to in terminator.kind.successors() {
                 if unreached.contains(&to) {
@@ -570,5 +704,36 @@ impl InitAnalysis {
             }
         }
         InitAnalysis { entry }
+    }
+
+    /// rustc's `compute_dead_unwinds`: the drops that may unwind of a place that holds nothing
+    /// where they are. Such a drop does nothing, so nothing unwinds out of it: the operand of
+    /// an aggregate a scope drops after the aggregate took it, say.
+    pub(super) fn dead_unwinds<'db>(
+        &self,
+        ctx: &Ctx<'db>,
+        data: &MoveData<'db>,
+        body: &MirBody<'db>,
+    ) -> FxHashSet<BasicBlockId> {
+        let index = |id: BasicBlockId| id.into_raw().into_u32() as usize;
+        let mut dead = FxHashSet::default();
+        for (id, block) in body.basic_blocks.iter() {
+            let Some(TerminatorKind::Drop { place, unwind: Some(_), .. }) =
+                block.terminator.as_ref().map(|it| &it.kind)
+            else {
+                continue;
+            };
+            let Some(entry) = &self.entry[index(id)] else { continue };
+            let mut state = entry.clone();
+            for at in 0..block.statements.len() {
+                for effect in effects_at(ctx, data, body, id, at) {
+                    state.set(&data.subtree(effect.path), effect.init);
+                }
+            }
+            if data.holds_nothing(ctx, place, &state) {
+                dead.insert(id);
+            }
+        }
+        dead
     }
 }

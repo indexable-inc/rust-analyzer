@@ -25,9 +25,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
         prev_block: BasicBlockId,
     ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
         let ty = self.expr_ty_without_adjust(expr_id);
-        let place = self.temp(ty, prev_block, expr_id.into())?.into();
-        let Some(current) = self.lower_expr_to_place_without_adjust(expr_id, place, prev_block)?
-        else {
+        let place: Place<'db> = self.temp(ty, prev_block, expr_id.into())?.into();
+        self.unscheduled.insert(place.local);
+        let lowered = self.lower_expr_to_place_without_adjust(expr_id, place, prev_block);
+        self.unscheduled.remove(&place.local);
+        let Some(current) = lowered? else {
             return Ok(None);
         };
         self.declare_last(place.local);
@@ -44,10 +46,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
             .last()
             .map(|it| it.target.as_ref())
             .unwrap_or_else(|| self.expr_ty_without_adjust(expr_id));
-        let place = self.temp(ty, prev_block, expr_id.into())?.into();
-        let Some(current) =
-            self.lower_expr_to_place_with_adjust(expr_id, place, prev_block, adjustments)?
-        else {
+        let place: Place<'db> = self.temp(ty, prev_block, expr_id.into())?.into();
+        self.unscheduled.insert(place.local);
+        let lowered = self.lower_expr_to_place_with_adjust(expr_id, place, prev_block, adjustments);
+        self.unscheduled.remove(&place.local);
+        let Some(current) = lowered? else {
             return Ok(None);
         };
         self.declare_last(place.local);
