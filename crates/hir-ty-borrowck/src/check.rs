@@ -7,7 +7,7 @@ use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     ClauseKind, OutlivesPredicate, RegionKind,
-    inherent::{Clause as _, IntoKind, Region as _},
+    inherent::{GenericArgs as _, IntoKind, Region as _},
 };
 
 use hir_ty::{
@@ -1216,7 +1216,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// Whether the region `rv` is in the type of a parameter, which rustc's E0521 names as
     /// where the data comes from; not in `f: impl FnOnce(&'a T)`, whose type is a parameter.
     fn parameter_names(&self, rv: regions::Rv) -> bool {
-        self.body.param_locals.iter().any(|&local| {
+        // A closure's reference to itself is not one of its parameters.
+        let own = usize::from(self.ctx.closure_local.is_some());
+        self.body.param_locals.iter().skip(own).any(|&local| {
             let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
             let mut found = false;
             rustc_type_ir::fold_regions(self.ctx.infcx.interner, ty, |region, _| {
@@ -1225,6 +1227,39 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             });
             found
         })
+    }
+
+    /// Whether the region `rv` is in the type of what a closure captures or of one of its
+    /// parameters, which rustc's E0521 names as where the data comes from or goes; the
+    /// closure's reference to itself is neither, nor is `'static`.
+    fn closure_variable_names(&self, rv: regions::Rv) -> bool {
+        if rv == self.regions.static_rv {
+            return false;
+        }
+        let tys = &self.regions.local_tys;
+        let Some((&env, params)) = self.body.param_locals.split_first() else { return false };
+        let env = tys[env.into_raw().into_u32() as usize];
+        let env = match env.kind() {
+            TyKind::Ref(_, inner, _) => inner,
+            _ => env,
+        };
+        let captured = match env.kind() {
+            TyKind::Closure(_, args) => Some(args.as_closure().tupled_upvars_ty()),
+            TyKind::Coroutine(_, args) => Some(args.as_coroutine().tupled_upvars_ty()),
+            _ => None,
+        };
+        let interner = self.ctx.infcx.interner;
+        captured
+            .into_iter()
+            .chain(params.iter().map(|&it| tys[it.into_raw().into_u32() as usize]))
+            .any(|ty| {
+                let mut found = false;
+                rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                    found |= regions::rv_of(region) == Some(rv);
+                    region
+                });
+                found
+            })
     }
 
     /// The universal regions made to outlive what the signature does not say they outlive,
@@ -1275,6 +1310,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 ("", "captured variable cannot escape `FnMut` closure body".to_owned())
             } else if escapes
                 && matches!(blamed.category, Category::Assignment | Category::CallArgument)
+                && (self.closure_variable_names(longer_rv)
+                    || self.closure_variable_names(shorter_rv))
             {
                 ("E0521", "borrowed data escapes outside of closure".to_owned())
             } else if !self.regions.is_impl_item

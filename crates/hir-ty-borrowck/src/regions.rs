@@ -452,6 +452,7 @@ pub(super) fn build<'db>(
         elided_output: None,
         location: None,
         env_aliases: Vec::new(),
+        annotated: FxHashSet::default(),
     };
     builder.universal_regions();
     builder.env_aliases();
@@ -479,6 +480,8 @@ struct Builder<'c, 'a, 'db> {
     /// outlive some region: rustc's declared bounds from the environment, known before
     /// `known_relations` says which regions.
     env_aliases: Vec<Ty<'db>>,
+    /// The variables a `let` writes the type of.
+    annotated: FxHashSet<LocalId>,
     body: &'c MirBody<'db>,
     regions: Regions<'db>,
     /// What each closure checked so far needs of the body that creates it, with how many
@@ -944,6 +947,7 @@ impl<'db> Builder<'_, '_, 'db> {
         // A variable with a type written out keeps the lifetimes the type names, as rustc
         // relates it to the annotation.
         let annotated = self.annotated_locals();
+        self.annotated = annotated.clone();
         for (local, data) in body.locals.iter() {
             let slot = &mut local_tys[local.into_raw().into_u32() as usize];
             if slot.is_some() {
@@ -2529,6 +2533,31 @@ impl<'db> Builder<'_, '_, 'db> {
         let projection = place.projection.as_slice();
         let dest = self.place_ty(place.local, projection).ty;
         let at = At { category: self.category_of_assignment(place.local, projection), span };
+        let first = self.regions.outlives.len();
+        self.assign(place, rvalue, dest, at, span);
+        // rustc relates a variable with a type written out to its annotation, so what flows
+        // into a lifetime the annotation names, `let p: &'static T = ..`, is blamed on that.
+        if projection.is_empty() && self.annotated.contains(&place.local) {
+            for index in first..self.regions.outlives.len() {
+                let constraint = &self.regions.outlives[index];
+                if constraint.category == Category::Assignment
+                    && self.regions.universal(constraint.sub).is_some()
+                {
+                    self.regions.outlives[index].category = Category::TypeAnnotation;
+                }
+            }
+        }
+    }
+
+    fn assign(
+        &mut self,
+        place: &hir_ty::mir::StoredPlace,
+        rvalue: &Rvalue,
+        dest: Ty<'db>,
+        at: At,
+        span: MirSpan,
+    ) {
+        let projection = place.projection.as_slice();
         if let MirSpan::ExprId(expr) = span
             && let hir_def::hir::Expr::Cast { .. } = self.ctx.store[expr]
             && matches!(rvalue, Rvalue::Use(_) | Rvalue::Cast(..))
@@ -3110,12 +3139,23 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.outlives(region, loan, at);
                     }
                     if mutability == rustc_ast_ir::Mutability::Not {
-                        break;
+                        return;
                     }
                 }
-                TyKind::RawPtr(..) => break,
+                TyKind::RawPtr(..) => return,
                 _ => (),
             }
+        }
+        // A capture by reference is rustc's `*(*env).i`, reborrowed through the closure's
+        // reference to itself too: `|| &mut x` returns what lives only as long as the call.
+        if projection.first() == Some(&ProjectionElem::Deref)
+            && self.ctx.upvars.iter().any(|it| it.local == local && it.by_ref)
+            && let Some(env) = self.ctx.closure_local
+            && let TyKind::Ref(region, _, _) =
+                self.regions.local_tys[env.into_raw().into_u32() as usize].kind()
+            && let Some(region) = rv_of(region)
+        {
+            self.outlives(region, loan, at);
         }
     }
 
