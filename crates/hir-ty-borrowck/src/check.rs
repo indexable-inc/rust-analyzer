@@ -1174,6 +1174,20 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
     }
 
+    /// Whether the region `rv` is in the type of a parameter, which rustc's E0521 names as
+    /// where the data comes from; not in `f: impl FnOnce(&'a T)`, whose type is a parameter.
+    fn parameter_names(&self, rv: regions::Rv) -> bool {
+        self.body.param_locals.iter().any(|&local| {
+            let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+            let mut found = false;
+            rustc_type_ir::fold_regions(self.ctx.infcx.interner, ty, |region, _| {
+                found |= regions::rv_of(region) == Some(rv);
+                region
+            });
+            found
+        })
+    }
+
     /// The universal regions made to outlive what the signature does not say they outlive,
     /// and the type parameters made to outlive what they are not known to.
     fn report_region_errors(&mut self) {
@@ -1225,6 +1239,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 ("E0621", "explicit lifetime required in the type of a parameter".to_owned())
             } else if blamed.category == Category::CallArgument
                 && shorter_kind == UniversalKind::Static
+                && self.parameter_names(longer_rv)
             {
                 ("E0521", "borrowed data escapes outside of function".to_owned())
             } else {

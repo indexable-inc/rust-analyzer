@@ -3173,6 +3173,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             scope.pop_assume_dropped(self);
                             return Ok(None);
                         };
+                        // rustc's `FakeReadCause::ForLet` of `x`, before the initializer's
+                        // temporaries are dropped: what the value borrows from a `match` arm's
+                        // bindings, dropped as the arm ends, must outlive them.
+                        self.push_fake_read(c, local.into(), MirSpan::PatId(*pat));
                         current = temporaries.pop_and_drop(self, c, span);
                         if let Some(scope) =
                             self.drop_scopes.iter_mut().rev().find(|it| !it.temporaries)

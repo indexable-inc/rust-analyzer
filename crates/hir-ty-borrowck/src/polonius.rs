@@ -9,7 +9,7 @@ use rustc_type_ir::{Variance, inherent::IntoKind};
 use smallvec::SmallVec;
 
 use hir_ty::{
-    mir::MirBody,
+    mir::{MirBody, OperandKind, Rvalue, StatementKind},
     next_solver::{GenericArgKind, GenericArgs, Region, Ty, TyKind},
 };
 
@@ -41,6 +41,23 @@ pub(super) fn live_loans<'db>(
     let mut directions: Vec<Option<Direction>> = vec![None; count];
     for &ty in &regions.local_tys {
         record_variances(ctx, ty, Variance::Covariant, &mut directions);
+    }
+    // rust-analyzer reaches a `static mut` through a shared reference, rustc through a
+    // `*mut T`, in which `T` is invariant.
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(place, Rvalue::Use(operand)) = &statement.kind
+                && let OperandKind::Static(id) = operand.kind
+                && place.projection.is_empty()
+                && hir_def::signatures::StaticSignature::of(ctx.db, id)
+                    .flags
+                    .contains(hir_def::signatures::StaticFlags::MUTABLE)
+                && let TyKind::Ref(_, inner, _) =
+                    regions.local_tys[place.local.into_raw().into_u32() as usize].kind()
+            {
+                record_variances(ctx, inner, Variance::Invariant, &mut directions);
+            }
+        }
     }
     let universal: FxHashSet<Rv> = regions.universals.iter().map(|&(rv, _)| rv).collect();
     let direction = |rv: Rv| {
