@@ -1021,6 +1021,7 @@ impl<'db> Builder<'_, '_, 'db> {
             }
         }
         self.pattern_paths();
+        self.path_arguments();
         for (pat, initializer) in lets {
             let Some(ty) = self.ctx.infer.type_of_pat.get(pat).map(|it| it.as_ref()) else {
                 continue;
@@ -1133,6 +1134,64 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
             }
             _ => (),
+        }
+    }
+
+    /// The generic arguments a path in the body spells out are well-formed, reached or not,
+    /// as rustc's user type annotations: `None::<<&'a () as Trait>::Ty>` that `&'a ()`
+    /// implements `Trait`.
+    fn path_arguments(&mut self) {
+        let store = self.ctx.store;
+        let mut parent = FxHashMap::default();
+        for (expr, _) in store.exprs() {
+            store.walk_child_exprs(expr, |child| {
+                parent.insert(child, expr);
+            });
+        }
+        // A path in a closure in this body is the closure's, which proves it.
+        let owner = |mut expr| loop {
+            match parent.get(&expr) {
+                Some(&up) if matches!(store[up], hir_def::hir::Expr::Closure { .. }) => {
+                    return Some(up);
+                }
+                Some(&up) => expr = up,
+                None => return None,
+            }
+        };
+        let mut found = Vec::new();
+        let mut items = Vec::new();
+        for (expr, it) in store.exprs() {
+            let hir_def::hir::Expr::Path(path) = it else { continue };
+            if owner(expr) != self.ctx.closure_expr {
+                continue;
+            }
+            if spells_generics(path)
+                && let Some(ty) = self.ctx.infer.type_of_expr.get(expr)
+                && let TyKind::FnDef(def, args) = ty.as_ref().kind()
+            {
+                items.push((expr, def.0, args));
+            }
+            for args in path.generic_args().into_iter().flatten().flatten() {
+                for arg in args.args.iter() {
+                    if let hir_def::expr_store::path::GenericArg::Type(type_ref) = arg {
+                        found.push((expr, *type_ref));
+                    }
+                }
+            }
+        }
+        for (expr, type_ref) in found {
+            let span = MirSpan::ExprId(expr);
+            let ty = self.lower_written(type_ref, span);
+            let ty = self.written(ty);
+            self.well_formed(ty, At { category: Category::TypeAnnotation, span }, 0);
+        }
+        // A closure proves its calls' where clauses at them, which it can propagate.
+        if self.ctx.closure_local.is_some() {
+            return;
+        }
+        for (expr, def, args) in items {
+            let args = self.written(args);
+            self.callee_predicates(def, args, MirSpan::ExprId(expr));
         }
     }
 
@@ -1249,6 +1308,37 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
                 self.well_formed(inner, at, depth + 1)
+            }
+            // An associated type is well-formed where its trait is implemented, `<&'a () as
+            // Trait>::Ty` with only `impl Trait for &'static ()` that `'a: 'static`.
+            TyKind::Alias(alias) => {
+                for it in alias.args.types() {
+                    self.well_formed(it, at, depth + 1);
+                }
+                if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind {
+                    self.prove(alias.trait_ref(self.interner()), at);
+                }
+            }
+            // As rustc, a function item is well-formed with its where clauses and its return
+            // type, but what names its late-bound lifetimes is not checked.
+            TyKind::FnDef(def, args) => {
+                let generic_def: GenericDefId = match def.0 {
+                    CallableDefId::FunctionId(it) => it.into(),
+                    CallableDefId::StructId(it) => it.into(),
+                    CallableDefId::EnumVariantId(it) => it.lookup(self.ctx.db).parent.into(),
+                };
+                self.predicates(generic_def, args, at, true);
+                let output = self
+                    .ctx
+                    .db
+                    .callable_item_signature(def.0)
+                    .instantiate(self.interner(), args)
+                    .skip_norm_wip()
+                    .output()
+                    .skip_binder();
+                if !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&output) {
+                    self.well_formed(output, at, depth + 1);
+                }
             }
             _ => (),
         }
@@ -2235,7 +2325,25 @@ impl<'db> Builder<'_, '_, 'db> {
                                 .callable_item_signature(def.0)
                                 .instantiate(self.interner(), args)
                                 .skip_norm_wip();
-                            let source = Ty::new_fn_ptr(self.interner(), sig);
+                            // rustc instantiates the item's late-bound lifetimes and proves
+                            // its signature well-formed with them: `&'a &'b ()` that `'b: 'a`.
+                            let sig = self.ctx.infcx.instantiate_binder_with_fresh_vars(
+                                hir_ty::Span::Dummy,
+                                hir_ty::next_solver::infer::BoundRegionConversionTime::FnCall,
+                                sig,
+                            );
+                            let sig = rustc_type_ir::fold_regions(self.interner(), sig, |r, _| {
+                                match r.kind() {
+                                    RegionKind::ReError(_) => self.fresh(),
+                                    _ => r,
+                                }
+                            });
+                            let wf = At { category: Category::Boring, span };
+                            for ty in sig.inputs_and_output.iter() {
+                                self.well_formed(ty, wf, 0);
+                            }
+                            let source =
+                                Ty::new_fn_ptr(self.interner(), rustc_type_ir::Binder::dummy(sig));
                             self.relate(source, target, Variance::Covariant, at);
                         }
                     }
@@ -2503,6 +2611,10 @@ impl<'db> Builder<'_, '_, 'db> {
                             sig,
                         );
                         self.callee_predicates(def, fn_args, span);
+                        let wf = At { category: Category::Boring, span };
+                        for ty in fn_args.types() {
+                            self.well_formed(ty, wf, 0);
+                        }
                         if let CallableDefId::FunctionId(function) = def
                             && let Some(expr) = self.callee_expr(func, span)
                         {
@@ -2532,8 +2644,13 @@ impl<'db> Builder<'_, '_, 'db> {
                             keep_static,
                             returns_self,
                         );
-                        // The where clauses of the associated types in the signature hold
-                        // for it to be well-formed.
+                        // The signature as written is well-formed, `&'a &'b ()` that `'b: 'a`
+                        // even where it normalizes to `()`; and the where clauses of its
+                        // associated types hold.
+                        let wf = At { category: Category::Boring, span };
+                        for ty in inputs.iter().copied().chain([output]) {
+                            self.well_formed(ty, wf, 0);
+                        }
                         let at = At { category: Category::Predicate, span };
                         for ty in inputs.iter().copied().chain([output]) {
                             for (def, args) in projections(ty) {

@@ -183,6 +183,8 @@ pub(crate) struct Ctx<'a, 'db> {
     /// In the body of a closure, how it is called.
     pub(crate) closure_kind: Option<rustc_type_ir::ClosureKind>,
     pub(crate) closure_local: Option<LocalId>,
+    /// The closure or `async` block this is the body of.
+    pub(crate) closure_expr: Option<ExprId>,
 }
 
 /// A capture of a closure, in its body.
@@ -251,6 +253,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             upvars,
             closure_kind,
             closure_local,
+            closure_expr: closure,
         }
     }
 
