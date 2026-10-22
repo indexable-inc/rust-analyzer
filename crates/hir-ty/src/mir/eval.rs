@@ -2917,6 +2917,16 @@ impl<'db> Evaluator<'db> {
             return Ok(());
         }
         use rustc_type_ir::TyKind;
+        // The vtable of a `dyn` pointer is the id the value's own evaluation gave the type it
+        // points at, and this one has another for it.
+        if let TyKind::RawPtr(t, _) | TyKind::Ref(_, t, _) = ty.kind()
+            && let TyKind::Dynamic(..) = t.kind()
+        {
+            let at = addr.offset(self.ptr_size());
+            let concrete = ty_of_bytes(self.read_memory(at, self.ptr_size())?)?;
+            let new_id = self.vtable_map.id(concrete);
+            self.write_memory(at, &word_bytes(new_id))?;
+        }
         // A pointer into a static points into this evaluator's copy of it.
         if let TyKind::RawPtr(..) | TyKind::Ref(..) = ty.kind() {
             let current = from_bytes!(usize, self.read_memory(addr, self.ptr_size())?);
@@ -2961,7 +2971,17 @@ impl<'db> Evaluator<'db> {
                             None => current,
                         };
                         let patched = Address::from_usize(patched);
-                        if let TyKind::Slice(inner) = t.kind() {
+                        if let TyKind::Dynamic(..) = t.kind() {
+                            let concrete = self.vtable_map.ty_of_bytes(&metadata)?;
+                            self.patch_addresses(
+                                patch_map,
+                                source,
+                                ty_of_bytes,
+                                patched,
+                                concrete,
+                                locals,
+                            )?;
+                        } else if let TyKind::Slice(inner) = t.kind() {
                             let len = from_bytes!(usize, metadata);
                             let size = self.size_of_sized(inner, locals, "slice item to patch")?;
                             let len = if size == 0 { 0 } else { len };

@@ -2173,10 +2173,13 @@ impl ModCollector<'_, '_> {
                         StructValueNsCtor::ValueNsCtorWithVis(vis) => {
                             Some(resolve_vis(def_map, local_def_map, &self.item_tree[*vis]))
                         }
-                        StructValueNsCtor::ValueNsCtorWithMinVis(multiple) => multiple
-                            .iter()
-                            .map(|&vis| resolve_vis(def_map, local_def_map, &self.item_tree[vis]))
-                            .fold(None, |a: Option<Visibility>, b| a?.min(db, b, def_map)),
+                        StructValueNsCtor::ValueNsCtorWithMinVis(multiple) => {
+                            let mut each = multiple.iter().map(|&vis| {
+                                resolve_vis(def_map, local_def_map, &self.item_tree[vis])
+                            });
+                            let first = each.next();
+                            each.fold(first, |a: Option<Visibility>, b| a?.min(db, b, def_map))
+                        }
                     };
                     let interned = StructLoc {
                         container: module_id,
