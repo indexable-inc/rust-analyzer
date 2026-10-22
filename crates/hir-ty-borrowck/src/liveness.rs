@@ -310,7 +310,14 @@ pub(super) fn region_liveness<'db>(
                 }
                 let rvs = drop_regions.entry(local).or_insert_with(|| {
                     let mut out = Vec::new();
-                    drop_components(ctx, regions.local_tys[local], &mut out, &mut cache, 0);
+                    drop_components(
+                        ctx,
+                        regions,
+                        regions.local_tys[local],
+                        &mut out,
+                        &mut cache,
+                        0,
+                    );
                     out
                 });
                 for &rv in rvs.iter() {
@@ -453,6 +460,7 @@ impl InitAtExit {
 /// The regions dropping a value of type `ty` may use: rustc's dropck outlives constraints.
 fn drop_components<'db>(
     ctx: &Ctx<'_, 'db>,
+    regions: &Regions<'db>,
     ty: Ty<'db>,
     out: &mut Vec<Rv>,
     cache: &mut FxHashMap<Ty<'db>, Vec<Rv>>,
@@ -467,11 +475,13 @@ fn drop_components<'db>(
     }
     let mut found = Vec::new();
     match ty.kind() {
+        // Dropping a `ManuallyDrop` drops nothing.
+        TyKind::Adt(def, _) if def.is_manually_drop() => (),
         TyKind::Adt(def, args) => {
             let adt = def.def_id();
             if def.is_box() || def.is_phantom_data() {
                 if let Some(GenericArgKind::Type(inner)) = args.iter().next().map(|it| it.kind()) {
-                    drop_components(ctx, inner, &mut found, cache, depth + 1);
+                    drop_components(ctx, regions, inner, &mut found, cache, depth + 1);
                 }
             } else {
                 if let Some(drop_impl) = hir_ty::drop::destructor(ctx.db, adt) {
@@ -480,7 +490,7 @@ fn drop_components<'db>(
                         let dangles = dangling.get(index).copied().unwrap_or(false);
                         match arg.kind() {
                             GenericArgKind::Type(arg) if dangles => {
-                                drop_components(ctx, arg, &mut found, cache, depth + 1)
+                                drop_components(ctx, regions, arg, &mut found, cache, depth + 1)
                             }
                             GenericArgKind::Type(arg) => regions_of(arg, &mut found),
                             GenericArgKind::Lifetime(region) if !dangles => {
@@ -504,23 +514,41 @@ fn drop_components<'db>(
                     for (_, field) in ctx.db.field_types(variant).iter() {
                         let field =
                             field.ty().instantiate(ctx.infcx.interner, args).skip_norm_wip();
-                        drop_components(ctx, field, &mut found, cache, depth + 1);
+                        drop_components(ctx, regions, field, &mut found, cache, depth + 1);
                     }
                 }
             }
         }
         TyKind::Array(inner, _) | TyKind::Slice(inner) => {
-            drop_components(ctx, inner, &mut found, cache, depth + 1)
+            drop_components(ctx, regions, inner, &mut found, cache, depth + 1)
         }
         TyKind::Tuple(tys) => {
             for it in tys.iter() {
-                drop_components(ctx, it, &mut found, cache, depth + 1);
+                drop_components(ctx, regions, it, &mut found, cache, depth + 1);
             }
         }
-        TyKind::Closure(_, args) => {
-            drop_components(ctx, args.as_closure().tupled_upvars_ty(), &mut found, cache, depth + 1)
-        }
+        TyKind::Closure(_, args) => drop_components(
+            ctx,
+            regions,
+            args.as_closure().tupled_upvars_ty(),
+            &mut found,
+            cache,
+            depth + 1,
+        ),
         TyKind::Dynamic(..) => regions_of(ty, &mut found),
+        // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
+        // another alias holds what its bounds and captures let it, as for liveness.
+        TyKind::Alias(alias) => {
+            let normalized = match alias.kind {
+                rustc_type_ir::AliasTyKind::Projection { .. } => super::regions::normalize(ctx, ty)
+                    .filter(|it| !matches!(it.kind(), TyKind::Alias(_) | TyKind::Infer(_))),
+                _ => None,
+            };
+            match normalized {
+                Some(it) => drop_components(ctx, regions, it, &mut found, cache, depth + 1),
+                None => live_regions_of(ctx, regions, ty, &mut found),
+            }
+        }
         _ => (),
     }
     found.sort_unstable();
@@ -632,11 +660,32 @@ fn alias_bound<'db>(
         else {
             continue;
         };
-        if erase(bounded) != erased && normalize_erased(ctx, erase(bounded)) != Some(erased) {
+        let same = erase(bounded) == erased;
+        if !same && normalize_erased(ctx, erase(bounded)) != Some(erased) {
             continue;
         }
         let bound = match region.kind() {
             RegionKind::ReStatic => return Some(None),
+            // `for<'a> T: 'a` is `T: 'static`; `for<'a, 'b> T::Changes<'a, 'b>: 'b` that the
+            // alias outlives what it has where the bound names `'b`.
+            RegionKind::ReBound(_, bound) => {
+                let regions_in = |ty: Ty<'db>| {
+                    let mut found = Vec::new();
+                    rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                        found.push(region);
+                        region
+                    });
+                    found
+                };
+                let at = regions_in(bounded).iter().position(|it| {
+                    matches!(it.kind(), RegionKind::ReBound(_, other) if other.var == bound.var)
+                });
+                match at {
+                    None => return Some(None),
+                    Some(at) if same => regions_in(ty).get(at).copied().and_then(rv_of),
+                    Some(_) => None,
+                }
+            }
             RegionKind::ReVar(_) => rv_of(region),
             RegionKind::ReEarlyParam(early) => regions.early.get(&early.index).copied(),
             _ => None,

@@ -201,6 +201,7 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
                 && let MirSpan::ExprId(expr) = statement.span
                 && refs.contains(&expr)
                 && place.projection.is_empty()
+                && !ctx.bindings.contains_key(&place.local)
             {
                 found.insert(place.local);
             }

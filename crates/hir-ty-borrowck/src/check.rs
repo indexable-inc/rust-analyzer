@@ -1129,8 +1129,17 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         );
                         return;
                     }
+                    // A `const` or `static` item's value is rustc's `UseAsConst`, not returned.
                     (None, Category::Return)
-                        if !blamed.from_closure && !self.regions.returns_static_opaque =>
+                        if !blamed.from_closure
+                            && !self.regions.returns_static_opaque
+                            && !matches!(
+                                self.ctx.owner,
+                                hir_ty::InferBodyId::DefWithBodyId(
+                                    hir_def::DefWithBodyId::ConstId(_)
+                                        | hir_def::DefWithBodyId::StaticId(_)
+                                )
+                            ) =>
                     {
                         let span = if blamed.span == MirSpan::Unknown {
                             loan.span

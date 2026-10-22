@@ -1828,57 +1828,8 @@ impl<'db> Builder<'_, '_, 'db> {
         }
     }
 
-    /// `ty` an associated type normalized, with the lifetimes it takes from its arguments
-    /// the same regions: the solver gives the result regions of its own, related to those it
-    /// came from only by constraints it records.
     fn normalize(&mut self, ty: Ty<'db>) -> Option<Ty<'db>> {
-        use hir_ty::next_solver::{
-            infer::{region_constraints::Constraint, traits::ObligationCause},
-            obligation_ctxt::ObligationCtxt,
-        };
-        if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
-            return None;
-        }
-        let infcx = &self.ctx.infcx;
-        let constraints_before = infcx
-            .inner
-            .borrow_mut()
-            .unwrap_region_constraints()
-            .region_constraint_data()
-            .constraints
-            .len();
-        let first_new = infcx.num_region_vars();
-        let mut ocx = ObligationCtxt::new(infcx);
-        let normalized =
-            ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.ctx.env, ty).ok()?;
-        let mut same = FxHashMap::default();
-        {
-            let mut inner = infcx.inner.borrow_mut();
-            let collector = inner.unwrap_region_constraints();
-            let data = collector.region_constraint_data();
-            for constraint in &data.constraints[constraints_before..] {
-                if let Constraint::VarSubVar(a, b) = *constraint {
-                    let (new, old) = if a.index() >= first_new { (a, b) } else { (b, a) };
-                    if new.index() >= first_new && old.index() < first_new {
-                        same.entry(new).or_insert(old);
-                    }
-                }
-            }
-        }
-        let mut unmapped = false;
-        let normalized = rustc_type_ir::fold_regions(self.interner(), normalized, |region, _| {
-            match region.kind() {
-                RegionKind::ReVar(vid) if vid.index() >= first_new => match same.get(&vid) {
-                    Some(&old) => Region::new_var(self.interner(), old),
-                    None => {
-                        unmapped = true;
-                        region
-                    }
-                },
-                _ => region,
-            }
-        });
-        (!unmapped).then_some(normalized)
+        normalize(self.ctx, ty)
     }
 
     fn outlives(&mut self, sup: Rv, sub: Rv, at: At) {
@@ -3912,4 +3863,56 @@ pub(super) fn blame(path: &[Outlives]) -> Option<Outlives> {
         .find(|it| interest(it) == best && it.span != MirSpan::Unknown)
         .or_else(|| path.iter().rev().find(|it| interest(it) == best))
         .copied()
+}
+
+/// `ty` an associated type normalized, with the lifetimes it takes from its arguments the same
+/// regions: the solver gives the result regions of its own, related to those it came from only
+/// by constraints it records.
+pub(super) fn normalize<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
+    use hir_ty::next_solver::{
+        infer::{region_constraints::Constraint, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
+        return None;
+    }
+    let infcx = &ctx.infcx;
+    let constraints_before = infcx
+        .inner
+        .borrow_mut()
+        .unwrap_region_constraints()
+        .region_constraint_data()
+        .constraints
+        .len();
+    let first_new = infcx.num_region_vars();
+    let mut ocx = ObligationCtxt::new(infcx);
+    let normalized = ocx.structurally_normalize_ty(&ObligationCause::dummy(), ctx.env, ty).ok()?;
+    let mut same = FxHashMap::default();
+    {
+        let mut inner = infcx.inner.borrow_mut();
+        let collector = inner.unwrap_region_constraints();
+        let data = collector.region_constraint_data();
+        for constraint in &data.constraints[constraints_before..] {
+            if let Constraint::VarSubVar(a, b) = *constraint {
+                let (new, old) = if a.index() >= first_new { (a, b) } else { (b, a) };
+                if new.index() >= first_new && old.index() < first_new {
+                    same.entry(new).or_insert(old);
+                }
+            }
+        }
+    }
+    let mut unmapped = false;
+    let normalized = rustc_type_ir::fold_regions(ctx.infcx.interner, normalized, |region, _| {
+        match region.kind() {
+            RegionKind::ReVar(vid) if vid.index() >= first_new => match same.get(&vid) {
+                Some(&old) => Region::new_var(ctx.infcx.interner, old),
+                None => {
+                    unmapped = true;
+                    region
+                }
+            },
+            _ => region,
+        }
+    });
+    (!unmapped).then_some(normalized)
 }
