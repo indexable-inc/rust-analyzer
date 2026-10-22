@@ -677,11 +677,29 @@ impl<'db> Builder<'_, '_, 'db> {
                         }
                     }
                     // Each elided input lifetime is its own region before `&dyn Trait` copies
-                    // it into the object's default, so that the two are the same one.
-                    for input in &mut inputs {
+                    // it into the object's default, so that the two are the same one. A
+                    // parameter that elides one lifetime has it once however often its type
+                    // does (`S2` of `type S2<'a> = S<'a, 'a>`).
+                    let resolver = {
+                        use hir_def::resolver::HasResolver;
+                        function.resolver(self.ctx.db)
+                    };
+                    let aligned = written.params.len() == inputs.len();
+                    for (index, input) in inputs.iter_mut().enumerate() {
+                        let single = aligned
+                            && written.params.get(index).is_some_and(|&param| {
+                                elided_lifetimes(self.ctx.db, &resolver, &written.store, param)
+                                    == Some(1)
+                            });
+                        let mut only = None;
                         *input =
                             rustc_type_ir::fold_regions(self.interner(), *input, |region, _| {
                                 match region.kind() {
+                                    RegionKind::ReError(_) if single => {
+                                        *only.get_or_insert_with(|| {
+                                            self.new_universal(UniversalKind::AnonParam)
+                                        })
+                                    }
                                     RegionKind::ReError(_) => {
                                         self.new_universal(UniversalKind::AnonParam)
                                     }
@@ -1729,6 +1747,9 @@ impl<'db> Builder<'_, '_, 'db> {
             infer::{region_constraints::Constraint, traits::ObligationCause},
             obligation_ctxt::ObligationCtxt,
         };
+        if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
+            return None;
+        }
         let infcx = &self.ctx.infcx;
         let constraints_before = infcx
             .inner
@@ -2000,6 +2021,22 @@ impl<'db> Builder<'_, '_, 'db> {
                     _ => None,
                 };
                 self.relate_args(x.args, y.args, variances.as_deref(), Variance::Invariant, at)
+            }
+            // A signature's associated type against what it is,
+            // `<&'a mut Vec<T> as IntoIterator>::IntoIter` and `IterMut<'_, T>`.
+            (TyKind::Alias(x), _) | (_, TyKind::Alias(x))
+                if matches!(x.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
+            {
+                let normalize = |this: &mut Self, ty: Ty<'db>| match ty.kind() {
+                    TyKind::Alias(_) => this.normalize(ty).filter(|&it| it != ty),
+                    _ => Some(ty),
+                };
+                if let Some(a) = normalize(self, a)
+                    && let Some(b) = normalize(self, b)
+                    && !matches!((a.kind(), b.kind()), (TyKind::Alias(_), TyKind::Alias(_)))
+                {
+                    self.relate(a, b, variance, at);
+                }
             }
             (TyKind::Closure(_, aa), TyKind::Closure(_, ab))
             | (TyKind::FnDef(_, aa), TyKind::FnDef(_, ab)) => {
@@ -3259,6 +3296,7 @@ fn writes_self(
     match &store[ty] {
         TypeRef::Path(path) => {
             path.is_self_type()
+                || path.qualifier().is_some_and(|it| it.is_self_type())
                 || path.type_anchor().is_some_and(|it| writes_self(store, it))
                 || path.generic_args().into_iter().flatten().flatten().any(|args| {
                     args.args
@@ -3271,6 +3309,63 @@ fn writes_self(
         TypeRef::Reference(it) => writes_self(store, it.ty),
         TypeRef::Array(it) => writes_self(store, it.ty),
         _ => false,
+    }
+}
+
+/// How many lifetimes the type `ty` in `store` elides: `&T`, `'_`, and a path that writes
+/// none of its lifetimes, one for `S2` of `type S2<'a> = S<'a, 'a>` though its type has it
+/// twice. `None` where that is not known (`dyn Trait`, `impl Trait`, `Self`, associated types).
+fn elided_lifetimes(
+    db: &dyn hir_ty::db::HirDatabase,
+    resolver: &hir_def::resolver::Resolver<'_>,
+    store: &hir_def::expr_store::ExpressionStore,
+    ty: hir_def::hir::type_ref::TypeRefId,
+) -> Option<usize> {
+    use hir_def::{
+        expr_store::path::GenericArg,
+        hir::{
+            generics::GenericParams,
+            type_ref::{LifetimeRef, TypeRef},
+        },
+        resolver::TypeNs,
+    };
+    let count = |it| elided_lifetimes(db, resolver, store, it);
+    match &store[ty] {
+        TypeRef::Reference(it) => {
+            let elided =
+                matches!(it.lifetime.map(|it| &store[it]), None | Some(LifetimeRef::Placeholder));
+            Some(elided as usize + count(it.ty)?)
+        }
+        TypeRef::Tuple(tys) => tys.iter().map(|&it| count(it)).sum(),
+        TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => count(*it),
+        TypeRef::Array(it) => count(it.ty),
+        TypeRef::Never | TypeRef::TypeParam(_) => Some(0),
+        TypeRef::Path(path) => {
+            let params = match resolver.resolve_path_in_type_ns_fully(db, path)? {
+                TypeNs::AdtId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+                TypeNs::TypeAliasId(it) => GenericParams::of(db, it.into()).len_lifetimes(),
+                TypeNs::BuiltinType(_) | TypeNs::GenericParam(_) => 0,
+                _ => return None,
+            };
+            let (mut written, mut placeholders, mut inner) = (0, 0, 0);
+            for args in path.generic_args().into_iter().flatten().flatten() {
+                if !args.bindings.is_empty() {
+                    return None;
+                }
+                for arg in &args.args {
+                    match arg {
+                        GenericArg::Lifetime(it) => {
+                            written += 1;
+                            placeholders += matches!(store[*it], LifetimeRef::Placeholder) as usize;
+                        }
+                        GenericArg::Type(it) => inner += count(*it)?,
+                        GenericArg::Const(_) => (),
+                    }
+                }
+            }
+            Some(inner + if written == 0 { params } else { placeholders })
+        }
+        _ => None,
     }
 }
 
