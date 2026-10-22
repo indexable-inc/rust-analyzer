@@ -1432,6 +1432,115 @@ pub struct CoroutineLocals {
     pub context: LocalId,
 }
 
+/// A walk over every place a body mentions, as `walk_places` (each place can be changed) or
+/// `visit_places` (each is only read).
+macro_rules! places_walker {
+    ($name:ident, $iter:ident, $each:ident $(, $m:tt)?) => {
+        pub fn $name(&$($m)? self, mut f: impl FnMut(&$($m)? StoredPlace)) {
+            fn for_operand(op: &$($m)? Operand, f: &mut impl FnMut(&$($m)? StoredPlace)) {
+                match &$($m)? op.kind {
+                    OperandKind::Copy(p) | OperandKind::Move(p) => {
+                        f(p);
+                    }
+                    OperandKind::Constant { .. }
+                    | OperandKind::Static(_)
+                    | OperandKind::Allocation { .. } => (),
+                }
+            }
+            for (_, block) in self.basic_blocks.$iter() {
+                for statement in &$($m)? block.statements {
+                    match &$($m)? statement.kind {
+                        StatementKind::Assign(p, r) => {
+                            f(p);
+                            match r {
+                                Rvalue::UnaryOp(_, o)
+                                | Rvalue::Cast(_, o, _)
+                                | Rvalue::Repeat(o, _)
+                                | Rvalue::Use(o) => for_operand(o, &mut f),
+                                Rvalue::CopyForDeref(p)
+                                | Rvalue::Discriminant(p)
+                                | Rvalue::Len(p)
+                                | Rvalue::Ref(_, p) => f(p),
+                                Rvalue::CheckedBinaryOp(_, o1, o2) | Rvalue::BinaryOp(_, o1, o2) => {
+                                    for_operand(o1, &mut f);
+                                    for_operand(o2, &mut f);
+                                }
+                                Rvalue::Aggregate(_, ops) => {
+                                    for op in ops.$iter() {
+                                        for_operand(op, &mut f);
+                                    }
+                                }
+                                Rvalue::ThreadLocalRef(n)
+                                | Rvalue::AddressOf(n)
+                                | Rvalue::NullaryOp(n) => match *n {},
+                            }
+                        }
+                        StatementKind::FakeRead(p) | StatementKind::Deinit(p) => f(p),
+                        StatementKind::InlineAsm(asm) => {
+                            for operand in &$($m)? asm.operands {
+                                match operand {
+                                    AsmOperand::Reg { input, output, .. } => {
+                                        if let Some(input) = input {
+                                            for_operand(input, &mut f);
+                                        }
+                                        if let Some(output) = output {
+                                            f(output);
+                                        }
+                                    }
+                                    AsmOperand::Const(value) | AsmOperand::Sym(value) => {
+                                        for_operand(value, &mut f)
+                                    }
+                                    AsmOperand::Label => (),
+                                }
+                            }
+                            if let Some(taken) = &$($m)? asm.taken {
+                                f(taken);
+                            }
+                        }
+                        StatementKind::StorageLive(_)
+                        | StatementKind::StorageDead(_)
+                        | StatementKind::Nop => (),
+                    }
+                }
+                match &$($m)? block.terminator {
+                    Some(x) => match &$($m)? x.kind {
+                        TerminatorKind::SwitchInt { discr, .. } => for_operand(discr, &mut f),
+                        TerminatorKind::FalseEdge { .. }
+                        | TerminatorKind::FalseUnwind { .. }
+                        | TerminatorKind::Goto { .. }
+                        | TerminatorKind::UnwindResume
+                        | TerminatorKind::CoroutineDrop
+                        | TerminatorKind::Abort
+                        | TerminatorKind::Return
+                        | TerminatorKind::Unreachable => (),
+                        TerminatorKind::Drop { place, .. } => {
+                            f(place);
+                        }
+                        TerminatorKind::DropAndReplace { place, value, .. } => {
+                            f(place);
+                            for_operand(value, &mut f);
+                        }
+                        TerminatorKind::Call { func, args, destination, .. } => {
+                            for_operand(func, &mut f);
+                            args.$iter().for_each(|x| for_operand(x, &mut f));
+                            f(destination);
+                        }
+                        TerminatorKind::Assert { cond, msg, .. } => {
+                            for_operand(cond, &mut f);
+                            msg.$each(&mut |it| for_operand(it, &mut f));
+                        }
+                        TerminatorKind::Yield { value, resume_arg, .. } => {
+                            for_operand(value, &mut f);
+                            f(resume_arg);
+                        }
+                    },
+                    None => (),
+                }
+            }
+        }
+    };
+}
+
 impl MirBody<'_> {
     /// The future the body of an `async` block waits for at `point`: going on from there
     /// starts by borrowing it, to poll it again.
@@ -1457,108 +1566,8 @@ impl MirBody<'_> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }
 
-    pub fn walk_places(&mut self, mut f: impl FnMut(&mut StoredPlace)) {
-        fn for_operand(op: &mut Operand, f: &mut impl FnMut(&mut StoredPlace)) {
-            match &mut op.kind {
-                OperandKind::Copy(p) | OperandKind::Move(p) => {
-                    f(p);
-                }
-                OperandKind::Constant { .. }
-                | OperandKind::Static(_)
-                | OperandKind::Allocation { .. } => (),
-            }
-        }
-        for (_, block) in self.basic_blocks.iter_mut() {
-            for statement in &mut block.statements {
-                match &mut statement.kind {
-                    StatementKind::Assign(p, r) => {
-                        f(p);
-                        match r {
-                            Rvalue::UnaryOp(_, o)
-                            | Rvalue::Cast(_, o, _)
-                            | Rvalue::Repeat(o, _)
-                            | Rvalue::Use(o) => for_operand(o, &mut f),
-                            Rvalue::CopyForDeref(p)
-                            | Rvalue::Discriminant(p)
-                            | Rvalue::Len(p)
-                            | Rvalue::Ref(_, p) => f(p),
-                            Rvalue::CheckedBinaryOp(_, o1, o2) | Rvalue::BinaryOp(_, o1, o2) => {
-                                for_operand(o1, &mut f);
-                                for_operand(o2, &mut f);
-                            }
-                            Rvalue::Aggregate(_, ops) => {
-                                for op in ops.iter_mut() {
-                                    for_operand(op, &mut f);
-                                }
-                            }
-                            Rvalue::ThreadLocalRef(n)
-                            | Rvalue::AddressOf(n)
-                            | Rvalue::NullaryOp(n) => match *n {},
-                        }
-                    }
-                    StatementKind::FakeRead(p) | StatementKind::Deinit(p) => f(p),
-                    StatementKind::InlineAsm(asm) => {
-                        for operand in &mut asm.operands {
-                            match operand {
-                                AsmOperand::Reg { input, output, .. } => {
-                                    if let Some(input) = input {
-                                        for_operand(input, &mut f);
-                                    }
-                                    if let Some(output) = output {
-                                        f(output);
-                                    }
-                                }
-                                AsmOperand::Const(value) | AsmOperand::Sym(value) => {
-                                    for_operand(value, &mut f)
-                                }
-                                AsmOperand::Label => (),
-                            }
-                        }
-                        if let Some(taken) = &mut asm.taken {
-                            f(taken);
-                        }
-                    }
-                    StatementKind::StorageLive(_)
-                    | StatementKind::StorageDead(_)
-                    | StatementKind::Nop => (),
-                }
-            }
-            match &mut block.terminator {
-                Some(x) => match &mut x.kind {
-                    TerminatorKind::SwitchInt { discr, .. } => for_operand(discr, &mut f),
-                    TerminatorKind::FalseEdge { .. }
-                    | TerminatorKind::FalseUnwind { .. }
-                    | TerminatorKind::Goto { .. }
-                    | TerminatorKind::UnwindResume
-                    | TerminatorKind::CoroutineDrop
-                    | TerminatorKind::Abort
-                    | TerminatorKind::Return
-                    | TerminatorKind::Unreachable => (),
-                    TerminatorKind::Drop { place, .. } => {
-                        f(place);
-                    }
-                    TerminatorKind::DropAndReplace { place, value, .. } => {
-                        f(place);
-                        for_operand(value, &mut f);
-                    }
-                    TerminatorKind::Call { func, args, destination, .. } => {
-                        for_operand(func, &mut f);
-                        args.iter_mut().for_each(|x| for_operand(x, &mut f));
-                        f(destination);
-                    }
-                    TerminatorKind::Assert { cond, msg, .. } => {
-                        for_operand(cond, &mut f);
-                        msg.for_each_operand_mut(&mut |it| for_operand(it, &mut f));
-                    }
-                    TerminatorKind::Yield { value, resume_arg, .. } => {
-                        for_operand(value, &mut f);
-                        f(resume_arg);
-                    }
-                },
-                None => (),
-            }
-        }
-    }
+    places_walker!(walk_places, iter_mut, for_each_operand_mut, mut);
+    places_walker!(visit_places, iter, for_each_operand);
 }
 
 impl<'db> MirBody<'db> {
