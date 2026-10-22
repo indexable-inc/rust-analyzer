@@ -69,6 +69,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 // First instantiate params.
                 let ty = ty.try_super_fold_with(self)?;
                 let ty = self.impl_opaque(ty);
+                if let Some(hidden) = self.hidden_with_opaques(ty) {
+                    return self.try_fold_ty(hidden);
+                }
 
                 let ty = self.normalized(ty)?;
                 // Normalization could introduce infer vars (for example, if the alias cannot be normalized),
@@ -180,6 +183,34 @@ impl<'db> Filler<'db> {
                 args,
             ),
         )
+    }
+
+    /// The hidden type of the `impl Trait` a function returns, when another `impl Trait` is
+    /// in it. One of a trait method (`fn f<T: A>(t: T) -> impl X { t.f() }`, or the body of
+    /// `impl<T: A> B for T`) is the impl's once the types are known, which only
+    /// [`Self::impl_opaque`] finds: the solver reveals all of it at once and stops at the
+    /// trait method's, which has no code.
+    fn hidden_with_opaques(&self, ty: Ty<'db>) -> Option<Ty<'db>> {
+        let TyKind::Alias(alias) = ty.kind() else { return None };
+        let AliasTyKind::Opaque { def_id } = alias.kind else { return None };
+        let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return None };
+        let db = self.infcx.interner.db;
+        let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else {
+            return None;
+        };
+        // A trait's own is the impl's, which `impl_opaque` has not found.
+        if matches!(
+            hir_def::Lookup::lookup(&func, db).container,
+            hir_def::ItemContainerId::TraitId(_)
+        ) {
+            return None;
+        }
+        if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
+            return None;
+        }
+        let hidden = crate::opaques::rpit_hidden_types(db, func).get(idx)?;
+        let hidden = hidden.get().instantiate(self.infcx.interner, alias.args).skip_norm_wip();
+        hidden.has_type_flags(TypeFlags::HAS_TY_OPAQUE).then_some(hidden)
     }
 
     fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError<'db>> {
