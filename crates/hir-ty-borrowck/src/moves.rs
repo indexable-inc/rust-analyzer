@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use hir_ty::{
     consteval::try_const_usize,
     mir::{
-        AsmOperand, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem, StatementKind,
+        AsmOperand, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
         StoredPlace, TerminatorKind,
     },
     next_solver::TyKind,
@@ -122,12 +122,24 @@ impl MoveData {
                 let compares =
                     matches!(&it.kind, StatementKind::Assign(_, rvalue) if super::compares(rvalue));
                 it.kind.for_each_operand(&mut |operand| {
-                    if !compares && let Some(place) = ctx.moved_place(body, operand) {
+                    if !compares
+                        && let Some(place) = ctx.moved_place(body, operand)
+                        && !ctx.moves_out_of_guard(
+                            place.local,
+                            place.projection.as_slice(),
+                            operand.span().unwrap_or(it.span),
+                        )
+                    {
                         data.gather_move(ctx, body, place, location);
                     }
                 });
                 match &it.kind {
-                    StatementKind::Assign(place, _) => {
+                    StatementKind::Assign(place, rvalue) => {
+                        if let Rvalue::Discriminant(moved) = rvalue
+                            && ctx.cast_moves(body, moved, it.span)
+                        {
+                            data.gather_move(ctx, body, moved, location);
+                        }
                         data.gather_init(ctx, body, place, location, InitKind::Deep)
                     }
                     StatementKind::StorageDead(local) => {
@@ -150,7 +162,13 @@ impl MoveData {
             let Some(terminator) = &data_block.terminator else { continue };
             let location = Location { block, statement: data_block.statements.len() };
             terminator.kind.for_each_operand(&mut |operand| {
-                if let Some(place) = ctx.moved_place(body, operand) {
+                if let Some(place) = ctx.moved_place(body, operand)
+                    && !ctx.moves_out_of_guard(
+                        place.local,
+                        place.projection.as_slice(),
+                        operand.span().unwrap_or(terminator.span),
+                    )
+                {
                     data.gather_move(ctx, body, place, location);
                 }
             });

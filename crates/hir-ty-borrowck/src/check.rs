@@ -437,6 +437,8 @@ enum MoveErrorKind {
     Destructor(usize),
     /// Out of an element of a slice or an array, at an index.
     SliceOrArray(usize),
+    /// Out of a variable in its `match` arm's guard.
+    Guard,
 }
 
 struct MoveError {
@@ -694,6 +696,47 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
     }
 
+    /// Whether `span` is a `&raw const` or `&raw mut`, which lowering builds from a borrow.
+    fn is_raw_borrow(&self, span: MirSpan) -> bool {
+        matches!(span, MirSpan::ExprId(expr) if matches!(
+            self.ctx.store[expr],
+            hir_def::hir::Expr::Ref { rawness: hir_def::hir::type_ref::Rawness::RawPtr, .. }
+        ))
+    }
+
+    /// rustc's `is_disaligned`: whether `place` is in a `#[repr(packed)]` struct, not behind a
+    /// reference, that may leave it less aligned than its type asks for, as one whose layout
+    /// is not known (of a type parameter) may.
+    fn is_disaligned(&self, place: PlaceRef<'_>) -> bool {
+        let mut pack: Option<u64> = None;
+        for at in (0..place.projection.len()).rev() {
+            if matches!(place.projection[at], ProjectionElem::Deref) {
+                break;
+            }
+            let base = self.ctx.place_ty(self.body, place.local, &place.projection[..at]);
+            if base.variant_id.is_none()
+                && let TyKind::Adt(adt, _) = base.ty.kind()
+                && let Some(packed) = adt.repr(self.ctx.db).pack
+            {
+                let packed = packed.bytes();
+                pack = Some(pack.map_or(packed, |it| it.min(packed)));
+            }
+        }
+        let Some(pack) = pack else { return false };
+        let ty = self.ctx.place_ty(self.body, place.local, place.projection).ty;
+        let env = hir_ty::ParamEnvAndCrate { param_env: self.ctx.env, krate: self.ctx.krate };
+        // An unsized value's alignment is known only for a slice or `str` tail, not a `dyn`.
+        let known_tail = || {
+            let normalize = |ty| liveness::normalize_erased(self.ctx, ty).unwrap_or(ty);
+            let tail = hir_ty::layout::struct_tail_erasing_lifetimes(self.ctx.db, ty, &normalize);
+            matches!(tail.kind(), TyKind::Slice(_) | TyKind::Str)
+        };
+        match self.ctx.db.layout_of_ty(ty.store(), env.store()) {
+            Ok(layout) => layout.align.abi.bytes() > pack || !(layout.is_sized() || known_tail()),
+            Err(_) => true,
+        }
+    }
+
     fn mutate_destination(&mut self, location: Location, place: PlaceRef<'_>, span: MirSpan) {
         if self.is_union_literal(place, span) {
             // Lowering builds a union literal by assigning its field, where rustc assigns the
@@ -724,6 +767,22 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 };
                 self.access_place(location, place, span, access, Allowed::No, depth);
                 self.check_if_path_or_subpath_is_moved(location, action, place, span);
+                if !matches!(kind, BorrowKind::Shallow)
+                    && !self.is_raw_borrow(span)
+                    && self.is_disaligned(place)
+                {
+                    self.report(
+                        "E0793",
+                        span,
+                        "reference to field of packed struct is unaligned".to_owned(),
+                    );
+                }
+            }
+            Rvalue::Discriminant(place) if self.ctx.cast_moves(self.body, place, span) => {
+                let place = PlaceRef::of(place);
+                self.check_movable_place(location, place, span);
+                self.access_place(location, place, span, Access::Move, Allowed::Yes, Depth::Deep);
+                self.check_if_path_or_subpath_is_moved(location, InitAction::Use, place, span);
             }
             Rvalue::Len(place) | Rvalue::Discriminant(place) | Rvalue::CopyForDeref(place) => {
                 let place = PlaceRef::of(place);
@@ -1696,6 +1755,14 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         if ty.ty.references_non_lt_error() {
             return;
         }
+        if self.ctx.moves_out_of_guard(place.local, place.projection, span) {
+            let moved = self.ctx.place_ty(self.body, place.local, place.projection).ty;
+            if !moved.references_non_lt_error() && !self.ctx.is_copy(moved) {
+                let kind = MoveErrorKind::Guard;
+                self.move_errors.push(MoveError { place: place.key(), location, span, kind });
+            }
+            return;
+        }
         for (len, elem) in place.projection.iter().enumerate() {
             let kind = match (elem, ty.ty.kind()) {
                 (ProjectionElem::Deref, TyKind::Ref(..) | TyKind::RawPtr(..)) => {
@@ -1920,6 +1987,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 .statements
                 .get(error.location.statement);
             if let Some(statement) = statement
+                && !matches!(error.kind, MoveErrorKind::Guard)
                 && let StatementKind::Assign(
                     target,
                     Rvalue::Use(Operand { kind: OperandKind::Move(_), .. }),
@@ -1941,7 +2009,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             let message = self.move_error_message(&error);
             let code = match error.kind {
                 MoveErrorKind::Borrowed(len) if self.is_slice_or_array(&error, len + 1) => "E0508",
-                MoveErrorKind::Borrowed(_) => "E0507",
+                MoveErrorKind::Borrowed(_) | MoveErrorKind::Guard => "E0507",
                 MoveErrorKind::SliceOrArray(_) => "E0508",
                 MoveErrorKind::Destructor(_) => "E0509",
             };
@@ -1979,6 +2047,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 let base = place.base(len);
                 let ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
                 format!("cannot move out of type `{ty:?}`, which implements the `Drop` trait")
+            }
+            MoveErrorKind::Guard => {
+                format!("cannot move out of {} in pattern guard", self.quoted(place, "value"))
             }
             MoveErrorKind::SliceOrArray(len) => {
                 let base = place.base(len);

@@ -185,6 +185,30 @@ pub(crate) struct Ctx<'a, 'db> {
     pub(crate) closure_local: Option<LocalId>,
     /// The closure or `async` block this is the body of.
     pub(crate) closure_expr: Option<ExprId>,
+    /// For each expression in a `match` arm's guard, the variables the arm's pattern binds:
+    /// rustc binds them by reference in the guard, so it cannot move out of them.
+    pub(crate) guard_bindings: FxHashMap<ExprId, Vec<BindingId>>,
+}
+
+fn guard_bindings(store: &ExpressionStore) -> FxHashMap<ExprId, Vec<BindingId>> {
+    let mut out: FxHashMap<ExprId, Vec<BindingId>> = FxHashMap::default();
+    for (_, expr) in store.exprs() {
+        let hir_def::hir::Expr::Match { arms, .. } = expr else { continue };
+        for arm in arms.iter() {
+            let Some(guard) = arm.guard else { continue };
+            let mut bindings = Vec::new();
+            store.walk_bindings_in_pat(arm.pat, |it| bindings.push(it));
+            if bindings.is_empty() {
+                continue;
+            }
+            let mut stack = vec![guard];
+            while let Some(expr) = stack.pop() {
+                out.entry(expr).or_default().extend(bindings.iter().copied());
+                store.walk_child_exprs(expr, |it| stack.push(it));
+            }
+        }
+    }
+    out
 }
 
 /// A capture of a closure, in its body.
@@ -254,7 +278,34 @@ impl<'a, 'db> Ctx<'a, 'db> {
             closure_kind,
             closure_local,
             closure_expr: closure,
+            guard_bindings: guard_bindings(store),
         }
+    }
+
+    /// Whether reading the discriminant of `place` at `span` is a cast of an enum, which moves
+    /// it, as rustc casts the enum value itself (`*e as usize` is a move out of `*e`).
+    pub(crate) fn cast_moves(
+        &self,
+        body: &MirBody<'db>,
+        place: &StoredPlace,
+        span: MirSpan,
+    ) -> bool {
+        matches!(span, MirSpan::ExprId(expr) if matches!(self.store[expr], hir_def::hir::Expr::Cast { .. }))
+            && !self.is_copy(self.place_ty(body, place.local, place.projection.as_slice()).ty)
+    }
+
+    /// Whether moving `local` with `projection` at `span` moves out of a variable its `match`
+    /// arm's guard is being evaluated for (rustc's "cannot move out of `x` in pattern guard").
+    pub(crate) fn moves_out_of_guard(
+        &self,
+        local: LocalId,
+        projection: &[PlaceElem],
+        span: MirSpan,
+    ) -> bool {
+        let MirSpan::ExprId(expr) = span else { return false };
+        let Some(binding) = self.bindings.get(&local) else { return false };
+        !projection.iter().any(|it| matches!(it, hir_ty::mir::ProjectionElem::Deref))
+            && self.guard_bindings.get(&expr).is_some_and(|it| it.contains(binding))
     }
 
     pub(crate) fn place_ty(
