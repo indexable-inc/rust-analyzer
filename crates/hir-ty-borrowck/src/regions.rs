@@ -83,6 +83,10 @@ pub(super) enum UniversalKind {
     Creator,
 }
 
+/// The position among a closure's creator's regions of the enclosing item's late-bound
+/// lifetime 0, past those of the closure's type.
+pub(super) const LATE_PARENT: usize = 1 << 24;
+
 /// What a closure needs of its creator's regions that it cannot prove itself, as rustc's
 /// `ClosureOutlivesRequirement`: that the region at position `longer` among the regions of
 /// the closure's type outlives the one at `shorter`, or `'static` for `None`. With a `subject`,
@@ -434,6 +438,7 @@ pub(super) fn build<'db>(
         requirements,
         early: FxHashMap::default(),
         late: FxHashMap::default(),
+        parent_late: FxHashMap::default(),
         impl_self: None,
         returns_opaque: false,
         elided_output: None,
@@ -469,6 +474,9 @@ struct Builder<'c, 'a, 'db> {
     early: FxHashMap<u32, Region<'db>>,
     /// The universal region of each of the signature's late-bound lifetimes.
     late: FxHashMap<u32, Region<'db>>,
+    /// In a closure, the universal region of each late-bound lifetime of the enclosing item
+    /// it names, one of its creator's.
+    parent_late: FxHashMap<u32, Region<'db>>,
     /// The self type of the impl the body is in, as rust-analyzer gives it with `'_` an error,
     /// and with universal regions there: rustc's anonymous lifetime parameters of the impl.
     impl_self: Option<(Ty<'db>, Ty<'db>)>,
@@ -537,6 +545,29 @@ impl<'db> Builder<'_, '_, 'db> {
         region
     }
 
+    /// The universal region of the enclosing item's late-bound lifetime `var`: the signature's
+    /// in the item, a creator's region of a closure's, at the position [`LATE_PARENT`] + `var`,
+    /// as rustc's `for_each_late_bound_region_in_recursive_scope` makes them external.
+    fn parent_late_region(&mut self, var: u32) -> Region<'db> {
+        if self.ctx.closure_local.is_none() {
+            if let Some(&it) = self.late.get(&var) {
+                return it;
+            }
+            let region = self.new_universal(UniversalKind::Named);
+            self.late.insert(var, region);
+            return region;
+        }
+        if let Some(&it) = self.parent_late.get(&var) {
+            return it;
+        }
+        let region = self.new_universal(UniversalKind::Creator);
+        self.regions
+            .creator_positions
+            .insert(self.regions.universals.len() - 1, LATE_PARENT + var as usize);
+        self.parent_late.insert(var, region);
+        region
+    }
+
     /// `region` of the signature as a universal region; `None` for an elided one. `depth` is
     /// how many binders in the region is, those of the signature's own late-bound lifetimes
     /// being outside it.
@@ -562,6 +593,10 @@ impl<'db> Builder<'_, '_, 'db> {
                 Some(region)
             }
             RegionKind::ReBound(..) => Some(region),
+            // In a closure, a late-bound lifetime of the enclosing item is its creator's.
+            RegionKind::ReLateParam(late) if self.ctx.closure_local.is_some() => {
+                Some(self.parent_late_region(late.bound_region.var.as_u32()))
+            }
             // A late-bound lifetime the body names, the same as in the signature.
             RegionKind::ReLateParam(late) if self.ctx.closure_local.is_none() => {
                 let var = late.bound_region.var.as_u32();
@@ -844,11 +879,8 @@ impl<'db> Builder<'_, '_, 'db> {
                 continue;
             }
             let ty = data.ty.as_ref();
-            *slot = Some(if annotated.contains(&local) && self.ctx.closure_local.is_none() {
-                self.written(ty)
-            } else {
-                self.renumber(ty)
-            });
+            *slot =
+                Some(if annotated.contains(&local) { self.written(ty) } else { self.renumber(ty) });
         }
         self.regions.local_tys = local_tys.into_iter().map(|it| it.unwrap()).collect();
     }
@@ -1526,10 +1558,16 @@ impl<'db> Builder<'_, '_, 'db> {
         if regions.len() != *count {
             return;
         }
+        let mut at_position = |this: &mut Self, position: usize| match position {
+            _ if position >= LATE_PARENT => {
+                rv_of(this.parent_late_region((position - LATE_PARENT) as u32))
+            }
+            _ => regions.get(position).copied(),
+        };
         for requirement in requirements {
             let sub = match requirement.shorter {
-                Some(it) => match regions.get(it) {
-                    Some(&it) => it,
+                Some(it) => match at_position(self, it) {
+                    Some(it) => it,
                     None => continue,
                 },
                 None => self.regions.static_rv,
@@ -1543,7 +1581,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 });
                 continue;
             }
-            let Some(&sup) = regions.get(requirement.longer) else { continue };
+            let Some(sup) = at_position(self, requirement.longer) else { continue };
             if sup != sub {
                 self.regions.outlives.push(Outlives {
                     sup,
@@ -1843,7 +1881,9 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             _ => {
                 let constant = match rvalue {
-                    Rvalue::Use(operand) => self.constant_ty(operand, span),
+                    Rvalue::Use(operand) => self
+                        .constant_ty(operand, span)
+                        .or_else(|| self.written_fn_item(operand, span)),
                     _ => None,
                 };
                 if let Some(ty) = constant.or_else(|| self.rvalue_ty(rvalue, span)) {
@@ -1889,6 +1929,17 @@ impl<'db> Builder<'_, '_, 'db> {
             );
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(self_ty, written, Variance::Invariant, at);
+        }
+        Some(ty)
+    }
+
+    /// A function item used as a value whose path spells out generic arguments,
+    /// `let f = <&'static u32 as Trait>::method;`, with the lifetimes written there and its
+    /// where clauses proven, as rustc's user type annotation on the path.
+    fn written_fn_item(&mut self, operand: &Operand, span: MirSpan) -> Option<Ty<'db>> {
+        let ty = self.written_callee(operand, span)?;
+        if let TyKind::FnDef(def, args) = ty.kind() {
+            self.callee_predicates(def.0, args, operand.span().unwrap_or(span));
         }
         Some(ty)
     }
@@ -2176,8 +2227,29 @@ impl<'db> Builder<'_, '_, 'db> {
     fn terminator(&mut self, kind: &TerminatorKind, span: MirSpan) {
         match kind {
             TerminatorKind::Call { func, args, destination, .. } => {
-                let Some(func_ty) = self
-                    .written_callee(func, span)
+                // A function item called through a variable, `let f = foo::<'a>; f()`, which
+                // rust-analyzer lowers as a call of the constant, has the variable's type.
+                let local = match (&func.kind, span) {
+                    (
+                        OperandKind::Constant { .. } | OperandKind::Allocation { .. },
+                        MirSpan::ExprId(call),
+                    ) => match self.ctx.store[call] {
+                        hir_def::hir::Expr::Call { callee, .. } => self
+                            .path_local(callee)
+                            .filter(|&it| {
+                                matches!(
+                                    (self.regions.local_tys[it.into_raw().into_u32() as usize].kind(),
+                                        self.operand_ty(func).map(|it| it.kind())),
+                                    (TyKind::FnDef(a, _), Some(TyKind::FnDef(b, _))) if a == b
+                                )
+                            }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some(func_ty) = local
+                    .map(|it| self.regions.local_tys[it.into_raw().into_u32() as usize])
+                    .or_else(|| self.written_callee(func, span))
                     .or_else(|| self.constant_ty(func, span))
                     .or_else(|| self.operand_ty(func))
                 else {

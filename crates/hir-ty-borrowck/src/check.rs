@@ -146,7 +146,8 @@ pub(super) fn check<'db>(
     }
     out.extend(checker.errors.into_iter().flatten());
     out.extend(checker.move_reported.into_values().map(|(_, _, error)| error));
-    (regions.creator_positions.len(), checker.requirements)
+    let count = regions.creator_positions.values().filter(|&&it| it < regions::LATE_PARENT).count();
+    (count, checker.requirements)
 }
 
 /// rustc's `apply_member_constraint` for each region of a returned `impl Trait`'s hidden type:
