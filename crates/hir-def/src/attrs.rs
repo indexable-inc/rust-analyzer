@@ -163,7 +163,10 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     "used" => attr_flags.insert(AttrFlags::USED),
                     "inline" if !tt.syntax().text().contains_char('n') => {
-                        attr_flags.insert(AttrFlags::IS_INLINE)
+                        attr_flags.insert(AttrFlags::IS_INLINE);
+                        if tt.syntax().text().to_string().contains("always") {
+                            attr_flags.insert(AttrFlags::INLINE_ALWAYS)
+                        }
                     }
                     "inline" if tt.syntax().text().to_string().contains("never") => {
                         attr_flags.insert(AttrFlags::INLINE_NEVER)
@@ -386,6 +389,8 @@ bitflags::bitflags! {
         const USED = 1 << 60;
         /// `#[inline(never)]`: not built into its callers, also where they are optimized.
         const INLINE_NEVER = 1 << 61;
+        /// `#[inline(always)]`: built into its callers where they are optimized.
+        const INLINE_ALWAYS = 1 << 62;
     }
 }
 

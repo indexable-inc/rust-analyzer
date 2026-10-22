@@ -58,7 +58,7 @@ pub use crate::{
         SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder,
     },
 };
-pub use parser::{Edition, SyntaxKind, T};
+pub use parser::{Edition, LexedStr, SyntaxKind, T};
 pub use rowan::{
     Direction, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset, WalkEvent,
     api::Preorder,

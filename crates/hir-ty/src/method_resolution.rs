@@ -40,7 +40,7 @@ use rustc_type_ir::{
     try_visit,
 };
 use stdx::impl_from;
-use syntax::SyntaxKind;
+use syntax::{SyntaxKind, T, TextSize};
 use triomphe::Arc;
 
 use crate::{
@@ -638,27 +638,84 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
 /// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
 /// name, and those are looked into in every crate. A function can hold one as well, of a type
 /// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
-/// functions are looked into in the crates of the workspace alone: lowering every body of
-/// every dependency for this is too much.
+/// a workspace crate's functions are all looked into. Lowering every body of every dependency
+/// for this is too much, so a dependency's function is looked into when lexing its file finds
+/// an impl in it (bincode's `deserialize_enum` holds its `EnumAccess` for `&mut Deserializer`).
 fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
-    if !krate.data(db).origin.is_local() {
-        return holders;
-    }
+    let local = krate.data(db).origin.is_local();
+    let holds = |it: FunctionId| local || holds_impl(db, it);
     let declared = scope.declarations().filter_map(|def| match def {
-        ModuleDefId::FunctionId(it) => Some(DefWithBodyId::from(it)),
-        ModuleDefId::StaticId(it) => Some(DefWithBodyId::from(it)),
+        ModuleDefId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
+        ModuleDefId::StaticId(it) if local => Some(DefWithBodyId::from(it)),
         _ => None,
     });
     holders.extend(declared);
     let in_impls =
         scope.impls().flat_map(|it| &it.impl_items(db).items).filter_map(|(_, item)| match *item {
-            AssocItemId::FunctionId(it) => Some(DefWithBodyId::from(it)),
-            AssocItemId::ConstId(it) => Some(DefWithBodyId::from(it)),
-            AssocItemId::TypeAliasId(_) => None,
+            AssocItemId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
+            AssocItemId::ConstId(it) if local => Some(DefWithBodyId::from(it)),
+            _ => None,
         });
     holders.extend(in_impls);
     holders
+}
+
+/// Whether an impl of [`impls_in_bodies`] is in the text of `function`. The file is parsed for
+/// the function's range only when its lexing found one.
+fn holds_impl(db: &dyn HirDatabase, function: FunctionId) -> bool {
+    let ast_id = function.loc(db).id;
+    let Some(file) = ast_id.file_id.file_id() else { return false };
+    let at = impls_in_bodies(db, file);
+    if at.is_empty() {
+        return false;
+    }
+    let range = ast_id.file_id.ast_id_map(db).get(ast_id.value).text_range();
+    at.iter().any(|&it| range.contains(it))
+}
+
+/// Where `file` writes an impl in the body of a function, found by its tokens: an `impl` after
+/// `{`, `}`, `;`, an attribute or `unsafe`, inside the braces that follow `fn name`. A macro's
+/// `impl` is found as well, which costs a lowering and nothing else.
+#[salsa::tracked(returns(deref))]
+fn impls_in_bodies(db: &dyn HirDatabase, file: base_db::EditionedFileId) -> Box<[TextSize]> {
+    let text = db.file_text(file.file_id(db)).text(db);
+    let lexed = syntax::LexedStr::new(file.edition(db), text);
+    // For each open brace, whether it is a function's body.
+    let mut braces = Vec::new();
+    let mut bodies = 0usize;
+    // The parentheses and brackets open: a `;` in `-> [u8; 4]` does not end the signature.
+    let mut nested = 0usize;
+    let mut signature = None;
+    let mut previous = SyntaxKind::EOF;
+    let mut found = Vec::new();
+    for i in 0..lexed.len() {
+        let kind = lexed.kind(i);
+        if kind.is_trivia() {
+            continue;
+        }
+        match kind {
+            SyntaxKind::IDENT if previous == T![fn] => signature = Some(nested),
+            T!['('] | T!['['] => nested += 1,
+            T![')'] | T![']'] => nested = nested.saturating_sub(1),
+            T![;] if signature == Some(nested) => signature = None,
+            T!['{'] => {
+                let body = signature.take().is_some();
+                bodies += usize::from(body);
+                braces.push(body);
+            }
+            T!['}'] => bodies -= usize::from(braces.pop().unwrap_or(false)),
+            T![impl]
+                if bodies > 0
+                    && matches!(previous, T!['{'] | T!['}'] | T![;] | T![']'] | T![unsafe]) =>
+            {
+                found.push(TextSize::from(lexed.text_start(i) as u32));
+            }
+            _ => {}
+        }
+        previous = kind;
+    }
+    found.into()
 }
 
 /// What finding the impls of `krate` asks of each impl and of each body that may hold one.
