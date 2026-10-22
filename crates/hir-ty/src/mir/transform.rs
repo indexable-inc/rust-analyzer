@@ -77,8 +77,13 @@ impl<'db> Ctx<'db> {
             return ty;
         }
         let mut ocx = ObligationCtxt::new(&self.infcx);
-        ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty)
-            .unwrap_or_else(|_| Ty::new_error(self.infcx.interner, ErrorGuaranteed))
+        // One the solver can't decide comes back as a variable, and stays the alias, which
+        // `needs_drop` takes as maybe having something to drop.
+        match ocx.structurally_normalize_ty(&ObligationCause::dummy(), self.env, ty) {
+            Ok(normalized) if matches!(normalized.kind(), TyKind::Infer(_)) => ty,
+            Ok(normalized) => normalized,
+            Err(_) => Ty::new_error(self.infcx.interner, ErrorGuaranteed),
+        }
     }
 
     fn has_destructor(&self, adt: hir_def::AdtId) -> bool {

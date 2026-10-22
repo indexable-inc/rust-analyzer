@@ -99,7 +99,12 @@ fn has_drop_glue_impl<'db>(
     visited: &mut FxHashSet<Ty<'db>>,
 ) -> DropGlue {
     let mut ocx = ObligationCtxt::new(infcx);
-    let ty = ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty);
+    // An alias the solver can't decide under `env` comes back as the variable it was to equal,
+    // which is no type: it stays the alias, which may have drop glue.
+    let ty = match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty) {
+        Ok(normalized) if !matches!(normalized.kind(), TyKind::Infer(_)) => normalized,
+        _ => ty,
+    };
 
     if !visited.insert(ty) {
         // Recursive type.
