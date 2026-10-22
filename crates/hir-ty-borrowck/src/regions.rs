@@ -1721,7 +1721,7 @@ impl<'db> Builder<'_, '_, 'db> {
         }
         match ty.kind() {
             TyKind::Ref(region, inner, _) => {
-                if let Some(shorter) = rv_of(region) {
+                if let Some(shorter) = self.region_rv(region) {
                     let referent = match inner.kind() {
                         TyKind::Alias(_) => self.normalize(inner).unwrap_or(inner),
                         _ => inner,
@@ -1810,7 +1810,14 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                 }
             }
-            TyKind::Alias(_) => {
+            // A projection implies what its arguments' well-formedness does as well as what its
+            // normalized type does: `<&'a &'b () as Trait>::Type` that `'b: 'a`.
+            TyKind::Alias(alias) => {
+                if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind {
+                    for it in alias.args.types() {
+                        self.implied_bounds(it, pairs, seen, depth + 1);
+                    }
+                }
                 if let Some(normalized) = self.normalize(ty)
                     && normalized != ty
                 {
@@ -2076,7 +2083,30 @@ impl<'db> Builder<'_, '_, 'db> {
                         (
                             rustc_type_ir::ExistentialPredicate::Trait(x),
                             rustc_type_ir::ExistentialPredicate::Trait(y),
-                        ) => self.relate_args(x.args, y.args, None, Variance::Invariant, at),
+                        ) if x.def_id == y.def_id => {
+                            self.relate_args(x.args, y.args, None, Variance::Invariant, at)
+                        }
+                        // An upcast, `dyn Foo<'static>` to `dyn Bar<'static, 'a>` with
+                        // `trait Foo<'a>: Bar<'a, 'a>`: the supertrait as the source's
+                        // arguments instantiate it is the target's.
+                        (
+                            rustc_type_ir::ExistentialPredicate::Trait(x),
+                            rustc_type_ir::ExistentialPredicate::Trait(y),
+                        ) => {
+                            let interner = self.interner();
+                            let source = rustc_type_ir::Binder::dummy(
+                                x.with_self_ty(interner, Ty::new_unit(interner)),
+                            );
+                            let found = rustc_type_ir::elaborate::supertraits(interner, source)
+                                .find(|it| it.def_id() == y.def_id)
+                                .and_then(|it| it.no_bound_vars());
+                            if let Some(found) = found {
+                                let args = GenericArgs::new_from_iter(
+                                    found.args.iter().skip(1).collect::<Vec<_>>(),
+                                );
+                                self.relate_args(args, y.args, None, Variance::Invariant, at);
+                            }
+                        }
                         // `dyn Foo<Bar = &'a u32>`: the binding is invariant.
                         (
                             rustc_type_ir::ExistentialPredicate::Projection(x),
@@ -2255,7 +2285,20 @@ impl<'db> Builder<'_, '_, 'db> {
         };
         let expr = self.callee_expr(func, call)?;
         match &self.ctx.store[expr] {
-            hir_def::hir::Expr::Path(path) if spells_generics(path) => Some(self.written(ty)),
+            hir_def::hir::Expr::Path(path) if spells_generics(path) => {
+                let ty = self.written(ty);
+                if let TyKind::FnDef(def, args) = ty.kind()
+                    && let CallableDefId::FunctionId(function) = def.0
+                {
+                    let container = function.lookup(self.ctx.db).container;
+                    let parent =
+                        hir_ty::generics::generics(self.ctx.db, function.into()).len_parent();
+                    let args =
+                        GenericArgs::new_from_iter(args.iter().take(parent).collect::<Vec<_>>());
+                    self.written_self(path, container, args, MirSpan::ExprId(expr));
+                }
+                Some(ty)
+            }
             // `x.f::<&'a T>()`: the method's own arguments as written, the impl's or trait's
             // inferred.
             hir_def::hir::Expr::MethodCall { generic_args: Some(_), .. } => {
@@ -2419,13 +2462,28 @@ impl<'db> Builder<'_, '_, 'db> {
         if let MirSpan::ExprId(expr) = span {
             self.path_well_formed(expr, id.lookup(db).container, args, span);
         }
-        let written = path.and_then(|path| match path.type_anchor() {
+        if let Some(path) = path {
+            self.written_self(path, id.lookup(db).container, args, span);
+        }
+        Some(ty)
+    }
+
+    /// For an associated item named through a written self type, `<Foo<'a>>::C` or
+    /// `Foo::<'a>::new`, that type equal to the impl's or the trait's self type.
+    fn written_self(
+        &mut self,
+        path: &hir_def::expr_store::path::Path,
+        container: ItemContainerId,
+        args: GenericArgs<'db>,
+        span: MirSpan,
+    ) {
+        let written = match path.type_anchor() {
             Some(anchor) => Some(self.lower_written(anchor, span)),
             None => self.lower_written_qualifier(path, span),
-        });
-        let self_ty = match id.lookup(db).container {
+        };
+        let self_ty = match container {
             ItemContainerId::ImplId(impl_) => Some(self.declared(
-                db.impl_self_ty(impl_).instantiate(self.interner(), args).skip_norm_wip(),
+                self.ctx.db.impl_self_ty(impl_).instantiate(self.interner(), args).skip_norm_wip(),
             )),
             ItemContainerId::TraitId(_) => args.types().next(),
             _ => None,
@@ -2437,7 +2495,6 @@ impl<'db> Builder<'_, '_, 'db> {
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(self_ty, written, Variance::Invariant, at);
         }
-        Some(ty)
     }
 
     /// A function item used as a value whose path spells out generic arguments,

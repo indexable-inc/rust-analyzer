@@ -140,7 +140,11 @@ impl<'db> CastCheck<'db> {
             )
             .is_ok()
         {
-            ctx.result.coercion_casts.insert(self.source_expr);
+            // Raw pointers whose pointees differ only in lifetimes, which inference cannot
+            // tell apart, stay a cast, as rustc's `check_cast` keeps them (rust-lang/rust#113257).
+            if !(self.expr_ty.is_raw_ptr() && self.cast_ty.is_raw_ptr()) {
+                ctx.result.coercion_casts.insert(self.source_expr);
+            }
             return Ok(());
         }
 
