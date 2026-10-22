@@ -1056,10 +1056,36 @@ impl<'db> Builder<'_, '_, 'db> {
         local_tys[env_local.into_raw().into_u32() as usize] = Some(closure);
         for (index, (&local, ty)) in params.iter().zip(inputs.iter()).enumerate() {
             let ty = self.elided_own(index, ty).unwrap_or(ty);
+            let ty = self.written_object_default(index, ty).unwrap_or(ty);
             local_tys[local.into_raw().into_u32() as usize] = Some(ty);
         }
         local_tys[super::return_slot().into_raw().into_u32() as usize] = Some(sig.output());
         true
+    }
+
+    /// The closure's parameter `index` written `&dyn Trait`, as `&'r (dyn Trait + 'r)` with
+    /// its reference's lifetime, as rustc's object lifetime default, where inference gave the
+    /// object a region of its own.
+    fn written_object_default(&mut self, index: usize, ty: Ty<'db>) -> Option<Ty<'db>> {
+        let closure = self.ctx.closure_expr?;
+        let hir_def::hir::Expr::Closure { arg_types, .. } = &self.ctx.store[closure] else {
+            return None;
+        };
+        let written = self.lower_written((*arg_types.get(index)?)?, MirSpan::ExprId(closure));
+        let TyKind::Ref(_, written, _) = written.kind() else { return None };
+        let TyKind::Dynamic(_, object) = written.kind() else { return None };
+        if !matches!(object.kind(), RegionKind::ReStatic) || writes_static_object(self.ctx.store) {
+            return None;
+        }
+        let TyKind::Ref(region, inner, mutability) = ty.kind() else { return None };
+        let TyKind::Dynamic(predicates, _) = inner.kind() else { return None };
+        let interner = self.interner();
+        Some(Ty::new_ref(
+            interner,
+            region,
+            Ty::new_dynamic(interner, predicates, region),
+            mutability,
+        ))
     }
 
     /// The type of the closure's parameter `index`, where the closure is typed without an
@@ -2256,7 +2282,7 @@ impl<'db> Builder<'_, '_, 'db> {
     }
 
     fn type_outlives_at(&mut self, ty: Ty<'db>, region: Region<'db>, at: At, depth: usize) {
-        let Some(rv) = rv_of(region) else { return };
+        let Some(rv) = self.region_rv(region) else { return };
         let mut components = Vec::new();
         let mut params = Vec::new();
         outlives_components(ty, &mut components, &mut params);
@@ -2292,13 +2318,15 @@ impl<'db> Builder<'_, '_, 'db> {
         {
             return;
         }
-        if let Some(normalized) = self.normalize(ty)
+        let opaque = matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. });
+        if !opaque
+            && let Some(normalized) = self.normalize(ty)
             && !matches!(normalized.kind(), TyKind::Alias(_) | TyKind::Infer(_))
         {
             self.type_outlives_at(normalized, region, at, depth + 1);
             return;
         }
-        let Some(rv) = rv_of(region) else { return };
+        let Some(rv) = self.region_rv(region) else { return };
         let interner = self.interner();
         let erase = |ty: Ty<'db>| {
             rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
@@ -2322,8 +2350,14 @@ impl<'db> Builder<'_, '_, 'db> {
             has_regions |= !matches!(region.kind(), RegionKind::ReBound(..));
             region
         });
-        if !in_env && from_trait.is_empty() && has_regions {
-            for arg in alias.args.iter() {
+        if !in_env && from_trait.is_empty() && (has_regions || opaque) {
+            let captured = opaque
+                .then(|| opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len()))
+                .flatten();
+            for (index, arg) in alias.args.iter().enumerate() {
+                if captured.as_ref().is_some_and(|it| !it[index]) {
+                    continue;
+                }
                 match arg.kind() {
                     GenericArgKind::Lifetime(it) => {
                         if let Some(longer) = self.region_rv(it) {
@@ -2961,6 +2995,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                     _ => None,
                 };
+                let mut annotated = false;
                 let args = match span {
                     _ if let Some(args) = self_args => args,
                     _ if let Some(args) = through_local => args,
@@ -2969,10 +3004,18 @@ impl<'db> Builder<'_, '_, 'db> {
                             || matches!(store[expr],
                                 hir_def::hir::Expr::Call { callee, .. } if spelled(callee)) =>
                     {
+                        annotated = true;
                         self.written(args.as_ref())
                     }
                     _ => self.renumber(args.as_ref()),
                 };
+                // The arguments a path spells out are well-formed, as rustc's user type
+                // annotation: `Outer::<T, Inner<T>> { .. }` where `struct Inner<T: 'static>`.
+                if annotated {
+                    for ty in args.types() {
+                        self.well_formed(ty, boring, 0);
+                    }
+                }
                 let fields = self.ctx.db.field_types(*variant);
                 for ((_, field), operand) in fields.iter().zip(operands.iter()) {
                     let field = field.ty().instantiate(self.interner(), args).skip_norm_wip();
@@ -3936,6 +3979,9 @@ pub(super) fn outlives_components<'db>(
         TyKind::Closure(_, args) => {
             outlives_components(args.as_closure().tupled_upvars_ty(), regions, params)
         }
+        TyKind::Coroutine(_, args) => {
+            outlives_components(args.as_coroutine().tupled_upvars_ty(), regions, params)
+        }
         TyKind::Tuple(tys) => {
             for it in tys.iter() {
                 outlives_components(it, regions, params);
@@ -3948,8 +3994,8 @@ pub(super) fn outlives_components<'db>(
     }
 }
 
-/// The associated types among what `outlives_components` splits `ty` into, which it leaves
-/// out.
+/// The associated and opaque types among what `outlives_components` splits `ty` into, which
+/// it leaves out.
 pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
     let args = |args: GenericArgs<'db>, out: &mut Vec<Ty<'db>>| {
         for it in args.types() {
@@ -3958,7 +4004,11 @@ pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
     };
     match ty.kind() {
         TyKind::Alias(alias)
-            if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
+            if matches!(
+                alias.kind,
+                rustc_type_ir::AliasTyKind::Projection { .. }
+                    | rustc_type_ir::AliasTyKind::Opaque { .. }
+            ) =>
         {
             out.push(ty)
         }
@@ -3975,6 +4025,7 @@ pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
         }
         TyKind::Adt(_, it) | TyKind::FnDef(_, it) => args(it, out),
         TyKind::Closure(_, it) => alias_components(it.as_closure().tupled_upvars_ty(), out),
+        TyKind::Coroutine(_, it) => alias_components(it.as_coroutine().tupled_upvars_ty(), out),
         TyKind::Tuple(tys) => {
             for it in tys.iter() {
                 alias_components(it, out);
