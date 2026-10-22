@@ -210,6 +210,9 @@ pub(super) fn region_liveness<'db>(
             effects[point] = effects_at(body, cfg.location(point));
         }
     }
+    for &(local, location) in &regions.callee_reads {
+        effects[cfg.point(location)].uses.push(local);
+    }
     // A drop of what cannot be initialized there does nothing.
     let (maybe_init, init_at_exit) = maybe_initialized_at_drops(body, cfg, moves);
     for (point, it) in effects.iter_mut().enumerate() {

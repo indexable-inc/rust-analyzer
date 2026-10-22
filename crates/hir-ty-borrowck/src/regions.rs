@@ -147,6 +147,9 @@ pub(super) struct Regions<'db> {
     /// The body returns an `impl Trait` that captures no lifetime, of a hidden type that names
     /// no other alias: what it returns must be `'static`, rustc's `OpaqueType` constraint.
     pub(super) returns_static_opaque: bool,
+    /// A variable a function item or constructor is called through, read at the call: rust-
+    /// analyzer lowers `f(x)` with `let f = Foo::<&'a u32>` as a call of the item itself.
+    pub(super) callee_reads: Vec<(LocalId, Location)>,
 }
 
 impl<'db> Regions<'db> {
@@ -437,6 +440,7 @@ pub(super) fn build<'db>(
             creator_positions: FxHashMap::default(),
             members: Vec::new(),
             returns_static_opaque: false,
+            callee_reads: Vec::new(),
             choices: Vec::new(),
         },
         requirements,
@@ -1269,6 +1273,20 @@ impl<'db> Builder<'_, '_, 'db> {
 
     /// The local of the variable `expr` names, if it is a path to one of this body's.
     fn path_local(&self, expr: hir_def::hir::ExprId) -> Option<LocalId> {
+        self.body.binding_locals.get(self.path_binding(expr)?).copied()
+    }
+
+    /// The variable a call's callee names, a capture of this closure's too.
+    fn callee_local(&self, expr: hir_def::hir::ExprId) -> Option<LocalId> {
+        let binding = self.path_binding(expr)?;
+        self.body
+            .binding_locals
+            .get(binding)
+            .copied()
+            .or_else(|| self.ctx.upvars.iter().find(|it| it.binding == binding).map(|it| it.local))
+    }
+
+    fn path_binding(&self, expr: hir_def::hir::ExprId) -> Option<hir_def::hir::BindingId> {
         use hir_def::resolver::{HasResolver, ValueNs};
         let hir_def::hir::Expr::Path(path) = &self.ctx.store[expr] else { return None };
         let db = self.ctx.db;
@@ -1277,7 +1295,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let _guard = resolver.update_to_inner_scope(db, owner.expression_store_owner(db), expr);
         let hygiene = self.ctx.store.expr_path_hygiene(expr);
         match resolver.resolve_path_in_value_ns_fully(db, path, hygiene)? {
-            ValueNs::LocalBinding(binding) => self.body.binding_locals.get(binding).copied(),
+            ValueNs::LocalBinding(binding) => Some(binding),
             _ => None,
         }
     }
@@ -1945,12 +1963,25 @@ impl<'db> Builder<'_, '_, 'db> {
                 self.relate_regions(ra, rb, variance, at);
                 for (x, y) in pa.iter().zip(pb.iter()) {
                     let (x, y) = (x.skip_binder(), y.skip_binder());
-                    if let (
-                        rustc_type_ir::ExistentialPredicate::Trait(x),
-                        rustc_type_ir::ExistentialPredicate::Trait(y),
-                    ) = (x, y)
-                    {
-                        self.relate_args(x.args, y.args, None, Variance::Invariant, at);
+                    match (x, y) {
+                        (
+                            rustc_type_ir::ExistentialPredicate::Trait(x),
+                            rustc_type_ir::ExistentialPredicate::Trait(y),
+                        ) => self.relate_args(x.args, y.args, None, Variance::Invariant, at),
+                        // `dyn Foo<Bar = &'a u32>`: the binding is invariant.
+                        (
+                            rustc_type_ir::ExistentialPredicate::Projection(x),
+                            rustc_type_ir::ExistentialPredicate::Projection(y),
+                        ) if x.def_id == y.def_id => {
+                            self.relate_args(x.args, y.args, None, Variance::Invariant, at);
+                            if let (Some(x), Some(y)) = (
+                                rustc_type_ir::inherent::Term::as_type(&x.term),
+                                rustc_type_ir::inherent::Term::as_type(&y.term),
+                            ) {
+                                self.relate(x, y, Variance::Invariant, at);
+                            }
+                        }
+                        _ => (),
                     }
                 }
             }
@@ -2256,6 +2287,22 @@ impl<'db> Builder<'_, '_, 'db> {
         })
     }
 
+    /// The arguments of the self type of the impl this body is in, with the signature's
+    /// lifetimes, where it is `adt`.
+    fn impl_self_args(&mut self, adt: AdtId) -> Option<GenericArgs<'db>> {
+        let db = self.ctx.db;
+        let GenericDefId::FunctionId(function) = self.ctx.owner.generic_def(db) else {
+            return None;
+        };
+        let ItemContainerId::ImplId(impl_) = function.lookup(db).container else { return None };
+        let ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
+        let TyKind::Adt(def, args) = ty.kind() else { return None };
+        if def.def_id() != adt {
+            return None;
+        }
+        Some(self.written(args))
+    }
+
     /// A type written in the body, lowered as inference lowers it, its lifetimes the
     /// signature's where it names them.
     fn lower_written(&self, type_ref: hir_def::type_ref::TypeRefId, span: MirSpan) -> Ty<'db> {
@@ -2388,22 +2435,57 @@ impl<'db> Builder<'_, '_, 'db> {
                 // the variable's arguments.
                 let through_local = match span {
                     MirSpan::ExprId(expr) => match store[expr] {
-                        hir_def::hir::Expr::Call { callee, .. } => self
-                            .path_local(callee)
-                            .map(|it| self.regions.local_tys[it.into_raw().into_u32() as usize])
-                            .and_then(|it| match it.kind() {
-                                TyKind::FnDef(def, args)
-                                    if !matches!(def.0, CallableDefId::FunctionId(_)) =>
-                                {
-                                    Some(args)
+                        hir_def::hir::Expr::Call { callee, .. } => {
+                            self.callee_local(callee).and_then(|local| {
+                                let ty =
+                                    self.regions.local_tys[local.into_raw().into_u32() as usize];
+                                let ty = match ty.kind() {
+                                    TyKind::Ref(_, inner, _) => inner,
+                                    _ => ty,
+                                };
+                                match ty.kind() {
+                                    TyKind::FnDef(def, args)
+                                        if !matches!(def.0, CallableDefId::FunctionId(_)) =>
+                                    {
+                                        if let Some(location) = self.location {
+                                            self.regions.callee_reads.push((local, location));
+                                        }
+                                        Some(args)
+                                    }
+                                    _ => None,
                                 }
-                                _ => None,
-                            }),
+                            })
+                        }
                         _ => None,
                     },
                     _ => None,
                 };
+                let db = self.ctx.db;
+                let adt_of = |variant: hir_def::VariantId| match variant {
+                    hir_def::VariantId::EnumVariantId(it) => AdtId::EnumId(it.lookup(db).parent),
+                    hir_def::VariantId::StructId(it) => AdtId::StructId(it),
+                    hir_def::VariantId::UnionId(it) => AdtId::UnionId(it),
+                };
+                let names_self = |expr| match &store[expr] {
+                    hir_def::hir::Expr::RecordLit { path, .. } | hir_def::hir::Expr::Path(path) => {
+                        path.is_self_type()
+                    }
+                    _ => false,
+                };
+                // `Self { .. }` and `Self(..)` in an impl are the impl's self type, with its
+                // lifetimes: in `impl MyStruct<'_>`, not a `MyStruct<'a>`.
+                let self_args = match span {
+                    MirSpan::ExprId(expr)
+                        if names_self(expr)
+                            || matches!(store[expr],
+                                hir_def::hir::Expr::Call { callee, .. } if names_self(callee)) =>
+                    {
+                        self.impl_self_args(adt_of(*variant))
+                    }
+                    _ => None,
+                };
                 let args = match span {
+                    _ if let Some(args) = self_args => args,
                     _ if let Some(args) = through_local => args,
                     MirSpan::ExprId(expr)
                         if spelled(expr)
@@ -2422,13 +2504,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.relate(ty, field, Variance::Covariant, at);
                     }
                 }
-                let adt = match variant {
-                    hir_def::VariantId::EnumVariantId(it) => {
-                        AdtId::EnumId(it.lookup(self.ctx.db).parent)
-                    }
-                    hir_def::VariantId::StructId(it) => AdtId::StructId(*it),
-                    hir_def::VariantId::UnionId(it) => AdtId::UnionId(*it),
-                };
+                let adt = adt_of(*variant);
                 self.predicates(adt.into(), args, boring, true);
                 Some(Ty::new_adt(self.interner(), adt, args))
             }
@@ -2559,7 +2635,19 @@ impl<'db> Builder<'_, '_, 'db> {
             (TyKind::Dynamic(..), TyKind::Dynamic(..)) => {
                 self.relate(source, target, Variance::Covariant, at)
             }
-            (_, TyKind::Dynamic(_, region)) => self.type_outlives(source, region, at),
+            // The value implements the object's trait, with what the impl proving it needs:
+            // `impl<T: 'static> Gettable<T> for S<T>` makes `&S<&'a u8> as &dyn Gettable<_>`
+            // need `'a: 'static`.
+            (_, TyKind::Dynamic(predicates, region)) => {
+                self.type_outlives(source, region, at);
+                for predicate in predicates.iter() {
+                    if let rustc_type_ir::ExistentialPredicate::Trait(principal) =
+                        predicate.skip_binder()
+                    {
+                        self.prove(principal.with_self_ty(self.interner(), source), at);
+                    }
+                }
+            }
             _ => self.relate(source, target, Variance::Covariant, at),
         }
     }
@@ -2588,6 +2676,9 @@ impl<'db> Builder<'_, '_, 'db> {
                     },
                     _ => None,
                 };
+                if let (Some(local), Some(location)) = (local, self.location) {
+                    self.regions.callee_reads.push((local, location));
+                }
                 let Some(func_ty) = local
                     .map(|it| self.regions.local_tys[it.into_raw().into_u32() as usize])
                     .or_else(|| self.written_callee(func, span))

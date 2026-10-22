@@ -197,6 +197,87 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
     found
 }
 
+/// The temporaries a `const` or `static` item's value borrows that rustc promotes there: in
+/// a const context a call of a `const fn` is promotable too, as are the literals, constants
+/// and aggregates its arguments are made of, of a type with no drop glue and no interior
+/// mutability (`Ms::new(&[M::new("a")])`).
+fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
+    let mut found = FxHashSet::default();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
+                && let MirSpan::ExprId(expr) = statement.span
+                && let Expr::Ref { expr: inner, .. } = ctx.store[expr]
+                && place.projection.is_empty()
+                && const_promotable(ctx, body, inner, 0)
+            {
+                let ty = body.locals[place.local].ty.as_ref();
+                if hir_ty::drop::is_freeze(ctx.db, ctx.infcx.interner, ty)
+                    && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
+                        == hir_ty::drop::DropGlue::None
+                {
+                    found.insert(place.local);
+                }
+            }
+        }
+    }
+    found
+}
+
+fn const_promotable(
+    ctx: &Ctx<'_, '_>,
+    body: &MirBody<'_>,
+    expr: hir_def::hir::ExprId,
+    depth: usize,
+) -> bool {
+    use hir_def::resolver::{HasResolver, ValueNs};
+    if depth > 16 {
+        return false;
+    }
+    let all = |exprs: Vec<hir_def::hir::ExprId>| {
+        exprs.into_iter().all(|it| const_promotable(ctx, body, it, depth + 1))
+    };
+    match &ctx.store[expr] {
+        Expr::Literal(_) => true,
+        Expr::Path(path) => {
+            let owner = body.owner;
+            let mut resolver = owner.resolver(ctx.db);
+            let _guard =
+                resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
+            let hygiene = ctx.store.expr_path_hygiene(expr);
+            !matches!(
+                resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene),
+                None | Some(ValueNs::LocalBinding(_) | ValueNs::StaticId(_))
+            )
+        }
+        Expr::Array(Array::ElementList { elements }) => all(elements.to_vec()),
+        Expr::Array(Array::Repeat { initializer, .. }) => {
+            const_promotable(ctx, body, *initializer, depth + 1)
+        }
+        Expr::Tuple { exprs } => all(exprs.to_vec()),
+        Expr::RecordLit { fields, spread: hir_def::hir::RecordSpread::None, .. } => {
+            all(fields.iter().map(|it| it.expr).collect())
+        }
+        Expr::Ref { expr, .. } | Expr::Cast { expr, .. } => {
+            const_promotable(ctx, body, *expr, depth + 1)
+        }
+        Expr::Call { callee, args } => {
+            let callable = match ctx.infer.expr_ty(*callee).kind() {
+                TyKind::FnDef(def, _) => match def.0 {
+                    hir_def::CallableDefId::StructId(_)
+                    | hir_def::CallableDefId::EnumVariantId(_) => true,
+                    hir_def::CallableDefId::FunctionId(func) => {
+                        hir_def::signatures::FunctionSignature::of(ctx.db, func).is_const()
+                    }
+                },
+                _ => false,
+            };
+            callable && all(args.to_vec())
+        }
+        _ => false,
+    }
+}
+
 impl Loans {
     pub(super) fn gather<'db>(
         ctx: &Ctx<'_, 'db>,
@@ -231,6 +312,7 @@ impl Loans {
         );
         if item {
             statics.extend(extended_temporaries(ctx, body));
+            statics.extend(const_promoted(ctx, body));
         }
         // A function item is a constant of a type with no data, promoted where it is borrowed:
         // `&Trait::method`, which inference may leave without a type when it cannot tell `Self`.
