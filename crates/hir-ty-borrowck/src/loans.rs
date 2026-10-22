@@ -164,7 +164,8 @@ pub(super) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
 
 /// The temporaries a `const` or `static` item's value borrows where rustc extends their
 /// lifetime, into the value itself: the operand of a `&` the value is, or that is an element,
-/// a field, a block's value or a cast operand of such.
+/// a field, a tuple struct's or variant's constructor argument, a block's value or a cast
+/// operand of such.
 fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
     let mut refs = FxHashSet::default();
     let mut stack: Vec<_> = ctx.store.expr_roots().next_back().into_iter().collect();
@@ -177,6 +178,17 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
             Expr::Array(Array::ElementList { elements }) => stack.extend(elements.iter().copied()),
             Expr::Tuple { exprs } => stack.extend(exprs.iter().copied()),
             Expr::RecordLit { fields, .. } => stack.extend(fields.iter().map(|it| it.expr)),
+            Expr::Call { callee, args }
+                if ctx.infer.variant_resolution_for_expr(*callee).is_some()
+                    || matches!(&ctx.store[*callee], Expr::Path(path) if path.is_self_type())
+                        && matches!(
+                            ctx.infer.expr_ty(*callee).kind(),
+                            TyKind::FnDef(def, _)
+                                if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))
+                        ) =>
+            {
+                stack.extend(args.iter().copied())
+            }
             Expr::Block { tail: Some(tail), .. } => stack.push(*tail),
             Expr::Cast { expr, .. } => stack.push(*expr),
             _ => (),

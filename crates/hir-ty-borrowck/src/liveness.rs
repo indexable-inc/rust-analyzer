@@ -59,7 +59,43 @@ fn assigned(local: LocalId, projection: &[PlaceElem], effects: &mut Effects) {
     }
 }
 
-fn effects_at(body: &MirBody<'_>, location: Location) -> Effects {
+/// The values of expression statements (`match x { None => &temp(), Some(it) => it };`),
+/// which lowering reads once the statement's temporaries are dropped, and rustc does not; with,
+/// for a `match`, the type of its value, which tells that read from the read of what it matches
+/// (they have the same span), where the two types differ.
+fn statement_values<'db>(ctx: &Ctx<'_, 'db>) -> FxHashMap<hir_def::hir::ExprId, Option<Ty<'db>>> {
+    let erased = |ty: Ty<'db>| {
+        rustc_type_ir::fold_regions(ctx.infcx.interner, ty, |_, _| {
+            Region::new_erased(ctx.infcx.interner)
+        })
+    };
+    let mut found = FxHashMap::default();
+    for (_, expr) in ctx.store.exprs() {
+        let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
+        for statement in statements.iter() {
+            let hir_def::hir::Statement::Expr { expr, .. } = statement else { continue };
+            match ctx.store[*expr] {
+                hir_def::hir::Expr::Match { expr: matched, .. } => {
+                    let value = erased(ctx.infer.expr_ty(*expr));
+                    if value != erased(ctx.infer.expr_ty(matched)) {
+                        found.insert(*expr, Some(value));
+                    }
+                }
+                _ => {
+                    found.insert(*expr, None);
+                }
+            }
+        }
+    }
+    found
+}
+
+fn effects_at<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &MirBody<'db>,
+    location: Location,
+    statement_values: &FxHashMap<hir_def::hir::ExprId, Option<Ty<'db>>>,
+) -> Effects {
     let mut effects = Effects::default();
     let data = &body.basic_blocks[location.block];
     if let Some(statement) = data.statements.get(location.statement) {
@@ -78,6 +114,17 @@ fn effects_at(body: &MirBody<'_>, location: Location) -> Effects {
                 }
                 assigned(place.local, place.projection.as_slice(), &mut effects);
             }
+            StatementKind::FakeRead(place)
+                if let hir_ty::mir::MirSpan::ExprId(expr) = statement.span
+                    && let Some(value) = statement_values.get(&expr)
+                    && value.is_none_or(|value| {
+                        place.projection.is_empty()
+                            && rustc_type_ir::fold_regions(
+                                ctx.infcx.interner,
+                                body.locals[place.local].ty.as_ref(),
+                                |_, _| Region::new_erased(ctx.infcx.interner),
+                            ) == value
+                    }) => {}
             StatementKind::FakeRead(place) => {
                 place_uses(place.local, place.projection.as_slice(), &mut effects.uses)
             }
@@ -205,9 +252,10 @@ pub(super) fn region_liveness<'db>(
     let size = cfg.points + regions.universals.len();
     let mut values = vec![BitSet::new(size); count];
     let mut effects: Vec<Effects> = (0..cfg.points).map(|_| Effects::default()).collect();
+    let statement_values = statement_values(ctx);
     for &block in &cfg.order {
         for point in cfg.block_start(block)..=cfg.block_end(body, block) {
-            effects[point] = effects_at(body, cfg.location(point));
+            effects[point] = effects_at(ctx, body, cfg.location(point), &statement_values);
         }
     }
     for &(local, location) in &regions.callee_reads {

@@ -2618,9 +2618,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     && matches!(to.kind(), TyKind::FnPtr(..));
                 // rustc's `promote_consts::Validator::validate_rvalue` lets every cast through
                 // but of a pointer to an integer, `b"node" as &[u8]` as much as `1 as char`.
-                let exposes_address =
-                    matches!(from.kind(), TyKind::RawPtr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..))
-                        && matches!(to.kind(), TyKind::Int(_) | TyKind::Uint(_));
+                let exposes_address = matches!(
+                    from.kind(),
+                    TyKind::RawPtr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..)
+                ) && matches!(to.kind(), TyKind::Int(_) | TyKind::Uint(_));
                 is_fn_address || !exposes_address && self.is_promotable(inner)
             }
             &Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
@@ -3032,6 +3033,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 exprs.iter().for_each(|&it| self.extend_in(it))
             }
             Expr::RecordLit { fields, .. } => fields.iter().for_each(|it| self.extend_in(it.expr)),
+            // A tuple struct's or variant's constructor named as such, `Some(&temp())` or
+            // `Self(&temp())`, not through a variable (`let some = Some; some(&temp())`).
+            Expr::Call { callee, args } if self.names_constructor(*callee) => {
+                args.iter().for_each(|&it| self.extend_in(it))
+            }
             &Expr::Block { tail: Some(tail), .. } => self.extend_in(tail),
             &Expr::If { then_branch, else_branch, .. } => {
                 self.extend_in(then_branch);
@@ -3042,6 +3048,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Match { arms, .. } => arms.iter().for_each(|it| self.extend_in(it.expr)),
             _ => (),
         }
+    }
+
+    fn names_constructor(&self, callee: ExprId) -> bool {
+        self.infer.variant_resolution_for_expr(callee).is_some()
+            || matches!(&self.store[callee], Expr::Path(path) if path.is_self_type())
+                && matches!(
+                    self.infer.expr_ty(callee).kind(),
+                    TyKind::FnDef(def, _) if !matches!(def.0, CallableDefId::FunctionId(_))
+                )
     }
 
     fn extend_operand(&mut self, mut expr: ExprId) {
