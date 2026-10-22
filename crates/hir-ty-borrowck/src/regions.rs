@@ -1002,6 +1002,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
             }
         }
+        self.pattern_paths();
         for (pat, initializer) in lets {
             let Some(ty) = self.ctx.infer.type_of_pat.get(pat).map(|it| it.as_ref()) else {
                 continue;
@@ -1009,7 +1010,10 @@ impl<'db> Builder<'_, '_, 'db> {
             let ty = self.written(ty);
             let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
             self.well_formed(ty, at, 0);
-            if let Pat::Wild = self.ctx.store[pat]
+            if !matches!(self.ctx.store[pat], Pat::Bind { subpat: None, .. }) {
+                self.annotated_bindings(pat, ty, at, true);
+            }
+            if !matches!(self.ctx.store[pat], Pat::Bind { .. })
                 && let Some(initializer) = initializer
             {
                 let value = match self.path_local(initializer) {
@@ -1023,6 +1027,151 @@ impl<'db> Builder<'_, '_, 'db> {
                 if let Some(value) = value {
                     self.relate(value, ty, Variance::Covariant, at);
                 }
+            }
+        }
+    }
+
+    /// The variables a pattern `pat` with the type `ty` written binds have the parts of `ty`
+    /// they bind, as rustc's user type projections: in `let (y, _): (&'static u32, u32)`,
+    /// `y` is a `&'static u32`. Not through a binding by reference or a pattern that derefs
+    /// what it matches by default binding modes.
+    fn annotated_bindings(&mut self, pat: hir_def::hir::PatId, ty: Ty<'db>, at: At, top: bool) {
+        if self.ctx.infer.pat_adjustments.contains_key(&pat) {
+            return;
+        }
+        let interner = self.interner();
+        match &self.ctx.store[pat] {
+            Pat::Bind { id, subpat } => {
+                if !top
+                    && let Some(hir_ty::BindingMode(by_ref, _)) = self.ctx.infer.binding_mode(pat)
+                    && let Some(&local) = self.body.binding_locals.get(*id)
+                {
+                    let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+                    // `ref y` borrows the part, which has the type.
+                    match (by_ref, local_ty.kind()) {
+                        (hir_ty::ByRef::No, _) => {
+                            self.relate(local_ty, ty, Variance::Invariant, at)
+                        }
+                        (hir_ty::ByRef::Yes(_), TyKind::Ref(_, inner, _)) => {
+                            self.relate(inner, ty, Variance::Invariant, at)
+                        }
+                        _ => (),
+                    }
+                }
+                if let Some(subpat) = *subpat {
+                    self.annotated_bindings(subpat, ty, at, false);
+                }
+            }
+            Pat::Tuple { args, ellipsis: None } => {
+                if let TyKind::Tuple(tys) = ty.kind()
+                    && tys.len() == args.len()
+                {
+                    let args = args.clone();
+                    for (pat, ty) in args.iter().zip(tys.iter()) {
+                        self.annotated_bindings(*pat, ty, at, false);
+                    }
+                }
+            }
+            Pat::Ref { pat, .. } => {
+                if let TyKind::Ref(_, inner, _) = ty.kind() {
+                    self.annotated_bindings(*pat, inner, at, false);
+                }
+            }
+            Pat::Record { args, ellipsis: _, .. } => {
+                let TyKind::Adt(_, adt_args) = ty.kind() else { return };
+                let Some(variant) = self.ctx.infer.variant_resolution_for_pat(pat) else { return };
+                let fields = hir_def::signatures::VariantFields::of(self.ctx.db, variant);
+                let types = self.ctx.db.field_types(variant);
+                let parts: Vec<_> = args
+                    .iter()
+                    .filter_map(|it| {
+                        let field = fields.field(&it.name)?;
+                        Some((it.pat, types[field].ty().instantiate(interner, adt_args)))
+                    })
+                    .collect();
+                for (pat, field) in parts {
+                    let mut field = field.skip_norm_wip();
+                    if rustc_type_ir::TypeVisitableExt::has_aliases(&field) {
+                        field = self.normalize(field).unwrap_or(field);
+                    }
+                    self.annotated_bindings(pat, field, at, false);
+                }
+            }
+            Pat::TupleStruct { args, ellipsis: None, .. } => {
+                let TyKind::Adt(_, adt_args) = ty.kind() else { return };
+                let Some(variant) = self.ctx.infer.variant_resolution_for_pat(pat) else { return };
+                let types = self.ctx.db.field_types(variant);
+                let parts: Vec<_> = args
+                    .iter()
+                    .zip(types.iter())
+                    .map(|(pat, (_, field))| (*pat, field.ty().instantiate(interner, adt_args)))
+                    .collect();
+                for (pat, field) in parts {
+                    let mut field = field.skip_norm_wip();
+                    if rustc_type_ir::TypeVisitableExt::has_aliases(&field) {
+                        field = self.normalize(field).unwrap_or(field);
+                    }
+                    self.annotated_bindings(pat, field, at, false);
+                }
+            }
+            _ => (),
+        }
+    }
+
+    /// What a struct, variant or constant pattern whose path spells out generic arguments
+    /// requires of the value it matches, `let Foo::<'static> { .. } = foo;` that `foo` is a
+    /// `Foo<'static>`, as rustc's user type annotation on the pattern. Only for the whole
+    /// pattern of a `let` or a `match` arm, matching a variable or what the `let` reads.
+    fn pattern_paths(&mut self) {
+        let spelled = |pat: &Pat| match pat {
+            Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(path) => {
+                spells_generics(path)
+            }
+            _ => false,
+        };
+        let mut found = Vec::new();
+        for (_, expr) in self.ctx.store.exprs() {
+            match expr {
+                hir_def::hir::Expr::Block { statements, .. } => {
+                    for statement in statements.iter() {
+                        if let Statement::Let { pat, type_ref: None, initializer, .. } = statement
+                            && spelled(&self.ctx.store[*pat])
+                        {
+                            found.push((*pat, *initializer));
+                        }
+                    }
+                }
+                hir_def::hir::Expr::Match { expr, arms } => {
+                    for arm in arms.iter() {
+                        if spelled(&self.ctx.store[arm.pat]) {
+                            found.push((arm.pat, Some(*expr)));
+                        }
+                    }
+                }
+                _ => (),
+            }
+        }
+        for (pat, value) in found {
+            let Some(ty) = self.ctx.infer.type_of_pat.get(pat).map(|it| it.as_ref()) else {
+                continue;
+            };
+            let value = match value.and_then(|it| self.path_local(it)) {
+                Some(local) => Some(self.regions.local_tys[local.into_raw().into_u32() as usize]),
+                None => self
+                    .ascribed_place(pat)
+                    .map(|(local, projection)| self.place_ty(local, &projection).ty),
+            };
+            let Some(value) = value else { continue };
+            let ty = self.written(ty);
+            let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
+            if let Pat::Path(_) = self.ctx.store[pat] {
+                // A constant's value is compared with `PartialEq<Self>`, both sides of a type
+                // they are subtypes of: `x: &'x str` matches a `&'static str`.
+                let common = self.renumber(value);
+                self.relate(value, common, Variance::Covariant, at);
+                self.relate(ty, common, Variance::Covariant, at);
+            } else {
+                self.relate(value, ty, Variance::Covariant, at);
             }
         }
     }
@@ -2064,7 +2213,27 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                     _ => false,
                 };
+                // A constructor called through a variable, `let f = Foo::<&'a u32>; f(x)`, has
+                // the variable's arguments.
+                let through_local = match span {
+                    MirSpan::ExprId(expr) => match store[expr] {
+                        hir_def::hir::Expr::Call { callee, .. } => self
+                            .path_local(callee)
+                            .map(|it| self.regions.local_tys[it.into_raw().into_u32() as usize])
+                            .and_then(|it| match it.kind() {
+                                TyKind::FnDef(def, args)
+                                    if !matches!(def.0, CallableDefId::FunctionId(_)) =>
+                                {
+                                    Some(args)
+                                }
+                                _ => None,
+                            }),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let args = match span {
+                    _ if let Some(args) = through_local => args,
                     MirSpan::ExprId(expr)
                         if spelled(expr)
                             || matches!(store[expr],
