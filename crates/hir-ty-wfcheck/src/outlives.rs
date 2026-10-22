@@ -5,17 +5,18 @@
 use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind,
-    TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _, TypeVisitor,
-    inherent::{IntoKind, Term as _},
+    ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
+    TypeVisitor,
+    inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
 
 use hir_ty::{
     GenericPredicates,
     db::HirDatabase,
     next_solver::{
-        Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, Region, SolverDefId, Ty,
-        TyKind,
+        AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, Region, SolverDefId,
+        Ty, TyKind,
     },
 };
 
@@ -58,6 +59,72 @@ pub(crate) fn components<'db>(ty: Ty<'db>) -> Vec<Component<'db>> {
     let mut find = Find(Vec::new());
     ty.visit_with(&mut find);
     find.0
+}
+
+/// The `impl Trait`s in `ty`, outermost first.
+pub(crate) fn opaques<'db>(ty: Ty<'db>, out: &mut Vec<AliasTy<'db>>) {
+    struct Find<'a, 'db>(&'a mut Vec<AliasTy<'db>>);
+    impl<'db> TypeVisitor<DbInterner<'db>> for Find<'_, 'db> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            if let TyKind::Alias(alias) = ty.kind()
+                && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+            {
+                self.0.push(alias);
+            }
+            ty.super_visit_with(self)
+        }
+    }
+    ty.visit_with(&mut Find(out));
+}
+
+/// `ty` with what outlives a region as it does in its place, as rustc's outlives components
+/// see it: a closure or a coroutine its captures, an `impl Trait` with no outlives bound its
+/// arguments.
+pub(crate) fn outlived_as<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Ty<'db> {
+    struct Fold<'db> {
+        db: &'db dyn HirDatabase,
+        depth: usize,
+    }
+    impl<'db> TypeFolder<DbInterner<'db>> for Fold<'db> {
+        fn cx(&self) -> DbInterner<'db> {
+            DbInterner::new_no_crate(self.db)
+        }
+        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            if self.depth > 16 {
+                return ty;
+            }
+            self.depth += 1;
+            let interner = self.cx();
+            let folded = match ty.kind() {
+                TyKind::Closure(_, args) => args.as_closure().tupled_upvars_ty().fold_with(self),
+                TyKind::Coroutine(_, args) => {
+                    args.as_coroutine().tupled_upvars_ty().fold_with(self)
+                }
+                TyKind::CoroutineClosure(_, args) => {
+                    args.as_coroutine_closure().tupled_upvars_ty().fold_with(self)
+                }
+                TyKind::Alias(alias)
+                    if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+                        && !rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+                            .iter_instantiated(interner, alias.args.as_slice())
+                            .any(|clause| {
+                                matches!(
+                                    clause.kind().skip_binder(),
+                                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, _))
+                                        if bounded == ty
+                                )
+                            }) =>
+                {
+                    Ty::new_tup_from_iter(interner, alias.args.types()).fold_with(self)
+                }
+                _ => ty.super_fold_with(self),
+            };
+            self.depth -= 1;
+            folded
+        }
+    }
+    ty.fold_with(&mut Fold { db, depth: 0 })
 }
 
 /// A region rustc calls free: a lifetime parameter of the item, which inference may name.

@@ -1013,6 +1013,25 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         ctx.lower_partly_resolved_path(resolution, false, path_id.type_ref().into())
     }
 
+    /// The type the qualifier of the value path `path` names, `A<'a>` of `A::<'a>::C`, where
+    /// it is a struct, enum, union or type alias.
+    pub fn lower_value_path_qualifier(&mut self, path: &Path) -> Option<Ty<'db>> {
+        let qualifier = path.qualifier()?;
+        let on_diagnostic = PathDiagnosticCallback {
+            data: Either::Left(PathDiagnosticCallbackData(TypeRefId::from_raw(
+                la_arena::RawIdx::from_u32(0),
+            ))),
+            callback: |_, _, _| {},
+        };
+        let mut ctx = PathLoweringContext::new(self, on_diagnostic, &qualifier);
+        match ctx.resolve_path_in_type_ns()? {
+            (resolution @ (TypeNs::AdtId(_) | TypeNs::TypeAliasId(_)), None) => {
+                Some(ctx.lower_partly_resolved_path(resolution, false, Span::Dummy).0)
+            }
+            _ => None,
+        }
+    }
+
     fn lower_trait_ref_from_path(
         &mut self,
         path_id: PathId,

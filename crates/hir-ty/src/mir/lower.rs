@@ -2017,6 +2017,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         ty: Ty<'db>,
         loc: &ExprId,
     ) -> Result<'db, Operand> {
+        let mut operand = self.lower_literal_or_const(ty, loc)?;
+        operand.span = Some((*loc).into());
+        Ok(operand)
+    }
+
+    fn lower_literal_or_const(&mut self, ty: Ty<'db>, loc: &ExprId) -> Result<'db, Operand> {
         match &self.store[*loc] {
             Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
             Expr::Path(c) => {

@@ -1474,6 +1474,31 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         _ => None,
                     }
                 }
+                Site::Opaque(function, index) => {
+                    use hir_def::{
+                        expr_store::StoreVisitor,
+                        hir::type_ref::{TypeRef, TypeRefId},
+                    };
+                    struct Find<'a> {
+                        store: &'a ExpressionStore,
+                        found: Vec<TypeRefId>,
+                    }
+                    impl StoreVisitor for Find<'_> {
+                        fn on_type(&mut self, ty: TypeRefId) {
+                            if let TypeRef::ImplTrait(_) = self.store[ty] {
+                                self.found.push(ty);
+                            }
+                            let store = self.store;
+                            store.visit_type_ref_children(ty, self);
+                        }
+                    }
+                    let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+                    let mut find = Find { store: &signature.store, found: Vec::new() };
+                    if let Some(ret_type) = signature.ret_type {
+                        find.on_type(ret_type);
+                    }
+                    find.found.get(index as usize).and_then(|it| source_map.type_syntax(*it).ok())
+                }
             };
             let Some(source) = source else { continue };
             self.acc.push(

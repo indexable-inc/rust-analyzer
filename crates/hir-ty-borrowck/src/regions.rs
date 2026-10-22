@@ -1023,11 +1023,58 @@ impl<'db> Builder<'_, '_, 'db> {
         let &[tupled] = sig.inputs().as_slice() else { return false };
         let TyKind::Tuple(inputs) = tupled.kind() else { return false };
         local_tys[env_local.into_raw().into_u32() as usize] = Some(closure);
-        for (&local, ty) in params.iter().zip(inputs.iter()) {
+        for (index, (&local, ty)) in params.iter().zip(inputs.iter()).enumerate() {
+            let ty = self.elided_own(index, ty).unwrap_or(ty);
             local_tys[local.into_raw().into_u32() as usize] = Some(ty);
         }
         local_tys[super::return_slot().into_raw().into_u32() as usize] = Some(sig.output());
         true
+    }
+
+    /// The type of the closure's parameter `index`, where the closure is typed without an
+    /// expected signature, with each lifetime elided in its written type a late-bound one of
+    /// the closure's own, as rustc's closure signature binds them: `|x: &i32| -> &i32 { x }`
+    /// returns what lives as long as the call, not as long as the closure's type says.
+    fn elided_own(&mut self, index: usize, ty: Ty<'db>) -> Option<Ty<'db>> {
+        let closure = self.ctx.closure_expr?;
+        if !self.ctx.infer.closures_without_expectation.contains(&closure) {
+            return None;
+        }
+        let hir_def::hir::Expr::Closure { arg_types, .. } = &self.ctx.store[closure] else {
+            return None;
+        };
+        let written = self.lower_written((*arg_types.get(index)?)?, MirSpan::ExprId(closure));
+        let regions = |ty: Ty<'db>| {
+            let mut found = Vec::new();
+            rustc_type_ir::fold_regions(self.interner(), ty, |region, _| {
+                found.push(region);
+                region
+            });
+            found
+        };
+        let elided: Vec<bool> = regions(written)
+            .into_iter()
+            .map(|region| {
+                !matches!(
+                    region.kind(),
+                    RegionKind::ReEarlyParam(_)
+                        | RegionKind::ReLateParam(_)
+                        | RegionKind::ReStatic
+                        | RegionKind::ReBound(..)
+                )
+            })
+            .collect();
+        if elided.len() != regions(ty).len() || !elided.contains(&true) {
+            return None;
+        }
+        let mut position = 0;
+        Some(rustc_type_ir::fold_regions(self.interner(), ty, |region, _| {
+            position += 1;
+            match elided[position - 1] {
+                true => self.new_universal(UniversalKind::AnonParam),
+                false => region,
+            }
+        }))
     }
 
     /// What a `let` with a type written out requires, as rustc's user type annotations: that
@@ -1044,6 +1091,7 @@ impl<'db> Builder<'_, '_, 'db> {
         }
         self.pattern_paths();
         self.path_arguments();
+        self.closure_annotations();
         for (pat, initializer) in lets {
             let Some(ty) = self.ctx.infer.type_of_pat.get(pat).map(|it| it.as_ref()) else {
                 continue;
@@ -1069,6 +1117,40 @@ impl<'db> Builder<'_, '_, 'db> {
                     self.relate(value, ty, Variance::Covariant, at);
                 }
             }
+        }
+    }
+
+    /// A closure's parameters and return slot have the types written for them, as rustc's
+    /// `check_signature_annotation`: in `|x: &'a i32| -> &'static i32` that `x` is a
+    /// `&'a i32` and the closure returns a `&'static i32`.
+    fn closure_annotations(&mut self) {
+        let Some(closure) = self.ctx.closure_expr else { return };
+        let hir_def::hir::Expr::Closure {
+            arg_types,
+            ret_type,
+            closure_kind: hir_def::hir::ClosureKind::Closure,
+            ..
+        } = &self.ctx.store[closure]
+        else {
+            return;
+        };
+        let params = self.body.param_locals.get(1..).unwrap_or_default();
+        if !self.regions.check_universals || params.len() != arg_types.len() {
+            return;
+        }
+        let span = MirSpan::ExprId(closure);
+        let at = At { category: Category::Boring, span };
+        let written: Vec<_> = params
+            .iter()
+            .copied()
+            .zip(arg_types.iter().copied())
+            .chain([(super::return_slot(), *ret_type)])
+            .collect();
+        for (local, type_ref) in written {
+            let Some(type_ref) = type_ref else { continue };
+            let ty = self.written(self.lower_written(type_ref, span));
+            let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+            self.relate(local_ty, ty, Variance::Invariant, at);
         }
     }
 
@@ -2233,6 +2315,11 @@ impl<'db> Builder<'_, '_, 'db> {
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(dest, written, Variance::Invariant, at);
         }
+        // A range pattern's bounds, `A::<'a>::X..=Y`, are named constants compared.
+        if let Rvalue::BinaryOp(_, left, right) | Rvalue::CheckedBinaryOp(_, left, right) = rvalue {
+            self.constant_ty(left, span);
+            self.constant_ty(right, span);
+        }
         match rvalue {
             // Raw and function pointers compare when they have a common supertype.
             Rvalue::BinaryOp(op, left, right) | Rvalue::CheckedBinaryOp(op, left, right)
@@ -2332,13 +2419,21 @@ impl<'db> Builder<'_, '_, 'db> {
         if let MirSpan::ExprId(expr) = span {
             self.path_well_formed(expr, id.lookup(db).container, args, span);
         }
-        if let Some(anchor) = path.and_then(|it| it.type_anchor())
-            && let ItemContainerId::ImplId(impl_) = id.lookup(db).container
-        {
-            let written = self.written(self.lower_written(anchor, span));
-            let self_ty = self.declared(
+        let written = path.and_then(|path| match path.type_anchor() {
+            Some(anchor) => Some(self.lower_written(anchor, span)),
+            None => self.lower_written_qualifier(path, span),
+        });
+        let self_ty = match id.lookup(db).container {
+            ItemContainerId::ImplId(impl_) => Some(self.declared(
                 db.impl_self_ty(impl_).instantiate(self.interner(), args).skip_norm_wip(),
-            );
+            )),
+            ItemContainerId::TraitId(_) => args.types().next(),
+            _ => None,
+        };
+        if let Some(written) = written
+            && let Some(self_ty) = self_ty
+        {
+            let written = self.written(written);
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(self_ty, written, Variance::Invariant, at);
         }
@@ -2385,6 +2480,27 @@ impl<'db> Builder<'_, '_, 'db> {
     /// A type written in the body, lowered as inference lowers it, its lifetimes the
     /// signature's where it names them.
     fn lower_written(&self, type_ref: hir_def::type_ref::TypeRefId, span: MirSpan) -> Ty<'db> {
+        self.lowering(span, |ctx| ctx.lower_ty(type_ref))
+    }
+
+    /// The type a value path's qualifier spells out with generic arguments, `A<'a>` of
+    /// `A::<'a>::C`, lowered as `lower_written` lowers.
+    fn lower_written_qualifier(
+        &self,
+        path: &hir_def::expr_store::path::Path,
+        span: MirSpan,
+    ) -> Option<Ty<'db>> {
+        let segments = path.segments();
+        let qualifier = segments.get(segments.len().checked_sub(2)?)?;
+        qualifier.args_and_bindings?;
+        self.lowering(span, |ctx| ctx.lower_value_path_qualifier(path))
+    }
+
+    fn lowering<T>(
+        &self,
+        span: MirSpan,
+        f: impl FnOnce(&mut hir_ty::TyLoweringContext<'db, '_>) -> T,
+    ) -> T {
         let db = self.ctx.db;
         let store_owner = self.ctx.owner.expression_store_owner(db);
         let mut resolver = store_owner.resolver(db);
@@ -2393,7 +2509,7 @@ impl<'db> Builder<'_, '_, 'db> {
             _ => None,
         };
         let generics = std::cell::OnceCell::new();
-        hir_ty::TyLoweringContext::new(
+        let mut ctx = hir_ty::TyLoweringContext::new(
             db,
             &resolver,
             hir_def::expr_store::ExpressionStore::of(db, store_owner),
@@ -2402,8 +2518,8 @@ impl<'db> Builder<'_, '_, 'db> {
             &generics,
             hir_ty::LifetimeElisionKind::Infer,
             hir_ty::LifetimeLoweringMode::LateParam,
-        )
-        .lower_ty(type_ref)
+        );
+        f(&mut ctx)
     }
 
     fn rvalue_ty(&mut self, rvalue: &Rvalue, span: MirSpan) -> Option<Ty<'db>> {

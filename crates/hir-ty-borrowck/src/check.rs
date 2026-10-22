@@ -1200,12 +1200,23 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             if matches!(kind, UniversalKind::Static | UniversalKind::FnBody) {
                 continue;
             }
-            if in_closure && self.propagate(longer) {
+            // As rustc, only the representative of the universal regions that outlive each
+            // other is checked against all it outlives; the others only against it.
+            let failing: Vec<usize> = match self.representative(longer) {
+                Some(representative) => Some(representative)
+                    .filter(|&it| !self.regions.knows(longer, it))
+                    .into_iter()
+                    .collect(),
+                None => self
+                    .values
+                    .universals_of(longer_rv)
+                    .filter(|&it| !self.regions.knows(longer, it))
+                    .collect(),
+            };
+            if failing.is_empty() || in_closure && self.propagate(longer, &failing) {
                 continue;
             }
-            let shorter =
-                self.values.universals_of(longer_rv).find(|&it| !self.regions.knows(longer, it));
-            let Some(shorter) = shorter else { continue };
+            let shorter = failing[0];
             let (shorter_rv, shorter_kind) = universals[shorter];
             let path =
                 regions::constraint_path(self.regions, self.region_count, longer_rv, shorter_rv);
@@ -1315,7 +1326,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// outlives one of its creator's becomes a requirement on the creator's regions, from the
     /// largest of them `longer` outlives to the smallest that outlive the shorter one. `false`
     /// when `longer` outlives none of the creator's, which is an error in the closure.
-    fn propagate(&mut self, longer: usize) -> bool {
+    fn propagate(&mut self, longer: usize, failing: &[usize]) -> bool {
         let known = self.regions;
         let universals = &known.universals;
         let non_local =
@@ -1338,9 +1349,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             return false;
         }
         let longer_rv = universals[longer].0;
-        let failing: Vec<usize> =
-            self.values.universals_of(longer_rv).filter(|&it| !knows(longer, it)).collect();
-        for shorter in failing {
+        for &shorter in failing {
             let path = regions::constraint_path(
                 known,
                 self.region_count,
@@ -1376,6 +1385,28 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             }
         }
         true
+    }
+
+    /// rustc's representative of the strongly connected universal regions `universal` is one
+    /// of, where it is not that region itself: the first made, a closure's creator's before
+    /// its own. Not the function body's.
+    fn representative(&self, universal: usize) -> Option<usize> {
+        let universals = &self.regions.universals;
+        let rank = |it: usize| {
+            let local = !matches!(universals[it].1, UniversalKind::Static | UniversalKind::Creator);
+            (local, it)
+        };
+        let rv = universals[universal].0;
+        let representative = self
+            .values
+            .universals_of(rv)
+            .filter(|&it| {
+                universals[it].1 != UniversalKind::FnBody
+                    && self.values.universals_of(universals[it].0).any(|it| it == universal)
+            })
+            .chain([universal])
+            .min_by_key(|&it| rank(it))?;
+        (representative != universal).then_some(representative)
     }
 
     /// rustc's `non_local_upper_bounds`: `universal` if it is the creator's, else the smallest

@@ -22,7 +22,7 @@ use hir_def::{
         generics::{GenericParams, WherePredicate},
         type_ref::{TypeBound, TypeRef},
     },
-    signatures::TraitSignature,
+    signatures::{FunctionSignature, TraitSignature},
 };
 use rustc_type_ir::{
     ClauseKind, RegionKind, TypeVisitableExt as _,
@@ -31,9 +31,9 @@ use rustc_type_ir::{
 use salsa::SalsaValue;
 
 use hir_ty::{
-    GenericPredicates,
+    GenericPredicates, ImplTraitId, InferBodyId, InferenceResult,
     db::HirDatabase,
-    next_solver::{Clause, DbInterner, GenericArgKind, TermId, Ty, TyKind},
+    next_solver::{Clause, DbInterner, GenericArgKind, SolverDefId, TermId, Ty, TyKind},
 };
 
 use outlives::{Inferred, Known, Needs};
@@ -50,6 +50,8 @@ pub enum Site {
     /// The bound of a where clause of an item, by its index among the item's where
     /// predicates (a bound written on a generic parameter is one too).
     Bound(GenericDefId, u32),
+    /// An `impl Trait` a function returns, by its index among those of its return type.
+    Opaque(FunctionId, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
@@ -234,7 +236,7 @@ impl<'db> Check<'_, 'db> {
             .instantiate_identity()
             .skip_norm_wip()
             .skip_binder();
-        let mut assumed: Vec<Ty<'db>> = sig.inputs_and_output.iter().collect();
+        let mut assumed: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
         if assumed.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
             return;
         }
@@ -242,9 +244,60 @@ impl<'db> Check<'_, 'db> {
             let Some(header) = self.header(impl_) else { return };
             assumed.extend(header);
         }
-        let known = self.known(function.into(), &assumed);
-        let needs = self.where_needs(function.into());
-        self.resolve(&known, needs);
+        let output = sig.output();
+        if output.references_error() {
+            return;
+        }
+        if !output.has_aliases() {
+            assumed.push(output);
+            let known = self.known(function.into(), &assumed);
+            let needs = self.where_needs(function.into());
+            self.resolve(&known, needs);
+        } else if !FunctionSignature::of(db, function).is_async() {
+            let known = self.known(function.into(), &assumed);
+            self.opaques(function, output, &known);
+        }
+    }
+
+    /// rustc's `check_opaque_meets_bounds`: the type each `impl Trait` the function returns
+    /// hides is well-formed and outlives what the `impl Trait`'s bounds say it does, given
+    /// what the function knows; `-> impl Sized + 'static` hiding a `T` needs `T: 'static`.
+    fn opaques(&mut self, function: FunctionId, output: Ty<'db>, known: &Known<'db>) {
+        let db = self.db;
+        let interner = self.interner();
+        let infer = InferenceResult::of(db, InferBodyId::from(function));
+        let hidden: Vec<_> = infer.return_position_impl_trait_types(db).collect();
+        let mut opaques = Vec::new();
+        outlives::opaques(output, &mut opaques);
+        for alias in opaques {
+            let SolverDefId::InternedOpaqueTyId(opaque) = alias.kind.def_id() else { continue };
+            let ImplTraitId::ReturnTypeImplTrait(owner, index) = opaque.loc(db) else { continue };
+            if owner != function {
+                continue;
+            }
+            let Some(&(_, ty)) = hidden.iter().find(|(it, _)| *it == index) else { continue };
+            if ty.references_error() || ty.has_infer() {
+                continue;
+            }
+            let ty = outlives::outlived_as(db, ty);
+            let site = Site::Opaque(function, index.into_raw().into_u32());
+            let mut needs = Vec::new();
+            let mut found = Vec::new();
+            outlives::wf(db, &mut self.inferred, ty, &mut found);
+            let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+            for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
+                if let ClauseKind::TypeOutlives(rustc_type_ir::OutlivesPredicate(bounded, region)) =
+                    clause.kind().skip_binder()
+                    && let TyKind::Alias(bounded) = bounded.kind()
+                    && bounded.kind.def_id() == alias.kind.def_id()
+                    && !region.has_escaping_bound_vars()
+                {
+                    found.push(Needs::Type(ty, region));
+                }
+            }
+            needs.extend(found.into_iter().map(|it| (it, site)));
+            self.resolve(known, needs);
+        }
     }
 
     /// What the well-formedness of `def`'s own where clauses needs: of each type in them,

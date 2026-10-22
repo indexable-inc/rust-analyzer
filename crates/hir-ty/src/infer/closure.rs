@@ -739,6 +739,7 @@ impl<'db> InferenceContext<'db> {
     ) -> ClosureSignatures<'db> {
         let bound_sig =
             self.supplied_sig_of_closure(closure_expr, decl_inputs, decl_output, closure_kind);
+        self.result.closures_without_expectation.insert(closure_expr);
 
         self.closure_sigs(bound_sig)
     }
