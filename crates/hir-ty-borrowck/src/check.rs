@@ -9,8 +9,8 @@ use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
     mir::{
-        AsmOperand, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, Operand, OperandKind,
-        PlaceElem, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+        AsmOperand, BinOp, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, Operand,
+        OperandKind, PlaceElem, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     },
     next_solver::{Ty, TyKind},
 };
@@ -112,6 +112,11 @@ pub(super) fn check<'db>(
         matched: matched(ctx),
         requirements: Vec::new(),
     };
+    let tested_at = tested_at(ctx);
+    let test_span = |span: MirSpan| match span {
+        MirSpan::PatId(pat) => tested_at.get(&pat).map_or(span, |&it| MirSpan::ExprId(it)),
+        _ => span,
+    };
     for &block in &cfg.order {
         checker.uninit = flow.uninit_entry[index(block)].clone();
         checker.ever = flow.ever_entry[index(block)].clone();
@@ -119,17 +124,30 @@ pub(super) fn check<'db>(
         let data = &body.basic_blocks[block];
         for (statement, it) in data.statements.iter().enumerate() {
             let location = Location { block, statement };
+            let span = match &it.kind {
+                StatementKind::Assign(_, Rvalue::Discriminant(_)) => test_span(it.span),
+                StatementKind::Assign(_, Rvalue::CheckedBinaryOp(BinOp::Eq, ..))
+                    if switched_literal(ctx, it.span) =>
+                {
+                    test_span(it.span)
+                }
+                _ => it.span,
+            };
             loans.before(&cfg, location, &mut checker.in_scope);
-            checker.check_activations(location, it.span);
-            checker.statement(location, &it.kind, it.span);
+            checker.check_activations(location, span);
+            checker.statement(location, &it.kind, span);
             apply(body, &moves, location, &mut checker.uninit, &mut checker.ever);
             loans.after(ctx, body, location, &mut checker.in_scope);
         }
         if let Some(terminator) = &data.terminator {
             let location = Location { block, statement: data.statements.len() };
+            let span = match &terminator.kind {
+                TerminatorKind::SwitchInt { .. } => test_span(terminator.span),
+                _ => terminator.span,
+            };
             loans.before(&cfg, location, &mut checker.in_scope);
-            checker.check_activations(location, terminator.span);
-            checker.terminator(location, &terminator.kind, terminator.span);
+            checker.check_activations(location, span);
+            checker.terminator(location, &terminator.kind, span);
         }
     }
     checker.report_move_errors();
@@ -217,6 +235,56 @@ fn matched(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
         }
     }
     found
+}
+
+/// The scrutinee of the `match` each pattern of an arm is in: rustc reads a discriminant and
+/// switches on a value at the scrutinee's span, where rust-analyzer gives the pattern's.
+fn tested_at(ctx: &Ctx<'_, '_>) -> FxHashMap<hir_def::hir::PatId, ExprId> {
+    let mut found = FxHashMap::default();
+    for (_, it) in ctx.store.exprs() {
+        if let hir_def::hir::Expr::Match { expr: scrutinee, arms } = it {
+            for arm in arms.iter() {
+                ctx.store.walk_pats(arm.pat, &mut |pat| {
+                    found.insert(pat, *scrutinee);
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Whether `expr` is the value of a block a `let` binds to a variable: `let c = { ..; expr };`.
+fn let_bound_block_value(ctx: &Ctx<'_, '_>, expr: ExprId) -> bool {
+    use hir_def::hir::Expr;
+    let value = |mut at: ExprId| {
+        while let Expr::Block { tail: Some(tail), .. } = ctx.store[at] {
+            at = tail;
+        }
+        at
+    };
+    ctx.store.exprs().any(|(_, it)| {
+        let Expr::Block { statements, .. } = it else { return false };
+        statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::Let { pat, initializer: Some(init), .. }
+                    if matches!(ctx.store[*pat], Pat::Bind { subpat: None, .. })
+                        && matches!(ctx.store[*init], Expr::Block { .. })
+                        && value(*init) == expr
+            )
+        })
+    })
+}
+
+/// A literal pattern rustc tests with a switch on the value rather than a call of `PartialEq`.
+fn switched_literal(ctx: &Ctx<'_, '_>, span: MirSpan) -> bool {
+    use hir_def::hir::{Expr, Literal};
+    let MirSpan::PatId(pat) = span else { return false };
+    let Pat::Lit(lit) = ctx.store[pat] else { return false };
+    matches!(
+        ctx.store[lit],
+        Expr::Literal(Literal::Bool(_) | Literal::Char(_) | Literal::Int(..) | Literal::Uint(..))
+    )
 }
 
 fn irrefutable(ctx: &Ctx<'_, '_>, pat: hir_def::hir::PatId) -> bool {
@@ -596,7 +664,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 .values
                 .universals_of(loan.region)
                 .any(|it| self.regions.universals[it].1 != UniversalKind::FnBody);
-            if outlives_universal {
+            // The unwind path drops the local the loan is of, a destructor that may see it.
+            let borrowed = PlaceRef { local: loan.local, projection: &loan.projection };
+            if outlives_universal && self.through_destructor(borrowed) {
+                self.report_conflicts_with_destructor(id);
+            } else if outlives_universal {
                 self.report_does_not_live_long_enough(id);
             }
         }
@@ -806,7 +878,15 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         format!("cannot move out of {what} because it is borrowed"),
                     );
                 }
-                (Access::StorageDeadOrDrop, _) => self.report_does_not_live_long_enough(id),
+                (Access::StorageDeadOrDrop, _) => {
+                    let loan = &self.loans.loans[id];
+                    let borrowed = PlaceRef { local: loan.local, projection: &loan.projection };
+                    if self.through_destructor(borrowed) && !borrowed.is_prefix_of(place) {
+                        self.report_conflicts_with_destructor(id);
+                    } else {
+                        self.report_does_not_live_long_enough(id);
+                    }
+                }
             }
             return true;
         }
@@ -909,6 +989,35 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         self.report(code, span, message);
     }
 
+    /// rustc's `classify_drop_access_kind` being `Destructor`: the place is reached through a
+    /// field of a value whose type implements `Drop`.
+    fn through_destructor(&self, place: PlaceRef<'_>) -> bool {
+        let mut ty = self.ctx.place_ty(self.body, place.local, &[]);
+        for elem in place.projection {
+            if let ProjectionElem::Field(_) | ProjectionElem::Downcast(_) = elem
+                && let TyKind::Adt(def, _) = ty.ty.kind()
+                && self.ctx.has_destructor(def.def_id())
+            {
+                return true;
+            }
+            ty = self.ctx.project(ty, elem);
+        }
+        false
+    }
+
+    /// rustc's `report_borrow_conflicts_with_destructor`.
+    fn report_conflicts_with_destructor(&mut self, id: usize) {
+        let loan = &self.loans.loans[id];
+        if !self.dead_reported.insert((loan.local, loan.span)) {
+            return;
+        }
+        self.report(
+            "E0713",
+            loan.span,
+            "borrow may still be in use when destructor runs".to_owned(),
+        );
+    }
+
     /// rustc's `report_borrowed_value_does_not_live_long_enough`.
     fn report_does_not_live_long_enough(&mut self, id: usize) {
         let loan = &self.loans.loans[id];
@@ -941,7 +1050,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         );
                         return;
                     }
-                    (None, Category::Return) if !blamed.from_closure => {
+                    (None, Category::Return)
+                        if !blamed.from_closure && !self.regions.returns_static_opaque =>
+                    {
                         let span = if blamed.span == MirSpan::Unknown {
                             loan.span
                         } else {
@@ -962,6 +1073,19 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             }
         }
         match self.describe(place) {
+            // rustc's `LaterUseKind::ClosureCapture`: the closure is a block's value a `let`
+            // binds, so what uses the borrow after the block is that `let`'s read.
+            Some(_)
+                if let Some(MirSpan::ExprId(closure)) = capture
+                    && let_bound_block_value(self.ctx, closure) =>
+            {
+                let what = self.quoted(place, "value");
+                self.report(
+                    "E0373",
+                    MirSpan::ExprId(closure),
+                    format!("closure may outlive the current block, but it borrows {what}, which is owned by the current block"),
+                );
+            }
             Some(name) => {
                 self.report("E0597", loan.span, format!("`{name}` does not live long enough"))
             }

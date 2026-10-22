@@ -144,6 +144,9 @@ pub(super) struct Regions<'db> {
     /// constraints. Empty when what it captures is not known exactly.
     pub(super) members: Vec<Rv>,
     pub(super) choices: Vec<Rv>,
+    /// The body returns an `impl Trait` that captures no lifetime, of a hidden type that names
+    /// no other alias: what it returns must be `'static`, rustc's `OpaqueType` constraint.
+    pub(super) returns_static_opaque: bool,
 }
 
 impl<'db> Regions<'db> {
@@ -433,6 +436,7 @@ pub(super) fn build<'db>(
             closure_env: None,
             creator_positions: FxHashMap::default(),
             members: Vec::new(),
+            returns_static_opaque: false,
             choices: Vec::new(),
         },
         requirements,
@@ -755,6 +759,20 @@ impl<'db> Builder<'_, '_, 'db> {
                 region
             });
             let hidden_static = opaque && self.regions.universals.len() == 2 && !names_parameter;
+            let captures_lifetime = signature.as_ref().is_some_and(|(_, output)| {
+                let TyKind::Alias(alias) = output.kind() else { return true };
+                let Some(captured) =
+                    opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
+                else {
+                    return true;
+                };
+                alias.args.iter().zip(captured).any(|(arg, captured)| {
+                    captured && matches!(arg.kind(), GenericArgKind::Lifetime(_))
+                })
+            });
+            self.regions.returns_static_opaque = hidden_static
+                && !captures_lifetime
+                && !rustc_type_ir::TypeVisitableExt::has_aliases(&ty);
             let ty = rustc_type_ir::fold_regions(self.interner(), ty, |region, depth| {
                 if (opaque || signature.is_none()) && matches!(region.kind(), RegionKind::ReVar(_))
                 {
@@ -1593,7 +1611,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let mut same = FxHashMap::default();
         {
             let mut inner = infcx.inner.borrow_mut();
-            let mut collector = inner.unwrap_region_constraints();
+            let collector = inner.unwrap_region_constraints();
             let data = collector.region_constraint_data();
             for constraint in &data.constraints[constraints_before..] {
                 if let Constraint::VarSubVar(a, b) = *constraint {
@@ -1707,7 +1725,7 @@ impl<'db> Builder<'_, '_, 'db> {
         if regions.len() != *count {
             return;
         }
-        let mut at_position = |this: &mut Self, position: usize| match position {
+        let at_position = |this: &mut Self, position: usize| match position {
             _ if position >= LATE_PARENT => {
                 rv_of(this.parent_late_region((position - LATE_PARENT) as u32))
             }
