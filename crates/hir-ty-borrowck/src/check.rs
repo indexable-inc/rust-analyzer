@@ -109,6 +109,7 @@ pub(super) fn check<'db>(
         reservation_reported: FxHashSet::default(),
         static_muts: static_muts(ctx, body),
         union_literals: union_literals(ctx),
+        matched: matched(ctx),
         requirements: Vec::new(),
     };
     for &block in &cfg.order {
@@ -201,6 +202,43 @@ fn member_choices(
         chosen.push((member, min.map(|it| regions.universals[it].0)));
     }
     chosen
+}
+
+/// The `match` expressions, and what they match, whose arms test the value: rustc reads the
+/// matched place on the edge taken when no arm matches, which a match of bindings alone lacks.
+fn matched(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
+    let mut found = FxHashSet::default();
+    for (expr, it) in ctx.store.exprs() {
+        if let hir_def::hir::Expr::Match { expr: scrutinee, arms } = it
+            && (arms.is_empty() || arms.iter().any(|arm| !irrefutable(ctx, arm.pat)))
+        {
+            found.insert(expr);
+            found.insert(*scrutinee);
+        }
+    }
+    found
+}
+
+fn irrefutable(ctx: &Ctx<'_, '_>, pat: hir_def::hir::PatId) -> bool {
+    let struct_like = || {
+        matches!(
+            ctx.infer.variant_resolution_for_pat(pat),
+            Some(hir_def::VariantId::StructId(_) | hir_def::VariantId::UnionId(_))
+        )
+    };
+    match &ctx.store[pat] {
+        Pat::Wild | Pat::Rest | Pat::Bind { subpat: None, .. } => true,
+        Pat::Bind { subpat: Some(inner), .. }
+        | Pat::Ref { pat: inner, .. }
+        | Pat::Box { inner }
+        | Pat::Deref { inner } => irrefutable(ctx, *inner),
+        Pat::Tuple { args, .. } => args.iter().all(|&it| irrefutable(ctx, it)),
+        Pat::TupleStruct { args, .. } => {
+            struct_like() && args.iter().all(|&it| irrefutable(ctx, it))
+        }
+        Pat::Record { args, .. } => struct_like() && args.iter().all(|it| irrefutable(ctx, it.pat)),
+        _ => false,
+    }
 }
 
 fn union_literals(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
@@ -366,6 +404,8 @@ struct Checker<'a, 'b, 'db> {
     /// Record literals and the values of their fields, whose lowering assigns a field of the
     /// literal where rustc assigns the whole of it (it matters for a union).
     union_literals: FxHashSet<ExprId>,
+    /// The scrutinees of `match`es and the `match`es.
+    matched: FxHashSet<ExprId>,
     /// In a closure, what it needs of its creator's regions.
     requirements: Vec<regions::Requirement<'db>>,
 }
@@ -439,7 +479,16 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // rustc reads a matched place only where no arm matches, and the bindings of a
             // `let`; lowering reads the matched place itself and every initializer, so these
             // say nothing rustc checks.
-            StatementKind::FakeRead(_) => (),
+            // Except a `match`'s read of what it matches, rustc's `ForMatchedPlace`: a value
+            // moved out of whole is used there, before any arm tests a part of it.
+            StatementKind::FakeRead(place) => {
+                if let MirSpan::ExprId(expr) = span
+                    && self.matched.contains(&expr)
+                {
+                    let place = PlaceRef::of(place);
+                    self.check_if_full_path_is_moved(location, InitAction::Use, place, span);
+                }
+            }
             StatementKind::InlineAsm(asm) => {
                 for operand in &asm.operands {
                     match operand {
@@ -471,9 +520,17 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         self.assigned_local = super::return_slot();
         match kind {
             TerminatorKind::SwitchInt { discr, .. } => self.consume_operand(location, discr, span),
-            TerminatorKind::Drop { place, .. } => {
+            TerminatorKind::Drop { place, target, .. } => {
+                // The drop of the old value of an assignment, `x = y` lowered as `drop(x)` then
+                // `x = y` where it goes: rustc's `Drop { replace: true }`, a write.
+                let replaces = self.body.basic_blocks[*target].statements.first().is_some_and(
+                    |it| matches!(&it.kind, StatementKind::Assign(assigned, _) if assigned == place),
+                );
                 let place = PlaceRef::of(place);
-                let access = Access::StorageDeadOrDrop;
+                let access = match replaces {
+                    true => Access::Mutate,
+                    false => Access::StorageDeadOrDrop,
+                };
                 self.access_place(location, place, span, access, Allowed::Yes, Depth::Drop);
             }
             TerminatorKind::Return => self.check_for_invalidation_at_exit(location, span),
