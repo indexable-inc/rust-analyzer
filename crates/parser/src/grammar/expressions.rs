@@ -305,6 +305,9 @@ fn expr_bp(
     };
 
     loop {
+        if p.at_fragment_start() {
+            break;
+        }
         let is_range = p.at(T![..]) || p.at(T![..=]);
         let (op_bp, op, associativity) = current_op(p);
         if op_bp < bp {
@@ -455,6 +458,9 @@ fn postfix_expr(
     mut allow_calls: bool,
 ) -> (CompletedMarker, BlockLike) {
     loop {
+        if p.at_fragment_start() {
+            break;
+        }
         lhs = match p.current() {
             // test stmt_postfix_expr_ambiguity
             // fn foo() {

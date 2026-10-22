@@ -2,7 +2,7 @@
 
 use either::Either;
 use hir_def::{
-    GenericDefId, GenericParamId, Lookup, TraitId, TypeParamId,
+    AssocItemId, GenericDefId, GenericParamId, HasModule, Lookup, TraitId, TypeParamId,
     expr_store::{
         ExpressionStore, HygieneId,
         path::{
@@ -17,6 +17,7 @@ use hir_def::{
     signatures::{TraitFlags, TraitSignature},
     type_ref::{TypeRef, TypeRefId},
 };
+use hir_expand::name::Name;
 use rustc_type_ir::{
     AliasTerm, AliasTy, AliasTyKind,
     inherent::{GenericArgs as _, Region as _, Ty as _},
@@ -161,7 +162,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             0 => (ty, res),
             1 => {
                 // resolve unselected assoc types
-                (self.select_associated_type(res, infer_args, span), None)
+                (self.select_associated_type(ty, res, infer_args, span), None)
             }
             _ => {
                 // FIXME report error (ambiguous associated type)
@@ -480,6 +481,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     #[tracing::instrument(skip(self), ret)]
     fn select_associated_type(
         &mut self,
+        ty: Ty<'db>,
         res: Option<TypeNs>,
         infer_args: bool,
         span: Span,
@@ -489,6 +491,16 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         let def = self.ctx.generic_def;
         let segment = self.current_or_prev_segment;
         let assoc_name = segment.name;
+        let inherent = match res {
+            Some(TypeNs::SelfType(impl_)) => db.impl_trait(impl_).is_none(),
+            Some(TypeNs::AdtId(_) | TypeNs::AdtSelfType(_) | TypeNs::TypeAliasId(_)) => true,
+            _ => false,
+        };
+        if inherent {
+            return self
+                .inherent_associated_type(ty, assoc_name)
+                .unwrap_or(self.ctx.types.types.error);
+        }
         let (assoc_type, trait_args) = match res {
             Some(TypeNs::GenericParam(param)) => {
                 let AssocTypeShorthandResolution::Resolved(assoc_type) =
@@ -547,6 +559,41 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         );
 
         Ty::new_projection_from_args(interner, assoc_type.into(), substs)
+    }
+
+    /// `Type::Name` of a type alias in an inherent impl of the struct, enum or union `ty`, as
+    /// `#![feature(inherent_associated_types)]` has it: the alias's type, with the impl's
+    /// parameters as `ty`'s arguments give them. An impl of `ty` itself is matched, or one of
+    /// its type with the impl's parameters in their order (`impl<T> Foo<T>`); an alias with
+    /// parameters of its own is not.
+    fn inherent_associated_type(&self, ty: Ty<'db>, name: &Name) -> Option<Ty<'db>> {
+        let (db, interner) = (self.ctx.db, self.ctx.interner);
+        let (adt, args) = ty.as_adt()?;
+        let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
+        for (_, module) in def_map.modules(db) {
+            for impl_ in module.scope(db).inherent_impls() {
+                let items = &impl_.impl_items(db).items;
+                let Some(alias) = items.iter().find_map(|(it, item)| match *item {
+                    AssocItemId::TypeAliasId(alias) if it == name => Some(alias),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let own = GenericArgs::identity_for_item(interner, impl_.into());
+                let impl_args = match db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip()
+                {
+                    it if it == ty => own,
+                    it if it.as_adt() == Some((adt, own)) && own.len() == args.len() => args,
+                    _ => continue,
+                };
+                if GenericArgs::identity_for_item(interner, alias.into()).len() != impl_args.len() {
+                    continue;
+                }
+                let aliased = db.ty(alias.into()).instantiate(interner, impl_args).skip_norm_wip();
+                return Some(aliased);
+            }
+        }
+        None
     }
 
     fn lower_path_inner(&mut self, typeable: TyDefId, infer_args: bool, span: Span) -> Ty<'db> {

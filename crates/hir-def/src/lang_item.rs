@@ -630,6 +630,8 @@ language_item_table! { LangItems =>
     FuturePoll,              sym::poll,                FunctionId;
     FutureOutput,            sym::future_output,       TypeAliasId;
 
+    TypeId,                  sym::type_id,             StructId;
+
     Option,                  sym::Option,              EnumId;
     OptionSome,              sym::Some,                EnumVariantId;
     OptionNone,              sym::None,                EnumVariantId;

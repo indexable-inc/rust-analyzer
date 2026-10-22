@@ -399,6 +399,15 @@ pub fn monomorphized<'db>(
     Ok(body)
 }
 
+/// `ty` of a monomorphized body with its aliases normalized, as the body's own types are.
+pub(crate) fn normalized_ty<'db>(
+    db: &'db dyn HirDatabase,
+    ty: Ty<'db>,
+    trait_env: ParamEnvAndCrate<'db>,
+) -> Result<Ty<'db>, MirLowerError<'db>> {
+    ty.try_fold_with(&mut Filler::new(db, trait_env, GenericArgs::empty()))
+}
+
 #[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_cycle_result)]
 pub fn monomorphized_mir_body_query<'db>(
     db: &'db dyn HirDatabase,

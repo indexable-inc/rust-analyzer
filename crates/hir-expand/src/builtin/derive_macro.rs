@@ -93,6 +93,7 @@ register_builtin! {
     CoercePointee => coerce_pointee_expand,
     Reborrow => reborrow_expand,
     CoerceShared => coerce_shared_expand,
+    ConstParamTy => const_param_ty_expand,
 }
 
 pub fn find_builtin_derive(ident: &name::Name) -> Option<BuiltinDeriveExpander> {
@@ -614,6 +615,24 @@ fn copy_expand(
         span,
         tt,
         quote! {span => #krate::marker::Copy },
+        true,
+        |_| quote! {span =>},
+    )
+}
+
+/// `#[derive(ConstParamTy)]` (`adt_const_params`): the marker trait, named apart from the
+/// macro in `core::marker`.
+fn const_param_ty_expand(
+    db: &dyn SourceDatabase,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = dollar_crate(span);
+    expand_simple_derive(
+        db,
+        span,
+        tt,
+        quote! {span => #krate::marker::ConstParamTy_ },
         true,
         |_| quote! {span =>},
     )

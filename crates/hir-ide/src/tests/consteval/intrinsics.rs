@@ -168,6 +168,109 @@ fn type_name() {
     );
 }
 
+const TYPE_INFO: &str = r#"
+    //- minicore: option
+    #![feature(lang_items)]
+    #[lang = "type_id"]
+    pub struct TypeId { t: (u64, u64) }
+
+    #[rustc_intrinsic]
+    pub const fn type_id<T: ?Sized>() -> TypeId;
+    #[rustc_intrinsic]
+    pub const fn type_id_variants(id: TypeId) -> usize;
+    #[rustc_intrinsic]
+    pub const fn type_id_fields(id: TypeId, variant: usize) -> usize;
+    #[rustc_intrinsic]
+    pub const fn type_id_field_representing_type(id: TypeId, variant: usize, field: usize) -> TypeId;
+    #[rustc_intrinsic]
+    pub const fn field_representing_type_actual_type_id(id: TypeId) -> TypeId;
+    #[rustc_intrinsic]
+    pub const fn field_representing_type_name(id: TypeId) -> &'static str;
+    #[rustc_intrinsic]
+    pub const fn field_representing_type_offset(id: TypeId) -> usize;
+    #[rustc_intrinsic]
+    pub const fn size_of_type_id(id: TypeId) -> Option<usize>;
+    #[rustc_intrinsic]
+    pub const fn type_id_points_to(id: TypeId) -> Option<TypeId>;
+    #[rustc_intrinsic]
+    pub const fn variant_name(id: TypeId, variant: usize) -> &'static str;
+
+    const fn same(a: TypeId, b: TypeId) -> bool {
+        a.t.0 == b.t.0 && a.t.1 == b.t.1
+    }
+    const fn field(base: TypeId, field: usize) -> TypeId {
+        field_representing_type_actual_type_id(type_id_field_representing_type(base, 0, field))
+    }
+
+    struct Point<'a> { x: u32, y: u8, name: &'a str }
+    #[repr(C)]
+    struct Packed { x: u32, y: u8 }
+    enum Shape { Dot, Line(u16, u64) }
+"#;
+
+#[test]
+fn type_info_counts_and_measures() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const GOAL: usize = {{
+                let point = type_id::<Point<'static>>();
+                let shape = type_id::<Shape>();
+                let size = match size_of_type_id(field(point, 1)) {{ Some(it) => it, None => 9 }};
+                let offset = field_representing_type_offset(
+                    type_id_field_representing_type(type_id::<Packed>(), 0, 1),
+                );
+                type_id_variants(point)
+                    + type_id_fields(point, 0) * 10
+                    + size * 100
+                    + type_id_variants(shape) * 1000
+                    + type_id_fields(shape, 1) * 10000
+                    + same(field(point, 2), type_id::<&str>()) as usize * 100000
+                    + offset * 1000000
+            }};"
+        ),
+        4122131,
+    );
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const GOAL: bool = match type_id_points_to(type_id::<&Shape>()) {{
+                Some(it) => same(it, type_id::<Shape>()),
+                None => false,
+            }};"
+        ),
+        1,
+    );
+}
+
+#[test]
+fn type_info_names() {
+    check_str(
+        &format!(
+            "{TYPE_INFO}
+            const GOAL: &str = field_representing_type_name(
+                type_id_field_representing_type(type_id::<Point<'static>>(), 0, 1),
+            );"
+        ),
+        "y",
+    );
+    check_str(
+        &format!("{TYPE_INFO}\n    const GOAL: &str = variant_name(type_id::<Shape>(), 1);"),
+        "Line",
+    );
+}
+
+#[test]
+fn type_info_out_of_bounds_and_escaping_ids() {
+    check_fail(
+        &format!("{TYPE_INFO}\n    const GOAL: usize = type_id_fields(type_id::<Shape>(), 2);"),
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
+    );
+    check_fail(&format!("{TYPE_INFO}\n    const GOAL: TypeId = type_id::<u8>();"), |e| {
+        matches!(e, ConstEvalError::MirEvalError(MirEvalError::NotSupported(_)))
+    });
+}
+
 #[test]
 fn transmute() {
     check_number(

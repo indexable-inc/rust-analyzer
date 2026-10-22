@@ -23,7 +23,7 @@ mod benchmark;
 mod tests;
 
 use span::{Edition, Span, SyntaxContext};
-use syntax_bridge::to_parser_input;
+use syntax_bridge::to_matcher_input;
 use tt::DelimSpan;
 use tt::iter::TtIter;
 
@@ -404,7 +404,7 @@ pub fn expect_fragment<'t>(
 ) -> ExpandResult<tt::TokenTreesView<'t>> {
     use ::parser;
     let buffer = tt_iter.remaining();
-    let parser_input = to_parser_input(buffer, &mut |ctx| ctx.edition(db));
+    let parser_input = to_matcher_input(buffer, &mut |ctx| ctx.edition(db));
     let tree_traversal = entry_point.parse(&parser_input);
     let mut cursor = buffer.cursor();
     let mut error = false;

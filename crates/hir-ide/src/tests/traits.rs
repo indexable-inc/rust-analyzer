@@ -463,6 +463,43 @@ fn test<T: Iterable>() {
 }
 
 #[test]
+fn inherent_associated_types() {
+    check_types(
+        r#"
+#![feature(inherent_associated_types)]
+struct Worker;
+impl Worker {
+    fn get(_: u8) -> Worker { Worker }
+}
+struct Pool;
+impl Pool {
+    type Worker = Worker;
+    fn worker() -> Self::Worker { Worker }
+}
+struct Wrap<T>(T);
+impl<T> Wrap<T> {
+    type Inner = T;
+}
+impl Wrap<u8> {
+    type Only = (u8, u8);
+}
+fn test() {
+    let w = Pool::Worker::get(0);
+    w;
+  //^ Worker
+    let v: Wrap<u32>::Inner = 0;
+    v;
+  //^ u32
+    let o: Wrap<u8>::Only;
+    o;
+  //^ (u8, u8)
+    Pool::worker();
+  //^^^^^^^^^^^^^^ Worker
+}"#,
+    );
+}
+
+#[test]
 fn associated_type_shorthand_from_self_issue_12484() {
     check_types(
         r#"

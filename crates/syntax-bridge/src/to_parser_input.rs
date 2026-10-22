@@ -9,7 +9,27 @@ pub fn to_parser_input(
     buffer: tt::TokenTreesView<'_>,
     span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
 ) -> parser::Input {
+    convert(buffer, span_to_edition, false)
+}
+
+/// The input of a macro's matcher: the first token of each group without delimiters, which is
+/// a fragment a macro transcribed, is marked as one, so that a matcher parses it whole, as rustc
+/// does. `count` followed by `$n` of `0u8 + 1u8` is no call of `count` to `(0u8 + 1u8)`.
+pub fn to_matcher_input(
+    buffer: tt::TokenTreesView<'_>,
+    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+) -> parser::Input {
+    convert(buffer, span_to_edition, true)
+}
+
+fn convert(
+    buffer: tt::TokenTreesView<'_>,
+    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    fragments: bool,
+) -> parser::Input {
     let mut res = parser::Input::with_capacity(buffer.len());
+    // Where the fragment that was opened last starts, until its first token is pushed.
+    let mut fragment_at = None;
 
     let mut current = buffer.cursor();
     let mut syntax_context_to_edition_cache = FxHashMap::default();
@@ -17,6 +37,12 @@ pub fn to_parser_input(
         |ctx| *syntax_context_to_edition_cache.entry(ctx).or_insert_with(|| span_to_edition(ctx));
 
     while !current.eof() {
+        if let Some(at) = fragment_at
+            && res.len() > at
+        {
+            res.mark_fragment_start(at);
+            fragment_at = None;
+        }
         let tt = current.token_tree();
 
         // Check if it is lifetime
@@ -95,6 +121,8 @@ pub fn to_parser_input(
                     tt::DelimiterKind::Invisible => None,
                 } {
                     res.push(kind, ctx_edition(subtree.delimiter.open.ctx));
+                } else if fragments && fragment_at.is_none() {
+                    fragment_at = Some(res.len());
                 }
                 current.bump();
             }
@@ -110,6 +138,11 @@ pub fn to_parser_input(
                 }
             }
         };
+    }
+    if let Some(at) = fragment_at
+        && res.len() > at
+    {
+        res.mark_fragment_start(at);
     }
 
     res

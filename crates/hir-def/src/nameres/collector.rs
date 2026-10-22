@@ -2745,9 +2745,9 @@ impl ModCollector<'_, '_> {
             self.def_collector.def_map.recursion_limit(),
             |path| {
                 let def_map = &self.def_collector.def_map;
-                let Some(name) = path.as_ident() else {
-                    // Where the path goes on in another crate, that crate is collected in full,
-                    // so what it names there it will still name once this crate is.
+                // Where the path goes on in another crate, that crate is collected in full, so
+                // what it names there it will still name once this crate is.
+                let of_another_crate = |path: &ModPath| {
                     let local_def_map = self
                         .def_collector
                         .crate_local_def_map
@@ -2761,12 +2761,32 @@ impl ModCollector<'_, '_> {
                         BuiltinShadowMode::Module,
                         Some(MacroSubNs::Bang),
                     );
-                    let whole = resolved.segment_index.is_none() && resolved.prefix_info.differing_crate;
-                    return resolved
+                    let whole =
+                        resolved.segment_index.is_none() && resolved.prefix_info.differing_crate;
+                    resolved
                         .resolved_def
                         .take_macros()
                         .filter(|&id| whole && sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
-                        .map(|it| it.definition(db));
+                        .map(|it| it.definition(db))
+                };
+                let Some(name) = path.as_ident() else { return of_another_crate(path) };
+                // A name a `use` of this module imports from another crate (`use cfg_if::cfg_if;`)
+                // is not in its scope until imports are resolved, after this call would be:
+                // lol_html's `cfg_if!` defines its `trace!` for the modules that follow.
+                let imported = || {
+                    self.def_collector.unresolved_imports.iter().find_map(|it| {
+                        let import = &it.import;
+                        let named = match &import.alias {
+                            Some(ImportAlias::Alias(alias)) => alias,
+                            Some(ImportAlias::Underscore) => return None,
+                            None => import.path.segments().last()?,
+                        };
+                        let plain = matches!(import.source.kind, ImportKind::Plain);
+                        if it.module_id != self.module_id || !plain || named != name {
+                            return None;
+                        }
+                        of_another_crate(&import.path)
+                    })
                 };
                 def_map
                     .legacy_macro_in_textual_scope(db, self.module_id, name)
@@ -2780,6 +2800,7 @@ impl ModCollector<'_, '_> {
                     .or_else(|| Some(def_map.macro_use_prelude.get(name).copied()?.0))
                     .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
                     .map(|it| it.definition(self.def_collector.db))
+                    .or_else(imported)
             },
             &mut |ptr, call_id| eager_callback_buffer.push((ptr, call_id)),
         ) {

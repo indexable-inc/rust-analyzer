@@ -75,6 +75,12 @@ impl<'t> Parser<'t> {
         self.inp.kind(self.pos + n)
     }
 
+    /// Whether the current token starts a fragment a macro transcribed, which goes on no
+    /// expression before it.
+    pub(crate) fn at_fragment_start(&self) -> bool {
+        self.inp.is_fragment_start(self.pos)
+    }
+
     /// Checks if the current token is `kind`.
     pub(crate) fn at(&self, kind: SyntaxKind) -> bool {
         self.nth_at(0, kind)

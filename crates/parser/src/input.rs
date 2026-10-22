@@ -17,6 +17,8 @@ type bits = u64;
 pub struct Input {
     kind: Vec<SyntaxKind>,
     joint: Vec<bits>,
+    /// The tokens that start a fragment a macro transcribed, one whole to what follows it.
+    fragment: Vec<bits>,
     contextual_kind: Vec<SyntaxKind>,
     edition: Vec<Edition>,
 }
@@ -28,6 +30,7 @@ impl Input {
         Self {
             kind: Vec::with_capacity(capacity),
             joint: Vec::with_capacity(capacity.div_ceil(bits::BITS as usize)),
+            fragment: Vec::with_capacity(capacity.div_ceil(bits::BITS as usize)),
             contextual_kind: Vec::with_capacity(capacity),
             edition: Vec::with_capacity(capacity),
         }
@@ -62,11 +65,20 @@ impl Input {
         let (idx, b_idx) = self.bit_index(n);
         self.joint[idx] |= 1 << b_idx;
     }
+    /// Marks token `n` as the first of a fragment that a macro transcribed (an `$e:expr`): as
+    /// to rustc, the fragment is one operand, which nothing before it takes as its operator,
+    /// call or index.
+    #[inline]
+    pub fn mark_fragment_start(&mut self, n: usize) {
+        let (idx, b_idx) = self.bit_index(n);
+        self.fragment[idx] |= 1 << b_idx;
+    }
     #[inline]
     fn push_impl(&mut self, kind: SyntaxKind, contextual_kind: SyntaxKind, edition: Edition) {
         let idx = self.len();
         if idx.is_multiple_of(bits::BITS as usize) {
             self.joint.push(0);
+            self.fragment.push(0);
         }
         self.kind.push(kind);
         self.contextual_kind.push(contextual_kind);
@@ -88,6 +100,10 @@ impl Input {
     pub(crate) fn is_joint(&self, n: usize) -> bool {
         let (idx, b_idx) = self.bit_index(n);
         self.joint[idx] & (1 << b_idx) != 0
+    }
+    pub(crate) fn is_fragment_start(&self, n: usize) -> bool {
+        let (idx, b_idx) = self.bit_index(n);
+        self.fragment.get(idx).is_some_and(|it| it & (1 << b_idx) != 0)
     }
 }
 

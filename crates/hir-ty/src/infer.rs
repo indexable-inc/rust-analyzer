@@ -1119,7 +1119,16 @@ impl<'db> InferenceResult<'db> {
     ) -> &'db InferenceResult<'db> {
         match def.into() {
             InferBodyId::DefWithBodyId(it) => InferenceResult::for_body(db, it),
-            InferBodyId::AnonConstId(it) => InferenceResult::for_anon_const(db, it),
+            InferBodyId::AnonConstId(it) => {
+                // A `const { .. }` block of a body, which MIR lowering makes a constant of its
+                // own, was inferred with the body, as rustc infers inline consts.
+                if let ExpressionStoreOwnerId::Body(body) = it.loc(db).owner
+                    && it.is_inline_const(db)
+                {
+                    return InferenceResult::for_body(db, body);
+                }
+                InferenceResult::for_anon_const(db, it)
+            }
         }
     }
 }

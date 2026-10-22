@@ -2664,6 +2664,228 @@ fn const_impl_assoc() {
 }
 
 #[test]
+fn inline_const_of_a_generic_function() {
+    check_number(
+        r#"
+//- minicore: sized
+struct Wide<T>(T);
+impl<T> Wide<T> {
+    const N: usize = 3;
+}
+fn sized<T>(extra: usize) -> usize {
+    let block = const {
+        let mut total = 0;
+        let mut i = 0;
+        while i < Wide::<T>::N {
+            total += i + 1;
+            i += 1;
+        }
+        total
+    };
+    block * extra
+}
+const GOAL: usize = sized::<u8>(2) + sized::<u32>(10);
+"#,
+        12 + 60,
+    );
+}
+
+#[test]
+fn impl_of_a_macro_in_the_body_of_a_dependency() {
+    check_number(
+        r#"
+//- minicore: sized, tuple
+//- /dtoa/lib.rs crate:dtoa library
+#[macro_use]
+mod diyfp;
+macro_rules! dtoa {
+    (value: $v:expr, significand_type: $sigty:ty, $($param:ident: $value:expr,)*) => {
+        diyfp! { significand_type: $sigty, $($param: $value,)* };
+        let (plus, minus) = DiyFp::new($v, 0).boundaries();
+        plus.f * 10 + minus.f
+    };
+}
+pub trait Write { fn write(self) -> u32; }
+impl Write for u32 {
+    fn write(self) -> u32 {
+        dtoa! { value: self, significand_type: u32, factor: 3, }
+    }
+}
+//- /dtoa/diyfp.rs
+pub struct DiyFp<F, E> { pub f: F, pub e: E }
+impl<F, E> DiyFp<F, E> {
+    pub const fn new(f: F, e: E) -> Self { DiyFp { f, e } }
+}
+macro_rules! diyfp {
+    (significand_type: $sigty:ty, factor: $factor:expr,) => {
+        type DiyFp = diyfp::DiyFp<$sigty, i32>;
+        impl DiyFp {
+            const fn normalize(self) -> DiyFp { DiyFp::new(self.f * $factor, self.e) }
+            const fn boundaries(self) -> (DiyFp, DiyFp) {
+                let plus = DiyFp::new(self.f + 1, self.e - 1).normalize();
+                (plus, self)
+            }
+        }
+    };
+}
+//- /main.rs crate:main deps:dtoa
+use dtoa::Write;
+const GOAL: u32 = 4u32.write();
+"#,
+        154,
+    );
+}
+
+#[test]
+fn macro_defined_by_cfg_if_in_a_macro_use_module() {
+    check_number(
+        r#"
+//- minicore: option, index, slice
+//- /cfg_if.rs crate:cfg_if
+#[macro_export]
+macro_rules! cfg_if {
+    (
+        if #[cfg( $($i_meta:tt)+ )] { $( $i_tokens:tt )* }
+        $( else if #[cfg( $($ei_meta:tt)+ )] { $( $ei_tokens:tt )* } )*
+        $( else { $( $e_tokens:tt )* } )?
+    ) => {
+        $crate::cfg_if! {
+            @__items () ;
+            (( $($i_meta)+ ) ( $( $i_tokens )* )),
+            $( (( $($ei_meta)+ ) ( $( $ei_tokens )* )), )*
+            $( (() ( $( $e_tokens )* )), )?
+        }
+    };
+    (@__items ( $( ($($_:tt)*) , )* ) ; ) => {};
+    (
+        @__items ( $( ($($no:tt)+) , )* ) ;
+        (( $( $($yes:tt)+ )? ) ( $( $tokens:tt )* )),
+        $( $rest:tt , )*
+    ) => {
+        #[cfg(all(
+            $( $($yes)+ , )?
+            not(any( $( $($no)+ ),* ))
+        ))]
+        $crate::cfg_if! { @__temp_group $( $tokens )* }
+        $crate::cfg_if! {
+            @__items ( $( ($($no)+) , )* $( ($($yes)+) , )? ) ;
+            $( $rest , )*
+        }
+    };
+    (@__temp_group $( $tokens:tt )* ) => {
+        $( $tokens )*
+    };
+}
+//- /main.rs crate:main deps:cfg_if
+#[macro_use]
+mod base {
+    #[macro_use]
+    mod debug_trace {
+        use cfg_if::cfg_if;
+        cfg_if! {
+            if #[cfg(feature = "debug_trace")] {
+                macro_rules! trace { ( @$ty:ident $($args:tt)* ) => { panic!() }; }
+            } else {
+                macro_rules! trace {
+                    ( @$ty:ident $($args:tt)* ) => {};
+                    ( @$ty:ident $($args:tt),* ) => {};
+                }
+            }
+        }
+    }
+}
+mod parser {
+    pub struct Cursor { pub next_pos: usize }
+    impl Cursor {
+        pub const fn consume_ch(&mut self, input: &[u8]) -> Option<u8> {
+            let ch = if self.next_pos < input.len() { Some(input[self.next_pos]) } else { None };
+            self.next_pos += 1;
+            trace!(@chars "consume", ch);
+            ch
+        }
+    }
+}
+const GOAL: u8 = {
+    let mut cursor = parser::Cursor { next_pos: 1 };
+    match cursor.consume_ch(b"xyz") { Some(ch) => ch, None => 0 }
+};
+"#,
+        b'y' as i128,
+    );
+}
+
+#[test]
+fn expression_fragment_is_one_operand_to_the_next_matcher() {
+    // bun's `task_tag::tags!`: `tags!(@count (0u8 + 1u8) + 1u8,)` is not `@ $n:expr,` of a call
+    // of `count`, as the fragment is one whole.
+    check_number(
+        r#"
+//- minicore: index, slice, option
+#[rustc_builtin_macro]
+macro_rules! stringify {}
+pub struct TaskTag(pub u8);
+pub mod task_tag {
+    use super::TaskTag;
+    macro_rules! tags {
+        ($($name:ident),* $(,)?) => {
+            tags!(@ 0u8, $($name,)*);
+            pub const COUNT: u8 = tags!(@count 0u8, $($name,)*);
+            pub const NAMES: [&str; COUNT as usize] = [$(stringify!($name)),*];
+        };
+        (@ $n:expr, $head:ident, $($rest:ident,)*) => {
+            pub const $head: TaskTag = TaskTag($n);
+            tags!(@ $n + 1u8, $($rest,)*);
+        };
+        (@ $n:expr,) => {};
+        (@count $n:expr, $head:ident, $($rest:ident,)*) => { tags!(@count $n + 1u8, $($rest,)*) };
+        (@count $n:expr,) => { $n };
+    }
+    tags! {
+        AnyTaskJob,
+        AsyncModule,
+        BakeHotReloadEvent,
+        ChromePipeEvent,
+        Close,
+    }
+}
+const GOAL: usize = task_tag::NAMES.len() * 1000 + task_tag::Close.0 as usize;
+"#,
+        5004,
+    );
+}
+
+#[test]
+fn adt_const_params() {
+    check_number(
+        r#"
+//- minicore: const_param_ty
+#![feature(adt_const_params)]
+use core::marker::ConstParamTy;
+#[derive(PartialEq, Eq, ConstParamTy)]
+enum Requirement { Connected, Not(u8), Pair { a: u16, b: bool } }
+#[derive(PartialEq, Eq, ConstParamTy)]
+struct Point(u8, u32);
+const fn check<const R: Requirement>() -> u32 {
+    match R {
+        Requirement::Connected => 1,
+        Requirement::Not(x) => x as u32 * 10,
+        Requirement::Pair { a, b } => a as u32 * 100 + b as u32,
+    }
+}
+const fn sum<const P: Point, const T: (u8, [u16; 2])>() -> u32 {
+    let (a, [b, c]) = T;
+    P.0 as u32 + P.1 + a as u32 + b as u32 + c as u32
+}
+const GOAL: u32 = check::<{ Requirement::Connected }>()
+    + check::<{ Requirement::Not(3) }>()
+    + check::<{ Requirement::Pair { a: 4, b: true } }>()
+    + sum::<{ Point(1, 1000) }, { (2, [20, 300]) }>();
+"#,
+        1 + 30 + 401 + 1323,
+    );
+}
+
+#[test]
 fn const_generic_subst_fn() {
     check_number(
         r#"

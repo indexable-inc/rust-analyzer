@@ -23,6 +23,7 @@
 //!     clone: sized
 //!     coerce_pointee: derive, sized, unsize, coerce_unsized, dispatch_from_dyn
 //!     reborrow: derive, copy
+//!     const_param_ty: derive, eq
 //!     coerce_unsized: unsize
 //!     concat:
 //!     copy: clone
@@ -224,6 +225,14 @@ pub mod marker {
     #[lang = "coerce_shared"]
     pub trait CoerceShared<Target: Copy>: Reborrow {}
     // endregion:reborrow
+
+    // region:const_param_ty
+    #[lang = "const_param_ty"]
+    pub trait ConstParamTy_: crate::cmp::Eq {}
+
+    #[rustc_builtin_macro]
+    pub macro ConstParamTy($item:item) {}
+    // endregion:const_param_ty
 }
 
 // region:default

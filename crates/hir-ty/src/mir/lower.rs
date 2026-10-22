@@ -24,7 +24,7 @@ use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    CoroutineArgs, CoroutineArgsParts,
+    CoroutineArgs, CoroutineArgsParts, TypeVisitableExt,
     inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
 };
 use salsa::SalsaValue;
@@ -33,7 +33,10 @@ use span::Edition;
 use crate::{
     Adjust, Adjustment, AutoBorrow, CallableDefId, InferBodyId, ParamEnvAndCrate,
     consteval::{ConstEvalError, try_const_usize},
-    db::{GeneralConstId, HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
+    db::{
+        AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase, InternedClosure, InternedClosureId,
+        InternedCoroutineId,
+    },
     generics::generics,
     infer::{
         AllowTwoPhase, AutoBorrowMutability, CaptureSourceStack, CapturedPlace, UpvarCapture,
@@ -44,6 +47,7 @@ use crate::{
     },
     inhabitedness::is_ty_uninhabited_from,
     layout::LayoutError,
+    lower::LoweringMode,
     method_resolution::CandidateId,
     mir::{
         AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
@@ -53,8 +57,8 @@ use crate::{
         Terminator, TerminatorKind, Ty, UnOp, VariantId, return_slot,
     },
     next_solver::{
-        Const, DbInterner, ParamConst, ParamEnv, Region, StoredGenericArgs, StoredTy, TyKind,
-        TypingMode, UnevaluatedConst,
+        Const, DbInterner, ParamConst, ParamEnv, Region, StoredEarlyBinder, StoredGenericArgs,
+        StoredTy, TyKind, TypingMode, UnevaluatedConst,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -1335,6 +1339,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             &Expr::Await { expr } => self.lower_await(expr, expr_id, place, current),
             Expr::Yeet { .. } => not_supported!("yeet"),
+            Expr::Const(_) if let Some(konst) = self.inline_const(expr_id) => {
+                let subst = GenericArgs::identity_for_item(
+                    self.interner(),
+                    self.owner.generic_def(self.db).into(),
+                );
+                self.lower_const(konst.into(), current, place, subst, expr_id.into())?;
+                Ok(Some(current))
+            }
             &Expr::Const(id) => {
                 // Inline const blocks (`const { .. }`) are stored with their inner expression in
                 // the same body (see inference, which infers the inner expression directly), so we
@@ -1592,13 +1604,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 if let hir_def::hir::BinaryOp::Assignment { op: Some(op) } = op {
                     // last adjustment is `&mut` which we don't want it.
-                    let adjusts = self
-                        .infer
-                        .expr_adjustments
-                        .get(lhs)
-                        .and_then(|it| it.split_last())
-                        .map(|it| it.1)
-                        .ok_or(MirLowerError::TypeError("adjustment of binary op was missing"))?;
+                    let adjusts = match self.infer.expr_adjustments.get(lhs) {
+                        Some(it) if let Some((_, rest)) = it.split_last() => rest,
+                        // A scalar's operator is not looked up while its type is still an
+                        // integer variable (`let mut n = 0; n += i;`), so there is no `&mut`
+                        // to take off: the place is the operand.
+                        _ if is_builtin => &[],
+                        _ => {
+                            return Err(MirLowerError::TypeError(
+                                "adjustment of binary op was missing",
+                            ));
+                        }
+                    };
                     // rustc evaluates the right-hand side of a built-in compound assignment
                     // before the place it assigns to.
                     let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)?
@@ -2126,6 +2143,32 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         let c = self.lower_const_to_operand(subst, const_id)?;
         self.push_assignment(prev_block, place, c.into(), span);
         Ok(())
+    }
+
+    /// A function's `const { .. }` block as the constant it is, evaluated for each instance of
+    /// the function as rustc's inline consts are: what only runs at compile time
+    /// (`#[rustc_comptime]`, `type_info`'s intrinsics) is then never code of the function. The
+    /// block of a constant's own body is lowered in place, as it is already evaluated. The
+    /// constant is the `const { .. }` expression, which owns the block's bindings.
+    fn inline_const(&self, expr: ExprId) -> Option<AnonConstId<'db>> {
+        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)) = self.owner else {
+            return None;
+        };
+        let ty = self.expr_ty_without_adjust(expr);
+        if ty.references_non_lt_error() || ty.has_infer() {
+            return None;
+        }
+        let token = LoweringMode::Analysis.allow_tracked_structs()?;
+        Some(AnonConstId::new(
+            self.db,
+            AnonConstLoc {
+                owner: self.store_owner,
+                expr,
+                ty: StoredEarlyBinder::bind(ty.store()),
+                allow_using_generic_params: true,
+            },
+            token,
+        ))
     }
 
     fn lower_const_to_operand(

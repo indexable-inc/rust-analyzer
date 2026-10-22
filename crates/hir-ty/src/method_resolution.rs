@@ -644,7 +644,7 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
 fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
     let local = krate.data(db).origin.is_local();
-    let holds = |it: FunctionId| local || holds_impl(db, it);
+    let holds = |it: FunctionId| local || holds_impl(db, krate, it);
     let declared = scope.declarations().filter_map(|def| match def {
         ModuleDefId::FunctionId(it) if holds(it) => Some(DefWithBodyId::from(it)),
         ModuleDefId::StaticId(it) if local => Some(DefWithBodyId::from(it)),
@@ -661,9 +661,10 @@ fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<De
     holders
 }
 
-/// Whether an impl of [`impls_in_bodies`] is in the text of `function`. The file is parsed for
-/// the function's range only when its lexing found one.
-fn holds_impl(db: &dyn HirDatabase, function: FunctionId) -> bool {
+/// Whether an impl of [`impls_in_bodies`] is in the text of `function`, or a call of one of
+/// `krate`'s [`macros_writing_impls`]. The file is parsed for the function's range only when its
+/// lexing found one.
+fn holds_impl(db: &dyn HirDatabase, krate: Crate, function: FunctionId) -> bool {
     let ast_id = function.loc(db).id;
     let Some(file) = ast_id.file_id.file_id() else { return false };
     let at = impls_in_bodies(db, file);
@@ -671,14 +672,21 @@ fn holds_impl(db: &dyn HirDatabase, function: FunctionId) -> bool {
         return false;
     }
     let range = ast_id.file_id.ast_id_map(db).get(ast_id.value).text_range();
-    at.iter().any(|&it| range.contains(it))
+    at.iter().any(|(it, call)| {
+        range.contains(*it)
+            && call.as_ref().is_none_or(|name| macros_writing_impls(db, krate).contains(name))
+    })
 }
 
 /// Where `file` writes an impl in the body of a function, found by its tokens: an `impl` after
 /// `{`, `}`, `;`, an attribute or `unsafe`, inside the braces that follow `fn name`. A macro's
-/// `impl` is found as well, which costs a lowering and nothing else.
+/// `impl` is found as well, which costs a lowering and nothing else. A macro called in a body
+/// is found with its name, for an impl the macro writes.
 #[salsa::tracked(returns(deref))]
-fn impls_in_bodies(db: &dyn HirDatabase, file: base_db::EditionedFileId) -> Box<[TextSize]> {
+fn impls_in_bodies(
+    db: &dyn HirDatabase,
+    file: base_db::EditionedFileId,
+) -> Box<[(TextSize, Option<Symbol>)]> {
     let text = db.file_text(file.file_id(db)).text(db);
     let lexed = syntax::LexedStr::new(file.edition(db), text);
     // For each open brace, whether it is a function's body.
@@ -688,6 +696,7 @@ fn impls_in_bodies(db: &dyn HirDatabase, file: base_db::EditionedFileId) -> Box<
     let mut nested = 0usize;
     let mut signature = None;
     let mut previous = SyntaxKind::EOF;
+    let mut previous_at = 0;
     let mut found = Vec::new();
     for i in 0..lexed.len() {
         let kind = lexed.kind(i);
@@ -709,11 +718,120 @@ fn impls_in_bodies(db: &dyn HirDatabase, file: base_db::EditionedFileId) -> Box<
                 if bodies > 0
                     && matches!(previous, T!['{'] | T!['}'] | T![;] | T![']'] | T![unsafe]) =>
             {
-                found.push(TextSize::from(lexed.text_start(i) as u32));
+                found.push((TextSize::from(lexed.text_start(i) as u32), None));
+            }
+            T![!] if bodies > 0 && previous == SyntaxKind::IDENT => {
+                let name = Symbol::intern(lexed.text(previous_at));
+                found.push((TextSize::from(lexed.text_start(previous_at) as u32), Some(name)));
             }
             _ => {}
         }
         previous = kind;
+        previous_at = i;
+    }
+    found.into()
+}
+
+/// The `macro_rules!` of `krate` and of its dependencies that write an impl, in their own text
+/// or by calling another that does: dtoa's `dtoa!`, called in the body of `<f64 as
+/// Sealed>::write`, calls `diyfp!`, which writes `impl DiyFp` there. Known by name, so a
+/// macro of the same name costs a lowering and nothing else.
+#[salsa::tracked(returns(deref))]
+fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Symbol]> {
+    let mut writing: Vec<Symbol> = krate
+        .data(db)
+        .dependencies
+        .iter()
+        .flat_map(|dep| macros_writing_impls(db, dep.crate_id).iter().cloned())
+        .collect();
+    let mut calling = Vec::new();
+    let mut files = FxHashSet::default();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        let Some(file) = module.origin.file_id() else { continue };
+        if !files.insert(file) {
+            continue;
+        }
+        for (name, writes, calls) in macro_definitions(db, file) {
+            match writes {
+                true => writing.push(name.clone()),
+                false => calling.push((name, calls)),
+            }
+        }
+    }
+    loop {
+        let before = writing.len();
+        calling.retain(|&(name, calls)| {
+            let writes = calls.iter().any(|it| writing.contains(it));
+            if writes {
+                writing.push(name.clone());
+            }
+            !writes
+        });
+        if writing.len() == before {
+            break;
+        }
+    }
+    writing.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    writing.dedup();
+    writing.into()
+}
+
+/// The `macro_rules!` of `file`, found by its tokens: each one's name, whether its text writes
+/// an impl (an `impl` after `{`, `}`, `;`, `(`, `*`, an attribute or `unsafe`) and the names of
+/// the macros it calls.
+#[salsa::tracked(returns(deref))]
+fn macro_definitions(
+    db: &dyn HirDatabase,
+    file: base_db::EditionedFileId,
+) -> Box<[(Symbol, bool, Box<[Symbol]>)]> {
+    let text = db.file_text(file.file_id(db)).text(db);
+    if !text.contains("macro_rules") {
+        return Box::default();
+    }
+    let lexed = syntax::LexedStr::new(file.edition(db), text);
+    let tokens: Vec<usize> = (0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia()).collect();
+    let kind = |at: usize| tokens.get(at).map_or(SyntaxKind::EOF, |&i| lexed.kind(i));
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        let definition = kind(at) == SyntaxKind::IDENT
+            && lexed.text(tokens[at]) == "macro_rules"
+            && kind(at + 1) == T![!]
+            && kind(at + 2) == SyntaxKind::IDENT
+            && matches!(kind(at + 3), T!['{'] | T!['('] | T!['[']);
+        if !definition {
+            at += 1;
+            continue;
+        }
+        let name = Symbol::intern(lexed.text(tokens[at + 2]));
+        let (mut writes, mut calls, mut depth) = (false, Vec::new(), 0usize);
+        at += 3;
+        while at < tokens.len() {
+            match kind(at) {
+                T!['{'] | T!['('] | T!['['] => depth += 1,
+                T!['}'] | T![')'] | T![']'] => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                T![impl]
+                    if matches!(
+                        kind(at - 1),
+                        T!['{'] | T!['}'] | T![;] | T!['('] | T![*] | T![']'] | T![unsafe]
+                    ) =>
+                {
+                    writes = true
+                }
+                T![!] if kind(at - 1) == SyntaxKind::IDENT && kind(at - 2) != T![$] => {
+                    calls.push(Symbol::intern(lexed.text(tokens[at - 1])))
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        found.push((name, writes, calls.into()));
+        at += 1;
     }
     found.into()
 }

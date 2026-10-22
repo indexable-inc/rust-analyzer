@@ -42,7 +42,7 @@ use triomphe::Arc;
 use crate::{
     CallableDefId, ComplexMemoryMap, InferBodyId, InferenceResult, MemoryMap, ParamEnvAndCrate,
     consteval::{self, ConstEvalError, try_const_usize},
-    db::{GeneralConstId, HirDatabase, InternedClosureId},
+    db::{AnonConstId, GeneralConstId, HirDatabase, InternedClosureId},
     infer::PointerCast,
     layout::{Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
@@ -227,9 +227,9 @@ pub struct Evaluator<'db> {
     cached_fn_mut_trait_func: Option<FunctionId>,
     cached_fn_once_trait_func: Option<FunctionId>,
     crate_id: Crate,
-    /// The types whose `TypeId` was asked for. An id here is the type's place in this list,
-    /// which says whether two are of one type and is not the hash compiled code has.
-    type_ids: Vec<Ty<'db>>,
+    /// What the `TypeId`s made so far stand for. An id here is its place in this list, which
+    /// says whether two are of one type and is not the hash compiled code has.
+    type_ids: Vec<TypeIdOf<'db>>,
     // FIXME: This is a workaround, see the comment on `interpret_mir`
     assert_placeholder_ty_is_unused: bool,
     /// A general limit on execution, to prevent non terminating programs from breaking r-a main process
@@ -239,6 +239,14 @@ pub struct Evaluator<'db> {
     /// Maximum count of bytes that heap and stack can grow
     memory_limit: usize,
     infcx: InferCtxt<'db>,
+}
+
+/// What a `TypeId` of the evaluation stands for: a type, or the type that stands for a field
+/// of one in reflection (`type_id_field_representing_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeIdOf<'db> {
+    Ty(Ty<'db>),
+    Field { base: Ty<'db>, variant: usize, field: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -524,9 +532,11 @@ impl<'db> Evaluator<'db> {
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
         let interval = self.interpret_mir(body, None.into_iter())?;
         // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
-        // so only a constant that cannot carry one is answered: a `bool`, which is what
-        // comparing two gives, as `IS_UNIT` in core does.
-        if !self.type_ids.is_empty() && !matches!(ty.kind(), TyKind::Bool) {
+        // so only a constant that cannot carry one is answered: one of a type with no `TypeId`
+        // in it or behind its references. A `TypeId` is pointers to const eval, which cannot
+        // read them as integers, so no other value is computed from an id's bytes: comparing
+        // two (`IS_UNIT` in core) and reflection's counts, sizes and names are answered.
+        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut FxHashSet::default()) {
             not_supported!("a constant computed from a `TypeId`");
         }
         let bytes = interval.get(self)?;
@@ -1991,10 +2001,28 @@ impl<'db> Evaluator<'db> {
         })
     }
 
+    /// The values of `consts`, each in memory of its own.
+    fn allocate_valtrees(
+        &mut self,
+        consts: &[Const<'db>],
+        locals: &Locals<'db>,
+    ) -> Result<'db, Vec<IntervalOrOwned>> {
+        let mut values = Vec::with_capacity(consts.len());
+        for konst in consts {
+            let ConstKind::Value(value) = konst.kind() else {
+                not_supported!("an unevaluated constant in a constant");
+            };
+            let value = self.allocate_valtree_in_heap(value.ty, value.value, locals)?;
+            values.push(IntervalOrOwned::Borrowed(value));
+        }
+        Ok(values)
+    }
+
     fn allocate_valtree_in_heap(
         &mut self,
         ty: Ty<'db>,
         valtree: ValTree<'db>,
+        locals: &Locals<'db>,
     ) -> Result<'db, Interval> {
         match ty.kind() {
             TyKind::Bool => {
@@ -2077,7 +2105,7 @@ impl<'db> Evaluator<'db> {
                         .iter()
                         .map(|konst| match konst.kind() {
                             ConstKind::Value(value) => {
-                                self.allocate_valtree_in_heap(value.ty, value.value)
+                                self.allocate_valtree_in_heap(value.ty, value.value, locals)
                             }
                             _ => not_supported!("unsupported const"),
                         })
@@ -2099,16 +2127,45 @@ impl<'db> Evaluator<'db> {
                 }
                 TyKind::Dynamic(..) => not_supported!("`dyn Trait` consts not supported yet"),
                 _ => {
-                    let inner_addr = self.allocate_valtree_in_heap(inner_ty, valtree)?;
+                    let inner_addr = self.allocate_valtree_in_heap(inner_ty, valtree, locals)?;
                     let ref_addr = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
                     self.write_memory(ref_addr, &inner_addr.addr.to_bytes())?;
                     Ok(Interval::new(ref_addr, self.ptr_size()))
                 }
             },
-            TyKind::Adt(_, _) | TyKind::Array(_, _) | TyKind::Tuple(_) => {
-                not_supported!(
-                    "ADTs, arrays and tuples are unsupported in consts currently (requires `adt_const_params`)"
-                )
+            TyKind::Adt(def, args) => {
+                // The fields in order, after the index of the variant of an enum.
+                let items = valtree.inner().to_branch();
+                let (variant, fields): (VariantId, _) = match def.def_id() {
+                    AdtId::StructId(id) => (id.into(), &items[..]),
+                    AdtId::UnionId(_) => not_supported!("a union constant"),
+                    AdtId::EnumId(id) => {
+                        let index = match items.first().map(|it| it.kind()) {
+                            Some(ConstKind::Value(it)) => it.value.inner().to_leaf().to_u32(),
+                            _ => not_supported!("an enum constant without its variant"),
+                        };
+                        let variants = &id.enum_variants(self.db).variants;
+                        let Some((_, &(variant, ..))) = variants.get_index(index as usize) else {
+                            not_supported!("an enum constant of a variant it does not have");
+                        };
+                        (variant.into(), &items[1..])
+                    }
+                };
+                let (size, layout, tag) = self.layout_of_variant(variant, args, locals)?;
+                let fields = self.allocate_valtrees(fields, locals)?;
+                let bytes = self.construct_with_layout(size, &layout, tag, fields.into_iter())?;
+                let addr = self.heap_allocate(size, layout.align.abi.bytes() as usize)?;
+                self.write_memory(addr, &bytes)?;
+                Ok(Interval::new(addr, size))
+            }
+            TyKind::Array(..) | TyKind::Tuple(_) => {
+                let layout = self.layout(ty)?;
+                let fields = self.allocate_valtrees(&valtree.inner().to_branch()[..], locals)?;
+                let size = layout.size.bytes_usize();
+                let bytes = self.construct_with_layout(size, &layout, None, fields.into_iter())?;
+                let addr = self.heap_allocate(size, layout.align.abi.bytes() as usize)?;
+                self.write_memory(addr, &bytes)?;
+                Ok(Interval::new(addr, size))
             }
             TyKind::Pat(_, _)
             | TyKind::Slice(_)
@@ -2138,7 +2195,7 @@ impl<'db> Evaluator<'db> {
         konst: Const<'db>,
     ) -> Result<'db, Interval> {
         match konst.kind() {
-            ConstKind::Value(value) => self.allocate_valtree_in_heap(value.ty, value.value),
+            ConstKind::Value(value) => self.allocate_valtree_in_heap(value.ty, value.value, locals),
             ConstKind::Unevaluated(UnevaluatedConst { def: const_id, args: subst }) => {
                 let mut id = const_id.0;
                 let mut subst = subst;
@@ -2146,6 +2203,11 @@ impl<'db> Evaluator<'db> {
                     let (c, s) = lookup_impl_const(&self.infcx, self.param_env.param_env, c, subst);
                     id = GeneralConstId::ConstId(c);
                     subst = s;
+                }
+                if let GeneralConstId::AnonConstId(konst) = id
+                    && konst.is_inline_const(self.db)
+                {
+                    return self.inline_const_in_heap(konst, subst, locals);
                 }
                 let allocation = match id {
                     GeneralConstId::ConstId(const_id) => {
@@ -2172,6 +2234,33 @@ impl<'db> Evaluator<'db> {
             }
             _ => not_supported!("evaluating unknown const"),
         }
+    }
+
+    /// A `const { .. }` block met while evaluating is run by this evaluation, as one lowered in
+    /// place was: the `TypeId`s it makes and compares are this evaluation's (`type_info::of`).
+    fn inline_const_in_heap(
+        &mut self,
+        konst: AnonConstId<'db>,
+        subst: GenericArgs<'db>,
+        locals: &Locals<'db>,
+    ) -> Result<'db, Interval> {
+        let body = super::optimize::interpreted_body(
+            self.db,
+            konst.into(),
+            subst.store(),
+            self.param_env.store(),
+        )
+        .map_err(|e| {
+            let name = GeneralConstId::AnonConstId(konst).name(self.db);
+            MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
+        })?;
+        let result = self.interpret_mir(body, iter::empty())?;
+        let ty = body.locals[return_slot()].ty.as_ref();
+        let align = self.size_align_of(ty, locals)?.map_or(1, |it| it.1);
+        let addr = self.heap_allocate(result.size, align)?;
+        let interval = Interval::new(addr, result.size);
+        interval.write_from_interval(self, result)?;
+        Ok(interval)
     }
 
     fn allocate_allocation_in_heap(
@@ -2507,6 +2596,51 @@ impl<'db> Evaluator<'db> {
                     self.db.field_types(variant).iter().all(|(_, field)| {
                         let field = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
                         self.holds_no_pointer(field)
+                    })
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether no value of the type has a `TypeId` in it or behind its references. A type
+    /// this cannot see through, as a raw pointer or a `dyn`, is taken to have one; one met
+    /// again in `seen`, through a reference to itself, adds nothing.
+    fn holds_no_type_id(&self, ty: Ty<'db>, seen: &mut FxHashSet<Ty<'db>>) -> bool {
+        if !seen.insert(ty) {
+            return true;
+        }
+        match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Str
+            | TyKind::Never => true,
+            TyKind::Array(inner, _)
+            | TyKind::Pat(inner, _)
+            | TyKind::Slice(inner)
+            | TyKind::Ref(_, inner, _) => self.holds_no_type_id(inner, seen),
+            TyKind::Tuple(fields) => fields.iter().all(|it| self.holds_no_type_id(it, seen)),
+            TyKind::Adt(adt, subst) => {
+                if self.lang_items().TypeId.is_some_and(|it| adt.def_id() == AdtId::StructId(it)) {
+                    return false;
+                }
+                let variants: Vec<VariantId> = match adt.def_id() {
+                    AdtId::StructId(it) => vec![it.into()],
+                    AdtId::UnionId(it) => vec![it.into()],
+                    AdtId::EnumId(it) => it
+                        .enum_variants(self.db)
+                        .variants
+                        .values()
+                        .map(|&(v, _)| v.into())
+                        .collect(),
+                };
+                variants.into_iter().all(|variant| {
+                    self.db.field_types(variant).iter().all(|(_, field)| {
+                        let field = field.ty().instantiate(self.interner(), subst).skip_norm_wip();
+                        self.holds_no_type_id(field, seen)
                     })
                 })
             }

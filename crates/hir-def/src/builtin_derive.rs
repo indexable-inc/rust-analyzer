@@ -110,7 +110,7 @@ impl BuiltinDeriveImplTrait {
 }
 
 pub(crate) fn has_builtin_derive_impl(derive: BuiltinDeriveExpander) -> bool {
-    !matches!(derive, BuiltinDeriveExpander::CoerceShared)
+    !matches!(derive, BuiltinDeriveExpander::CoerceShared | BuiltinDeriveExpander::ConstParamTy)
 }
 
 impl BuiltinDeriveImplMethod {
@@ -146,7 +146,7 @@ pub(crate) fn with_derive_traits(
             f(BuiltinDeriveImplTrait::DispatchFromDyn);
         }
         BuiltinDeriveExpander::Reborrow => f(BuiltinDeriveImplTrait::Reborrow),
-        BuiltinDeriveExpander::CoerceShared => {}
+        BuiltinDeriveExpander::CoerceShared | BuiltinDeriveExpander::ConstParamTy => {}
     }
 }
 

@@ -834,6 +834,26 @@ impl <T, const N: usize, > $crate::marker::CoerceShared<shared::Shared<'a, 'b, (
 }
 
 #[test]
+fn const_param_ty_expansion() {
+    check(
+        r#"
+//- minicore: const_param_ty
+
+use core::marker::ConstParamTy;
+
+#[derive(ConstParamTy)]
+enum Requirement<T> { Connected, Not(T) }"#,
+        expect![[r#"
+
+use core::marker::ConstParamTy;
+
+#[derive(ConstParamTy)]
+enum Requirement<T> { Connected, Not(T) }
+impl <T: $crate::marker::ConstParamTy_, > $crate::marker::ConstParamTy_ for Requirement<T, > where {}"#]],
+    );
+}
+
+#[test]
 fn coerce_shared_errors() {
     check_errors(
         r#"

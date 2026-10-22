@@ -765,6 +765,17 @@ pub fn signature_anon_consts_and_diagnostics<'db>(
 }
 
 impl<'db> AnonConstId<'db> {
+    /// A `const { .. }` block of a body, which MIR lowering makes a constant of its own. The
+    /// body inferred it.
+    pub fn is_inline_const(self, db: &'db dyn HirDatabase) -> bool {
+        let loc = self.loc(db);
+        matches!(loc.owner, ExpressionStoreOwnerId::Body(_))
+            && matches!(
+                hir_def::expr_store::ExpressionStore::of(db, loc.owner)[loc.expr],
+                hir_def::hir::Expr::Const(_)
+            )
+    }
+
     pub fn all_from_signature(
         db: &'db dyn HirDatabase,
         def: GenericDefId,
