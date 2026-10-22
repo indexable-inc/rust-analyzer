@@ -210,7 +210,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
     ) -> Self {
         let krate = owner.krate(db);
         let env = db.trait_environment(owner.generic_def(db));
-        let interner = DbInterner::new_with(db, krate);
+        let interner = DbInterner::new_with(db, krate).with_regions();
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         let bindings =
             body.binding_locals.iter().map(|(binding, &local)| (local, binding)).collect();

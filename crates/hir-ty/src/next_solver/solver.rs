@@ -6,8 +6,8 @@ use hir_def::{
 };
 use rustc_next_trait_solver::delegate::SolverDelegate;
 use rustc_type_ir::{
-    AliasTyKind, GenericArgKind, InferCtxtLike, InferTy, Interner, PredicatePolarity, TypeFlags,
-    TypeVisitableExt,
+    AliasTyKind, GenericArgKind, InferCtxtLike, InferTy, Interner, OutlivesPredicate,
+    PredicatePolarity, TypeFlags, TypeVisitableExt,
     inherent::{Const as _, GenericArg as _, IntoKind, Term as _, Ty as _},
     lang_items::SolverTraitLangItem,
     solve::{Certainty, FetchEligibleAssocItemResponse, NoSolution, VisibleForLeakCheck},
@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    Const, DbInterner, GenericArg,
+    Const, DbInterner, GenericArg, Region,
     infer::{DbInternerInferExt, InferCtxt, canonical::instantiate::CanonicalExt},
 };
 
@@ -124,8 +124,35 @@ impl<'db> SolverDelegate for SolverContext<'db> {
     fn make_deduplicated_region_constraints(
         &self,
     ) -> Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> {
-        // FIXME: add if we care about regions
-        vec![]
+        use super::infer::region_constraints::Constraint;
+        let interner = self.interner;
+        if !interner.regions() {
+            return Vec::new();
+        }
+        let mut inner = self.inner.borrow_mut();
+        let types: Vec<_> = inner
+            .region_obligations()
+            .iter()
+            .map(|it| OutlivesPredicate(GenericArg::from(it.sup_type), it.sub_region))
+            .collect();
+        let var = |vid| Region::new_var(interner, vid);
+        // `a <= b` is `b: a`.
+        let mut constraints = inner.unwrap_region_constraints();
+        let regions = constraints.region_constraint_data().constraints.iter().map(|constraint| {
+            let (a, b) = match *constraint {
+                Constraint::VarSubVar(a, b) => (var(a), var(b)),
+                Constraint::RegSubVar(a, b) => (a, var(b)),
+                Constraint::VarSubReg(a, b) => (var(a), b),
+                Constraint::RegSubReg(a, b) => (a, b),
+            };
+            OutlivesPredicate(GenericArg::from(b), a)
+        });
+        let mut seen = rustc_hash::FxHashSet::default();
+        regions
+            .chain(types)
+            .filter(|it| it.0.as_region() != Some(it.1) && seen.insert(*it))
+            .map(|it| (RegionConstraint::Outlives(it), VisibleForLeakCheck::Yes))
+            .collect()
     }
 
     fn instantiate_canonical<V>(

@@ -282,8 +282,10 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
         self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(a, b);
     }
 
-    fn register_ty_outlives(&self, _ty: Ty<'db>, _r: Region<'db>, _span: Span) {
-        // self.register_type_outlives_constraint(ty, r, &ObligationCause::dummy());
+    fn register_ty_outlives(&self, ty: Ty<'db>, r: Region<'db>, _span: Span) {
+        if self.interner.regions() {
+            self.register_type_outlives_constraint(ty, r);
+        }
     }
 
     type OpaqueTypeStorageEntries = OpaqueTypeStorageEntries;

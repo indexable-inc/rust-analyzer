@@ -323,6 +323,17 @@ fn has_opaque(ty: Ty<'_>) -> bool {
     rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Find).is_break()
 }
 
+/// Whether `ty` has a closure or a coroutine in it, whose signature RA does not keep
+/// higher-ranked: `|line: &String|` is `fn(&'1 String)` for one `'1`, not `for<'a>`.
+fn names_closure(ty: Ty<'_>) -> bool {
+    ty.walk().filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it)).any(|it| {
+        matches!(
+            it.kind(),
+            TyKind::Closure(..) | TyKind::CoroutineClosure(..) | TyKind::Coroutine(..)
+        )
+    })
+}
+
 /// The regions of a hidden type that rustc's `CollectMemberConstraintsVisitor` gives member
 /// constraints: not those of a closure's parent arguments, nor an `impl Trait`'s arguments
 /// it does not capture.
@@ -2314,7 +2325,8 @@ impl<'db> Builder<'_, '_, 'db> {
                     for region in self.trait_outlives(trait_ref) {
                         self.type_outlives(trait_ref.self_ty(), region, at);
                     }
-                    self.caller_bound(trait_ref, at)
+                    self.caller_bound(trait_ref, at);
+                    self.prove(trait_ref, at);
                 }
                 _ => (),
             }
@@ -2373,6 +2385,105 @@ impl<'db> Builder<'_, '_, 'db> {
             self.signature_region(region, depth).unwrap_or_else(|| self.fresh())
         });
         self.relate_args(trait_ref.args, args, None, Variance::Invariant, at);
+    }
+
+    /// Proves `trait_ref` with the trait solver, as rustc's `prove_predicate`, and takes the
+    /// region constraints proving it gives: a where clause or an impl it matches relates the
+    /// regions of the two (`&'min G: Get` proven by `&'max G: Get` equals them), and the
+    /// impl's where clauses (`T: 'a`) hold. Nothing when it is not proven.
+    fn prove(
+        &mut self,
+        trait_ref: rustc_type_ir::TraitRef<hir_ty::next_solver::DbInterner<'db>>,
+        at: At,
+    ) {
+        use hir_ty::next_solver::{
+            infer::{
+                region_constraints::Constraint,
+                traits::{Obligation, ObligationCause},
+            },
+            obligation_ctxt::ObligationCtxt,
+        };
+        if !rustc_type_ir::TypeVisitableExt::has_free_regions(&trait_ref)
+            || rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&trait_ref)
+            || rustc_type_ir::TypeVisitableExt::references_error(&trait_ref)
+            || trait_ref.args.iter().any(|arg| {
+                rustc_type_ir::inherent::GenericArg::as_type(&arg).is_some_and(names_closure)
+            })
+        {
+            return;
+        }
+        let interner = self.interner();
+        let (constraints_before, obligations_before) = {
+            let mut inner = self.ctx.infcx.inner.borrow_mut();
+            let obligations = inner.region_obligations().len();
+            let constraints =
+                inner.unwrap_region_constraints().region_constraint_data().constraints.len();
+            (constraints, obligations)
+        };
+        let mut ocx = ObligationCtxt::new(&self.ctx.infcx);
+        let predicate = rustc_type_ir::TraitPredicate {
+            trait_ref,
+            polarity: rustc_type_ir::PredicatePolarity::Positive,
+        };
+        ocx.register_obligation(Obligation::new(
+            interner,
+            ObligationCause::dummy(),
+            self.ctx.env,
+            predicate,
+        ));
+        if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+            return;
+        }
+        let (constraints, obligations) = {
+            let mut inner = self.ctx.infcx.inner.borrow_mut();
+            let obligations: Vec<_> = inner.region_obligations()[obligations_before..]
+                .iter()
+                .map(|it| (it.sup_type, it.sub_region))
+                .collect();
+            let constraints: Vec<_> =
+                inner.unwrap_region_constraints().region_constraint_data().constraints
+                    [constraints_before..]
+                    .iter()
+                    .cloned()
+                    .collect();
+            (constraints, obligations)
+        };
+        let rv = |this: &mut Self, region: Region<'db>| match region.kind() {
+            RegionKind::ReVar(vid) => Some(vid.as_usize()),
+            RegionKind::ReStatic => Some(this.regions.static_rv),
+            RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
+                this.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
+            }
+            _ => None,
+        };
+        for constraint in constraints {
+            // `a <= b`: `b` outlives `a`.
+            let (shorter, longer) = match constraint {
+                Constraint::VarSubVar(a, b) => (Some(a.as_usize()), Some(b.as_usize())),
+                Constraint::RegSubVar(a, b) => (rv(self, a), Some(b.as_usize())),
+                Constraint::VarSubReg(a, b) => (Some(a.as_usize()), rv(self, b)),
+                Constraint::RegSubReg(a, b) => (rv(self, a), rv(self, b)),
+            };
+            if let (Some(shorter), Some(longer)) = (shorter, longer) {
+                self.outlives(longer, shorter, at);
+            }
+        }
+        for (ty, region) in obligations {
+            let Some(region) = rv(self, region) else { continue };
+            let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match it.kind() {
+                RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {
+                    rv(self, it).map_or(it, |it| {
+                        Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(it))
+                    })
+                }
+                _ => it,
+            });
+            self.type_outlives(
+                ty,
+                Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(region)),
+                at,
+            );
+        }
     }
 
     fn region_rv(&self, region: Region<'db>) -> Option<Rv> {

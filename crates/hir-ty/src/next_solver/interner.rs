@@ -358,6 +358,9 @@ pub struct DbInterner<'db> {
     recursion_limit: u32,
     /// Which of the thread's solver caches is this interner's, see [`tls_cache`].
     solved: tls_cache::Solved,
+    /// The solver answers with the region constraints proving a goal takes, as borrowck needs;
+    /// otherwise regions are not looked at.
+    regions: bool,
 }
 
 // FIXME: very wrong, see https://github.com/rust-lang/rust/pull/144808
@@ -375,6 +378,7 @@ impl<'db> DbInterner<'db> {
             lang_items: None,
             recursion_limit: 128,
             solved: tls_cache::Solved::new(),
+            regions: false,
         })
     }
 
@@ -391,6 +395,7 @@ impl<'db> DbInterner<'db> {
             lang_items: None,
             recursion_limit: 128,
             solved: tls_cache::Solved::new(),
+            regions: false,
         }
     }
 
@@ -404,7 +409,19 @@ impl<'db> DbInterner<'db> {
             lang_items: Some(hir_def::lang_item::lang_items(db, krate)),
             recursion_limit: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
             solved: tls_cache::Solved::new(),
+            regions: false,
         }
+    }
+
+    /// This interner, with the solver answering with the region constraints of what it proves.
+    /// It solves into a cache of its own, as an answer without them would be wrong for it.
+    pub fn with_regions(self) -> DbInterner<'db> {
+        DbInterner { regions: true, solved: tls_cache::Solved::new(), ..self }
+    }
+
+    #[inline]
+    pub(crate) fn regions(&self) -> bool {
+        self.regions
     }
 
     #[inline]
