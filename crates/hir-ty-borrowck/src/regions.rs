@@ -1055,6 +1055,35 @@ impl<'db> Builder<'_, '_, 'db> {
         }
     }
 
+    /// What a path naming the associated item of `container` through a type needs, as
+    /// rustc's user type annotation on it: its generic arguments well-formed, and the impl's
+    /// self type and trait arguments, `<Evil>::f` with `struct Evil<'a, 'b: 'a>` that `'b: 'a`.
+    fn path_well_formed(
+        &mut self,
+        expr: hir_def::hir::ExprId,
+        container: ItemContainerId,
+        args: GenericArgs<'db>,
+        span: MirSpan,
+    ) {
+        let hir_def::hir::Expr::Path(path) = &self.ctx.store[expr] else { return };
+        if !names_through_type(self.ctx.db, path, container) {
+            return;
+        }
+        let at = At { category: Category::TypeAnnotation, span };
+        let mut tys: Vec<Ty<'db>> = args.types().collect();
+        if let ItemContainerId::ImplId(impl_) = container {
+            let db = self.ctx.db;
+            tys.push(db.impl_self_ty(impl_).instantiate(self.interner(), args).skip_norm_wip());
+            if let Some(trait_ref) = db.impl_trait(impl_) {
+                let trait_ref = trait_ref.instantiate(self.interner(), args).skip_norm_wip();
+                tys.extend(trait_ref.args.types().skip(1));
+            }
+        }
+        for ty in tys {
+            self.well_formed(ty, at, 0);
+        }
+    }
+
     fn annotated_locals(&self) -> FxHashSet<LocalId> {
         let mut found = FxHashSet::default();
         for (_, expr) in self.ctx.store.exprs() {
@@ -1703,6 +1732,18 @@ impl<'db> Builder<'_, '_, 'db> {
         })
     }
 
+    /// The expression a call's callee is: its path, or the method call.
+    fn callee_expr(&self, func: &Operand, call: MirSpan) -> Option<hir_def::hir::ExprId> {
+        match (func.span(), call) {
+            (Some(MirSpan::ExprId(expr)), _) => Some(expr),
+            (_, MirSpan::ExprId(call)) => match self.ctx.store[call] {
+                hir_def::hir::Expr::Call { callee, .. } => Some(callee),
+                _ => Some(call),
+            },
+            _ => None,
+        }
+    }
+
     /// The type of a callee whose path spells out generic arguments, `f::<&'a T>`, with the
     /// lifetimes written there: rustc's user type annotation on the path.
     fn written_callee(&mut self, func: &Operand, call: MirSpan) -> Option<Ty<'db>> {
@@ -1711,19 +1752,24 @@ impl<'db> Builder<'_, '_, 'db> {
             OperandKind::Allocation { allocation } => allocation.as_ref().ty,
             _ => return None,
         };
-        let expr = match (func.span(), call) {
-            (Some(MirSpan::ExprId(expr)), _) => expr,
-            (_, MirSpan::ExprId(call)) => match self.ctx.store[call] {
-                hir_def::hir::Expr::Call { callee, .. } => callee,
-                _ => return None,
-            },
-            _ => return None,
-        };
-        let hir_def::hir::Expr::Path(path) = &self.ctx.store[expr] else { return None };
-        if !spells_generics(path) {
-            return None;
+        let expr = self.callee_expr(func, call)?;
+        match &self.ctx.store[expr] {
+            hir_def::hir::Expr::Path(path) if spells_generics(path) => Some(self.written(ty)),
+            // `x.f::<&'a T>()`: the method's own arguments as written, the impl's or trait's
+            // inferred.
+            hir_def::hir::Expr::MethodCall { generic_args: Some(_), .. } => {
+                let TyKind::FnDef(def, args) = ty.kind() else { return None };
+                let CallableDefId::FunctionId(function) = def.0 else { return None };
+                let parent = hir_ty::generics::generics(self.ctx.db, function.into()).len_parent();
+                let args = args.iter().enumerate().map(|(index, arg)| match index < parent {
+                    true => self.renumber(arg),
+                    false => self.written(arg),
+                });
+                let args = GenericArgs::new_from_iter(args.collect::<Vec<_>>());
+                Some(Ty::new_fn_def(self.interner(), def, args))
+            }
+            _ => None,
         }
-        Some(self.written(ty))
     }
 
     fn category_of_assignment(&self, local: LocalId, projection: &[PlaceElem]) -> Category {
@@ -1754,11 +1800,24 @@ impl<'db> Builder<'_, '_, 'db> {
             self.relate(dest, written, Variance::Invariant, at);
         }
         match rvalue {
-            Rvalue::Repeat(operand, _) => {
+            Rvalue::Repeat(operand, len) => {
                 if let (Some(ty), TyKind::Array(element, _)) =
                     (self.operand_ty(operand), dest.kind())
                 {
                     self.relate(ty, element, Variance::Covariant, at);
+                    // More than one copy of what is not a constant needs it `Copy`, which
+                    // `impl Copy for Foo<'static>` proves only for `'static`.
+                    let copies = hir_ty::consteval::try_const_usize(self.ctx.db, len.as_ref());
+                    if !matches!(
+                        operand.kind,
+                        OperandKind::Constant { .. } | OperandKind::Allocation { .. }
+                    ) && copies.is_none_or(|it| it > 1)
+                        && let Some(copy) = self.interner().lang_items().Copy
+                    {
+                        let trait_ref =
+                            rustc_type_ir::TraitRef::new(self.interner(), copy.into(), [ty]);
+                        self.prove(trait_ref, At { category: Category::Predicate, span });
+                    }
                 }
             }
             Rvalue::Aggregate(AggregateKind::Array(_), operands) => {
@@ -1818,6 +1877,9 @@ impl<'db> Builder<'_, '_, 'db> {
         let ty = self
             .declared(db.value_ty(id.into())?.instantiate(self.interner(), args).skip_norm_wip());
         self.predicates(id.into(), args, At { category: Category::Predicate, span }, true);
+        if let MirSpan::ExprId(expr) = span {
+            self.path_well_formed(expr, id.lookup(db).container, args, span);
+        }
         if let Some(anchor) = path.and_then(|it| it.type_anchor())
             && let ItemContainerId::ImplId(impl_) = id.lookup(db).container
         {
@@ -1976,6 +2038,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     hir_def::VariantId::StructId(it) => AdtId::StructId(*it),
                     hir_def::VariantId::UnionId(it) => AdtId::UnionId(*it),
                 };
+                self.predicates(adt.into(), args, boring, true);
                 Some(Ty::new_adt(self.interner(), adt, args))
             }
             Rvalue::Aggregate(AggregateKind::Tuple(ty), operands) => {
@@ -2135,6 +2198,12 @@ impl<'db> Builder<'_, '_, 'db> {
                             sig,
                         );
                         self.callee_predicates(def, fn_args, span);
+                        if let CallableDefId::FunctionId(function) = def
+                            && let Some(expr) = self.callee_expr(func, span)
+                        {
+                            let container = function.lookup(self.ctx.db).container;
+                            self.path_well_formed(expr, container, fn_args, span);
+                        }
                         let (self_param, keep_static) = match def {
                             CallableDefId::FunctionId(it) => {
                                 let written = FunctionSignature::of(self.ctx.db, it);
@@ -2615,6 +2684,28 @@ fn writes_static_object(store: &hir_def::expr_store::ExpressionStore) -> bool {
 
 /// Whether `path` writes generic arguments, `f::<T>` or `<T as Trait>::f`: a user type
 /// annotation, whose lifetimes bind.
+/// Whether `path` names the associated item `item` through a type, `Foo::f`, `<()>::f` or
+/// `T::f`, not through its trait alone, `Default::default`: rustc gives it a user type
+/// annotation whose generic arguments, and an inherent impl's self type, must be well-formed.
+fn names_through_type(
+    db: &dyn hir_ty::db::HirDatabase,
+    path: &hir_def::expr_store::path::Path,
+    container: ItemContainerId,
+) -> bool {
+    if path.type_anchor().is_some() {
+        return true;
+    }
+    let segments = path.segments();
+    let Some(qualifier) = segments.get(segments.len().wrapping_sub(2)) else { return false };
+    match container {
+        ItemContainerId::ImplId(_) => true,
+        ItemContainerId::TraitId(trait_) => {
+            *qualifier.name != hir_def::signatures::TraitSignature::of(db, trait_).name
+        }
+        _ => false,
+    }
+}
+
 fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
     path.type_anchor().is_some()
         || path.generic_args().is_some_and(|args| args.iter().any(Option::is_some))
