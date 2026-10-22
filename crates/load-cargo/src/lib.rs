@@ -8,6 +8,9 @@
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
+mod wrap;
+pub use wrap::{Wrap, asked, wrap_expanders};
+
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
 
 use crossbeam_channel::unbounded;
@@ -660,7 +663,7 @@ pub fn load_proc_macro(
         }
         Ok(vec
             .into_iter()
-            .map(|expander| expander_to_proc_macro(expander, ignored_macros))
+            .map(|expander| expander_to_proc_macro(expander, path, ignored_macros))
             .collect())
     })();
     match res {
@@ -680,6 +683,7 @@ pub fn load_proc_macro(
 
 fn expander_to_proc_macro(
     expander: proc_macro_api::ProcMacro,
+    dylib: &AbsPath,
     ignored_macros: &[Box<str>],
 ) -> ProcMacro {
     let name = expander.name();
@@ -689,10 +693,11 @@ fn expander_to_proc_macro(
         proc_macro_api::ProcMacroKind::Attr => ProcMacroKind::Attr,
     };
     let disabled = ignored_macros.iter().any(|replace| **replace == *name);
+    let name = intern::Symbol::intern(name);
     ProcMacro {
-        name: intern::Symbol::intern(name),
+        expander: wrap::wrapped(sync::Arc::new(Expander(expander)), dylib, name.as_str(), kind),
+        name,
         kind,
-        expander: sync::Arc::new(Expander(expander)),
         disabled,
     }
 }
@@ -869,7 +874,10 @@ impl ProcMacroExpander for Expander {
             call_site,
             mixed_site,
             current_dir,
-            Some(&cb),
+            Some(&|req| {
+                wrap::ask();
+                cb(req)
+            }),
         ) {
             Ok(Ok(subtree)) => Ok(subtree),
             Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err)),
