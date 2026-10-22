@@ -3,7 +3,7 @@
 //! for being allowed to mutate what it mutates and, with the loans in scope, for conflicting
 //! with a loan.
 
-use hir_def::hir::{BindingId, ExprId, Pat, Statement};
+use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
 
@@ -110,6 +110,7 @@ pub(super) fn check<'db>(
         static_muts: static_muts(ctx, body),
         union_literals: union_literals(ctx),
         matched: matched(ctx),
+        mut_errors: FxHashMap::default(),
         requirements: Vec::new(),
     };
     let tested_at = tested_at(ctx);
@@ -322,7 +323,16 @@ fn union_literals(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
 
 /// Whether the variable `place` starts from is declared without `mut`: rustc's
 /// `limit_capture_mutability` makes a closure's mutable borrow of such a place a unique one.
+/// In a closure, a capture of its own captures is checked against how the variable it captured
+/// is declared.
 fn is_immutable_root(ctx: &Ctx<'_, '_>, place: PlaceRef<'_>) -> bool {
+    if Some(place.local) == ctx.closure_local
+        && let [ProjectionElem::Field(field), ..]
+        | [ProjectionElem::Deref, ProjectionElem::Field(field), ..] = place.projection
+        && let Some(upvar) = ctx.upvars.get(field.0 as usize)
+    {
+        return !upvar.mutable;
+    }
     match ctx.upvar_of_local(place.local) {
         Some(upvar) => !ctx.upvars[upvar].mutable,
         None => ctx.is_immutable(place.local),
@@ -474,6 +484,9 @@ struct Checker<'a, 'b, 'db> {
     union_literals: FxHashSet<ExprId>,
     /// The scrutinees of `match`es and the `match`es.
     matched: FxHashSet<ExprId>,
+    /// For each variable declared without `mut` borrowed mutably, its error and how many
+    /// borrows it is about.
+    mut_errors: FxHashMap<LocalId, (usize, usize)>,
     /// In a closure, what it needs of its creator's regions.
     requirements: Vec<regions::Requirement<'db>>,
 }
@@ -638,13 +651,20 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => (),
         }
-        if matches!(
+        // A loop's way back is rustc's `FalseUnwind` at the loop's head, which may unwind.
+        let loops = matches!(
             kind,
-            TerminatorKind::Call { .. }
-                | TerminatorKind::Drop { .. }
-                | TerminatorKind::DropAndReplace { .. }
-                | TerminatorKind::Assert { .. }
-        ) {
+            TerminatorKind::Goto { target } if self.dominators.dominates(*target, location.block)
+        );
+        if loops
+            || matches!(
+                kind,
+                TerminatorKind::Call { .. }
+                    | TerminatorKind::Drop { .. }
+                    | TerminatorKind::DropAndReplace { .. }
+                    | TerminatorKind::Assert { .. }
+            )
+        {
             self.check_for_invalidation_at_unwind();
         }
     }
@@ -1490,6 +1510,26 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             Access::Mutate => format!("cannot {verb} {name}{reason}"),
             _ => format!("cannot {verb} {name} as mutable{reason}"),
         };
+        // rustc's `buffer_mut_error`: the mutable borrows of a variable declared without `mut`
+        // are one error, at the declaration once there are two.
+        let binding = self.ctx.bindings.get(&place.local).copied();
+        if code == "E0596"
+            && root == 0
+            && let Some(binding) = binding
+            && self.ctx.store[binding].mode == BindingAnnotation::Unannotated
+            && self.ctx.upvar_of_local(place.local).is_none()
+        {
+            if let Some((index, count)) = self.mut_errors.get_mut(&place.local) {
+                *count += 1;
+                if *count == 2
+                    && let Some(error) = &mut self.errors[*index]
+                {
+                    error.span = MirSpan::BindingId(binding);
+                }
+                return;
+            }
+            self.mut_errors.insert(place.local, (self.errors.len(), 1));
+        }
         self.report(code, span, message);
     }
 

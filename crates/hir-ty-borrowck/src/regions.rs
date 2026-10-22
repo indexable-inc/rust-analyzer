@@ -1577,6 +1577,31 @@ impl<'db> Builder<'_, '_, 'db> {
             TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
                 self.implied_bounds(inner, pairs, seen, depth + 1)
             }
+            // `dyn Any + 'r` is well-formed only where `'r` outlives what the trait requires of
+            // `Self`: `trait Any: 'static`.
+            TyKind::Dynamic(predicates, region) => {
+                let Some(shorter) = rv_of(region) else { return };
+                for predicate in predicates.iter() {
+                    let trait_ = match predicate.skip_binder() {
+                        rustc_type_ir::ExistentialPredicate::Trait(it) => it.def_id.0,
+                        rustc_type_ir::ExistentialPredicate::AutoTrait(it) => it.0,
+                        rustc_type_ir::ExistentialPredicate::Projection(_) => continue,
+                    };
+                    let requires_static = GenericPredicates::query_all(self.ctx.db, trait_.into())
+                        .iter_identity()
+                        .any(|clause| {
+                            matches!(
+                                clause.skip_norm_wip().kind().skip_binder(),
+                                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region))
+                                    if matches!(ty.kind(), TyKind::Param(param) if param.index == 0)
+                                        && matches!(region.kind(), RegionKind::ReStatic)
+                            )
+                        });
+                    if requires_static {
+                        pairs.push((shorter, self.regions.static_rv));
+                    }
+                }
+            }
             TyKind::Alias(_) => {
                 if let Some(normalized) = self.normalize(ty)
                     && normalized != ty
@@ -1763,7 +1788,12 @@ impl<'db> Builder<'_, '_, 'db> {
     }
 
     fn relate_regions(&mut self, a: Region<'db>, b: Region<'db>, variance: Variance, at: At) {
-        let (Some(a), Some(b)) = (rv_of(a), rv_of(b)) else { return };
+        let static_rv = self.regions.static_rv;
+        let rv = |region: Region<'db>| match region.kind() {
+            RegionKind::ReStatic => Some(static_rv),
+            _ => rv_of(region),
+        };
+        let (Some(a), Some(b)) = (rv(a), rv(b)) else { return };
         match variance {
             Variance::Covariant => self.outlives(a, b, at),
             Variance::Contravariant => self.outlives(b, a, at),
@@ -1990,7 +2020,22 @@ impl<'db> Builder<'_, '_, 'db> {
         }
     }
 
+    /// rustc's `CopyBound`: a copied value's type is `Copy`, which `impl Copy for Foo<'static>`
+    /// proves only for `'static`. References, pointers and scalars are `Copy` for any lifetime.
+    fn copy_bound(&mut self, operand: &Operand, span: MirSpan) {
+        let OperandKind::Copy(place) = &operand.kind else { return };
+        let ty = self.place_ty(place.local, place.projection.as_slice()).ty;
+        if !matches!(ty.kind(), TyKind::Adt(..) | TyKind::Tuple(..) | TyKind::Array(..)) {
+            return;
+        }
+        let Some(copy) = self.interner().lang_items().Copy else { return };
+        let trait_ref = rustc_type_ir::TraitRef::new(self.interner(), copy.into(), [ty]);
+        let span = operand.span().unwrap_or(span);
+        self.prove(trait_ref, At { category: Category::Predicate, span });
+    }
+
     fn statement(&mut self, kind: &StatementKind, span: MirSpan) {
+        kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
         let StatementKind::Assign(place, rvalue) = kind else { return };
         let projection = place.projection.as_slice();
         let dest = self.place_ty(place.local, projection).ty;
@@ -2412,6 +2457,7 @@ impl<'db> Builder<'_, '_, 'db> {
     }
 
     fn terminator(&mut self, kind: &TerminatorKind, span: MirSpan) {
+        kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
         match kind {
             TerminatorKind::Call { func, args, destination, .. } => {
                 // A function item called through a variable, `let f = foo::<'a>; f()`, which
@@ -2463,18 +2509,28 @@ impl<'db> Builder<'_, '_, 'db> {
                             let container = function.lookup(self.ctx.db).container;
                             self.path_well_formed(expr, container, fn_args, span);
                         }
-                        let (self_param, keep_static) = match def {
+                        let (self_param, keep_static, returns_self) = match def {
                             CallableDefId::FunctionId(it) => {
                                 let written = FunctionSignature::of(self.ctx.db, it);
-                                (written.has_self_param(), writes_static_object(&written.store))
+                                let returns_self = written.ret_type.is_some_and(|it| {
+                                    matches!(&written.store[it],
+                                        hir_def::hir::type_ref::TypeRef::Path(path)
+                                            if path.is_self_type())
+                                });
+                                (
+                                    written.has_self_param(),
+                                    writes_static_object(&written.store),
+                                    returns_self,
+                                )
                             }
-                            _ => (false, true),
+                            _ => (false, true, false),
                         };
                         let (inputs, output) = self.elide(
                             sig.inputs().iter().copied().collect(),
                             sig.output(),
                             self_param,
                             keep_static,
+                            returns_self,
                         );
                         // The where clauses of the associated types in the signature hold
                         // for it to be well-formed.
@@ -2543,6 +2599,7 @@ impl<'db> Builder<'_, '_, 'db> {
         output: Ty<'db>,
         self_param: bool,
         keep_static: bool,
+        returns_self: bool,
     ) -> (Vec<Ty<'db>>, Ty<'db>) {
         let interner = self.interner();
         let mut defaults = ObjectDefaults { db: self.ctx.db, interner, keep_static, erase: false };
@@ -2578,8 +2635,11 @@ impl<'db> Builder<'_, '_, 'db> {
                 _ => None,
             }
         });
+        // A return of `Self` elides nothing: its anonymous lifetimes are the impl's,
+        // `impl Foo<'_>`, which rust-analyzer leaves as errors too.
         let output =
             rustc_type_ir::fold_regions(interner, output, |region, _| match region.kind() {
+                RegionKind::ReError(_) if returns_self => self.fresh(),
                 RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh()),
                 _ => region,
             });

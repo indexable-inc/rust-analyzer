@@ -126,6 +126,26 @@ fn is_unit_value(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
             TyKind::Adt(def, _) if hir_ty::drop::destructor(ctx.db, def.def_id()).is_none())
 }
 
+/// Whether `expr` names a `const` item outside any impl or trait: rustc asks whether its value,
+/// not its type, needs dropping, which only a value that does (a `String` that is not empty)
+/// fails; such a value is taken to be promotable when its type has no interior mutability.
+fn names_const_item(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
+    use hir_def::{
+        Lookup,
+        resolver::{HasResolver, ValueNs},
+    };
+    let Expr::Path(path) = &ctx.store[expr] else { return false };
+    let owner = body.owner;
+    let mut resolver = owner.resolver(ctx.db);
+    let _guard = resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
+    let hygiene = ctx.store.expr_path_hygiene(expr);
+    matches!(
+        resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene),
+        Some(ValueNs::ConstId(it))
+            if matches!(it.lookup(ctx.db).container, hir_def::ItemContainerId::ModuleId(_))
+    )
+}
+
 /// The locals a `static` is read through.
 pub(super) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
     let mut found = FxHashSet::default();
@@ -199,12 +219,34 @@ impl Loans {
                     // rustc promotes no call, not even of a `const fn` in a `const` block.
                     item || (!is_call(ctx, expr)
                         && (ctx.is_plain(body.locals[local].ty.as_ref())
-                            || is_unit_value(ctx, expr)))
+                            || is_unit_value(ctx, expr)
+                            || (names_const_item(ctx, body, expr)
+                                && hir_ty::drop::is_freeze(
+                                    ctx.db,
+                                    ctx.infcx.interner,
+                                    body.locals[local].ty.as_ref(),
+                                ))))
                 })
                 .map(|&(local, _)| local),
         );
         if item {
             statics.extend(extended_temporaries(ctx, body));
+        }
+        // A function item is a constant of a type with no data, promoted where it is borrowed:
+        // `&Trait::method`, which inference may leave without a type when it cannot tell `Self`.
+        for (_, block) in body.basic_blocks.iter() {
+            for statement in &block.statements {
+                if let StatementKind::Assign(place, Rvalue::Use(operand)) = &statement.kind
+                    && !matches!(operand.kind, OperandKind::Copy(_) | OperandKind::Move(_))
+                    && place.projection.is_empty()
+                    && matches!(
+                        body.locals[place.local].ty.as_ref().kind(),
+                        TyKind::FnDef(..) | TyKind::Error(_)
+                    )
+                {
+                    statics.insert(place.local);
+                }
+            }
         }
         let mut loans = Loans {
             loans: Vec::new(),
