@@ -214,8 +214,29 @@ impl fmt::Display for ProjectManifest {
     }
 }
 
+/// What asks the toolchain about itself for the embedder: given a command that runs rustc or
+/// cargo only to ask, it answers, or readies the command and returns `None` to have it run.
+pub type Answerer = fn(&mut Command) -> Option<io::Result<std::process::Output>>;
+
+static ANSWERER: std::sync::OnceLock<Answerer> = std::sync::OnceLock::new();
+
+/// Has `answerer` see every question asked of the toolchain from now on. Only the first
+/// call counts.
+pub fn answer_toolchain_questions_with(answerer: Answerer) {
+    _ = ANSWERER.set(answerer);
+}
+
+/// Readies a command that only asks the toolchain, as the embedder wants it run.
+fn ready_question(cmd: &mut Command) {
+    if let Some(answerer) = ANSWERER.get() {
+        // A cargo is readied, not answered.
+        _ = answerer(cmd);
+    }
+}
+
 fn utf8_stdout(cmd: &mut Command) -> anyhow::Result<String> {
-    let output = cmd.output().with_context(|| format!("{cmd:?} failed"))?;
+    let answered = ANSWERER.get().and_then(|answerer| answerer(cmd));
+    let output = answered.unwrap_or_else(|| cmd.output()).with_context(|| format!("{cmd:?} failed"))?;
     if !output.status.success() {
         match String::from_utf8(output.stderr) {
             Ok(stderr) if !stderr.is_empty() => {

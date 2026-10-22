@@ -698,7 +698,8 @@ impl FetchMetadata {
         sysroot: &Sysroot,
         no_deps: bool,
     ) -> Self {
-        let cargo = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
+        let mut cargo = sysroot.tool(Tool::Cargo, current_dir, &config.extra_env);
+        crate::ready_question(&mut cargo);
         let mut command = MetadataCommand::new();
         command.env(NO_RUSTUP_AUTO_INSTALL_ENV.0, NO_RUSTUP_AUTO_INSTALL_ENV.1);
         command.cargo_path(cargo.get_program());
