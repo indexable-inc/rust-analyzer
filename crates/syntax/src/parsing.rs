@@ -5,11 +5,11 @@ mod reparsing;
 
 use rowan::TextRange;
 
-use crate::{SyntaxError, SyntaxTreeBuilder, syntax_node::GreenNode};
+use crate::{SyntaxError, SyntaxTreeBuilder, Tree};
 
 pub(crate) use crate::parsing::reparsing::incremental_reparse;
 
-pub(crate) fn parse_text(text: &str, edition: parser::Edition) -> (GreenNode, Vec<SyntaxError>) {
+pub(crate) fn parse_text(text: &str, edition: parser::Edition) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!("parse_text").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
@@ -22,7 +22,7 @@ pub(crate) fn parse_text_at(
     text: &str,
     entry: parser::TopEntryPoint,
     edition: parser::Edition,
-) -> (GreenNode, Vec<SyntaxError>) {
+) -> (Tree, Vec<SyntaxError>) {
     let _p = tracing::info_span!("parse_text_at").entered();
     let lexed = parser::LexedStr::new(edition, text);
     let parser_input = lexed.to_input(edition);
@@ -34,7 +34,7 @@ pub(crate) fn parse_text_at(
 pub(crate) fn build_tree(
     lexed: parser::LexedStr<'_>,
     parser_output: parser::Output,
-) -> (GreenNode, Vec<SyntaxError>, bool) {
+) -> (Tree, Vec<SyntaxError>, bool) {
     let _p = tracing::info_span!("build_tree").entered();
     let mut builder = SyntaxTreeBuilder::default();
 

@@ -6,8 +6,7 @@ use base_db::SourceDatabase;
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
 use span::{AstIdMap, Edition, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
-    AstNode, GreenNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
-    ast,
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, ast,
 };
 use triomphe::Arc;
 
@@ -108,7 +107,7 @@ impl Body {
         let anchor = item
             .ancestors()
             .find(|it| {
-                it.text_range().start() == start && hash_kept(it.green().to_owned()) == syntax.tree
+                it.text_range().start() == start && hash_kept(it.clone_subtree()) == syntax.tree
             })
             .expect("the anchor is not around the item");
         debug_assert_eq!(Some(start), Self::anchor_offset(db, def));
@@ -310,12 +309,11 @@ impl BodySyntax {
     /// The anchor as the root of a tree of its own.
     pub fn root(&self, db: &dyn SourceDatabase) -> SyntaxNode {
         let kept = trees::get(self.tree).filter(|_| !check_relative());
-        let green = kept.unwrap_or_else(|| {
-            let green = self.reparse().unwrap_or_else(|| self.from_file(db));
-            trees::put(self.tree, green.clone());
-            green
-        });
-        SyntaxNode::new_root(green)
+        kept.unwrap_or_else(|| {
+            let root = self.reparse().unwrap_or_else(|| self.from_file(db));
+            trees::put(self.tree, root.clone());
+            root
+        })
     }
 
     /// The text of the anchor.
@@ -324,23 +322,23 @@ impl BodySyntax {
     }
 
     /// The anchor parsed alone, when that makes the tree it is in the file.
-    fn reparse(&self) -> Option<GreenNode> {
+    fn reparse(&self) -> Option<SyntaxNode> {
         let file = ast::SourceFile::parse(self.text(), self.edition).syntax_node();
-        let green = match self.kind == SyntaxKind::SOURCE_FILE {
-            true => file.green().to_owned(),
+        let root = match self.kind == SyntaxKind::SOURCE_FILE {
+            true => file,
             false => {
                 let range = TextRange::up_to(self.range.len());
                 let mut items = file.children();
                 let item = items.next().filter(|_| items.next().is_none())?;
                 (item.kind() == self.kind && item.text_range() == range)
-                    .then(|| item.green().to_owned())?
+                    .then(|| item.clone_subtree())?
             }
         };
-        (tree_hash(&green) == self.tree).then_some(green)
+        (tree_hash(&root) == self.tree).then_some(root)
     }
 
     /// The anchor from the tree of its file, for one that parses differently alone.
-    fn from_file(&self, db: &dyn SourceDatabase) -> GreenNode {
+    fn from_file(&self, db: &dyn SourceDatabase) -> SyntaxNode {
         if check_relative() {
             eprintln!(
                 "{:?}: the anchor at {:?} parses differently alone",
@@ -350,32 +348,33 @@ impl BodySyntax {
         let file = self.file_id.file_id().expect("a body written in a file").parse(db);
         file.syntax_node()
             .descendants()
-            .find(|it| {
-                it.text_range() == self.range && hash_kept(it.green().to_owned()) == self.tree
-            })
+            .filter(|it| it.text_range() == self.range)
+            .map(|it| it.clone_subtree())
+            .find(|it| hash_kept(it.clone()) == self.tree)
             .expect("the anchor is not in its file")
-            .green()
-            .to_owned()
     }
 }
 
-/// What a tree is made of, so that two trees made of the same are the same.
-fn tree_hash(green: &GreenNode) -> u128 {
+/// What the tree of `root` is made of, so that two trees made of the same are the same.
+fn tree_hash(root: &SyntaxNode) -> u128 {
     use std::hash::{Hash, Hasher};
     let half = |seed: u8| {
         let mut hasher = std::hash::DefaultHasher::new();
         seed.hash(&mut hasher);
-        green.hash(&mut hasher);
+        match root.flat_tree() {
+            Some(tree) => tree.hash(&mut hasher),
+            None => root.green().to_owned().hash(&mut hasher),
+        }
         hasher.finish() as u128
     };
     half(0) << 64 | half(1)
 }
 
-/// [`tree_hash`] of `green`, which is kept among the trees of this thread.
-fn hash_kept(green: GreenNode) -> u128 {
-    trees::hash_of(&green).unwrap_or_else(|| {
-        let tree = tree_hash(&green);
-        trees::put(tree, green);
+/// [`tree_hash`] of `root`, which is kept among the trees of this thread.
+fn hash_kept(root: SyntaxNode) -> u128 {
+    trees::hash_of(&root).unwrap_or_else(|| {
+        let tree = tree_hash(&root);
+        trees::put(tree, root);
         tree
     })
 }
@@ -385,33 +384,31 @@ fn hash_kept(green: GreenNode) -> u128 {
 mod trees {
     use std::{cell::RefCell, collections::VecDeque};
 
-    use syntax::GreenNode;
+    use syntax::SyntaxNode;
 
     const KEPT: usize = 32;
 
     thread_local! {
-        static TREES: RefCell<VecDeque<(u128, GreenNode)>> = const { RefCell::new(VecDeque::new()) };
+        static TREES: RefCell<VecDeque<(u128, SyntaxNode)>> = const { RefCell::new(VecDeque::new()) };
     }
 
-    pub(super) fn get(tree: u128) -> Option<GreenNode> {
+    pub(super) fn get(tree: u128) -> Option<SyntaxNode> {
         TREES.with_borrow(|trees| trees.iter().find(|it| it.0 == tree).map(|it| it.1.clone()))
     }
 
-    /// What [`super::tree_hash`] gives for `green`, when it is one of these: the bodies of an
-    /// anchor are made one after another, and hashing the anchor again for each is long when
-    /// it is a whole `impl` or module.
-    pub(super) fn hash_of(green: &GreenNode) -> Option<u128> {
-        TREES.with_borrow(|trees| {
-            trees.iter().find(|it| std::ptr::eq(&*it.1, &**green)).map(|it| it.0)
-        })
+    /// What [`super::tree_hash`] gives for `root`, when it is one of these: the bodies of an
+    /// anchor are made one after another, and hashing a green anchor again for each is long
+    /// when it is a whole `impl` or module.
+    pub(super) fn hash_of(root: &SyntaxNode) -> Option<u128> {
+        TREES.with_borrow(|trees| trees.iter().find(|it| it.1 == *root).map(|it| it.0))
     }
 
-    pub(super) fn put(tree: u128, green: GreenNode) {
+    pub(super) fn put(tree: u128, root: SyntaxNode) {
         TREES.with_borrow_mut(|trees| {
             if trees.len() == KEPT {
                 trees.pop_front();
             }
-            trees.push_back((tree, green));
+            trees.push_back((tree, root));
         })
     }
 }
@@ -430,7 +427,7 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
             item.ancestors().find(|it| SyntaxNodePtr::new(it) == ptr)?
         }
     };
-    let root = SyntaxNode::new_root(anchor.green().to_owned());
+    let root = anchor.clone_subtree();
     let range = item.text_range() - start;
     let relative = match root.covering_element(range) {
         NodeOrToken::Node(it) => it,
@@ -439,7 +436,7 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
     let relative =
         relative.ancestors().find(|it| it.text_range() == range && it.kind() == item.kind())?;
     let (file, edition) = src.file_id.file_id()?.unpack(db);
-    let tree = hash_kept(anchor.green().to_owned());
+    let tree = hash_kept(root.clone());
     Some(BodySyntax {
         file_id: src.file_id,
         tree,

@@ -113,7 +113,7 @@ fn reparse_block(
 
     let (green, new_parser_errors, _eof) = build_tree(lexed, tree_traversal);
 
-    Some((node.replace_with(green), new_parser_errors, node.text_range()))
+    Some((node.replace_with(green.into_green()), new_parser_errors, node.text_range()))
 }
 
 fn get_text_after_edit(element: SyntaxElement, mut delete: TextRange, insert: &str) -> String {
@@ -218,7 +218,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(range.len(), reparsed_len.into(), "reparsed fragment has wrong length");
-            Parse::new(green, new_errors)
+            Parse::new(crate::Tree::Green(green), new_errors)
         };
 
         assert_eq_text!(

@@ -55,7 +55,7 @@ pub use crate::{
     syntax_error::SyntaxError,
     syntax_node::{
         PreorderWithTokens, RustLanguage, SyntaxElement, SyntaxElementChildren, SyntaxNode,
-        SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder,
+        SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder, Tree, set_green_trees,
     },
 };
 pub use parser::{Edition, LexedStr, SyntaxKind, T};
@@ -73,7 +73,7 @@ pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 /// files.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parse<T> {
-    green: Option<GreenNode>,
+    green: Option<Tree>,
     errors: Option<Arc<[SyntaxError]>>,
     _ty: PhantomData<fn() -> T>,
 }
@@ -85,7 +85,7 @@ impl<T> Clone for Parse<T> {
 }
 
 impl<T> Parse<T> {
-    fn new(green: GreenNode, errors: Vec<SyntaxError>) -> Parse<T> {
+    fn new(green: Tree, errors: Vec<SyntaxError>) -> Parse<T> {
         Parse {
             green: Some(green),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
@@ -94,7 +94,7 @@ impl<T> Parse<T> {
     }
 
     pub fn syntax_node(&self) -> SyntaxNode {
-        SyntaxNode::new_root(self.green.as_ref().unwrap().clone())
+        self.green.as_ref().unwrap().root()
     }
 
     pub fn errors(&self) -> Vec<SyntaxError> {
@@ -170,7 +170,7 @@ impl Parse<SourceFile> {
             edition,
         )
         .map(|(green_node, errors, _reparsed_range)| Parse {
-            green: Some(green_node),
+            green: Some(Tree::Green(green_node)),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
             _ty: PhantomData,
         })
@@ -195,7 +195,7 @@ impl ast::Expr {
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
         let _p = tracing::info_span!("Expr::parse").entered();
         let (green, errors) = parsing::parse_text_at(text, parser::TopEntryPoint::Expr, edition);
-        let root = SyntaxNode::new_root(green.clone());
+        let root = green.root();
 
         assert!(
             ast::Expr::can_cast(root.kind()) || root.kind() == SyntaxKind::ERROR,
@@ -212,11 +212,11 @@ impl<T> Drop for Parse<T> {
         let Some(green) = self.green.take() else {
             return;
         };
-        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<GreenNode>> =
+        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Tree>> =
             std::sync::OnceLock::new();
         PARSE_DROP_THREAD
             .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<GreenNode>();
+                let (sender, receiver) = std::sync::mpsc::channel::<Tree>();
                 std::thread::Builder::new()
                     .name("ParseNodeDropper".to_owned())
                     .spawn(move || {
@@ -246,7 +246,7 @@ impl SourceFile {
     pub fn parse(text: &str, edition: Edition) -> Parse<SourceFile> {
         let _p = tracing::info_span!("SourceFile::parse").entered();
         let (green, errors) = parsing::parse_text(text, edition);
-        let root = SyntaxNode::new_root(green.clone());
+        let root = green.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse::new(green, errors)

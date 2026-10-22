@@ -7,7 +7,7 @@ use std::{fmt, iter::successors};
 
 use itertools::Itertools;
 use parser::SyntaxKind;
-use rowan::{GreenNodeData, GreenTokenData, TextSize};
+use rowan::TextSize;
 use smallvec::{SmallVec, smallvec};
 
 use crate::{
@@ -48,11 +48,7 @@ impl ast::NameRef {
 }
 
 fn text_of_first_token(node: &SyntaxNode) -> &str {
-    fn first_token(green_ref: &GreenNodeData) -> &GreenTokenData {
-        green_ref.children().next().and_then(NodeOrToken::into_token).unwrap()
-    }
-
-    first_token(node.green()).text()
+    node.first_child_token_text().unwrap()
 }
 
 fn into_comma(it: NodeOrToken<SyntaxNode, SyntaxToken>) -> Option<SyntaxToken> {
