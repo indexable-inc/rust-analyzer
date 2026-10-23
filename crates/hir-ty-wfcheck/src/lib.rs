@@ -1,5 +1,5 @@
 //! Item well-formedness: the part of rustc's `wfcheck` (`rustc_hir_analysis::check::wfcheck`)
-//! about what outlives what, which reports E0309 and E0310 outside function bodies.
+//! about what outlives what, which reports E0309, E0310 and E0311 outside function bodies.
 //!
 //! An ADT's fields must be well-formed given its where clauses and what rustc infers from
 //! the fields themselves (RFC 2093), which is every `T: 'a` and never `T: 'static`. A trait
@@ -25,7 +25,7 @@ use hir_def::{
     signatures::{FunctionSignature, TraitSignature},
 };
 use rustc_type_ir::{
-    ClauseKind, RegionKind, TypeVisitableExt as _,
+    BoundRegionKind, BoundVar, ClauseKind, RegionKind, TypeVisitableExt as _,
     inherent::{IntoKind, Term as _},
 };
 use salsa::SalsaValue;
@@ -33,10 +33,13 @@ use salsa::SalsaValue;
 use hir_ty::{
     GenericPredicates, ImplTraitId, InferBodyId, InferenceResult,
     db::HirDatabase,
-    next_solver::{Clause, DbInterner, GenericArgKind, SolverDefId, TermId, Ty, TyKind},
+    next_solver::{
+        BoundRegion, Clause, DbInterner, GenericArgKind, Region, SolverDefId, TermId, Ty, TyKind,
+    },
 };
 
-use outlives::{Inferred, Known, Needs};
+pub use outlives::Inferred;
+use outlives::{Known, Needs};
 
 /// Where an error is: rustc's span of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
@@ -234,12 +237,32 @@ impl<'db> Check<'_, 'db> {
     /// of its signature, and of its impl's header, imply.
     fn function(&mut self, function: FunctionId) {
         let db = self.db;
-        let sig = db
-            .callable_item_signature(CallableDefId::FunctionId(function))
-            .instantiate_identity()
-            .skip_norm_wip()
-            .skip_binder();
-        let mut assumed: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
+        let sig = self.interner().liberate_late_bound_regions(
+            function.into(),
+            db.callable_item_signature(CallableDefId::FunctionId(function))
+                .instantiate_identity()
+                .skip_norm_wip(),
+        );
+        // rust-analyzer gives a lifetime an argument elides an error region, where rustc makes
+        // each a lifetime parameter of its own.
+        let interner = self.interner();
+        let mut anonymous = 0;
+        let inputs: Vec<Ty<'db>> = sig
+            .inputs()
+            .iter()
+            .map(|&ty| {
+                rustc_type_ir::fold_regions(interner, ty, |region, _| {
+                    if !region.is_error() {
+                        return region;
+                    }
+                    anonymous += 1;
+                    let var = BoundVar::from_u32(u32::MAX / 2 + anonymous);
+                    let bound_region = BoundRegion { var, kind: BoundRegionKind::Anon };
+                    Region::new_late_param(interner, function.into(), bound_region)
+                })
+            })
+            .collect();
+        let mut assumed = inputs.clone();
         if assumed.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
             return;
         }
@@ -258,14 +281,23 @@ impl<'db> Check<'_, 'db> {
             self.resolve(&known, needs);
         } else if !FunctionSignature::of(db, function).is_async() {
             let known = self.known(function.into(), &assumed);
-            self.opaques(function, output, &known);
+            let elided = elided_output(db, function, &inputs);
+            self.opaques(function, output, &known, elided);
         }
     }
 
     /// rustc's `check_opaque_meets_bounds`: the type each `impl Trait` the function returns
     /// hides is well-formed and outlives what the `impl Trait`'s bounds say it does, given
     /// what the function knows; `-> impl Sized + 'static` hiding a `T` needs `T: 'static`.
-    fn opaques(&mut self, function: FunctionId, output: Ty<'db>, known: &Known<'db>) {
+    /// rust-analyzer gives a lifetime the return type elides an error region; `elided` is
+    /// the one lifetime elision makes it.
+    fn opaques(
+        &mut self,
+        function: FunctionId,
+        output: Ty<'db>,
+        known: &Known<'db>,
+        elided: Option<Region<'db>>,
+    ) {
         let db = self.db;
         let interner = self.interner();
         let infer = InferenceResult::of(db, InferBodyId::from(function));
@@ -279,10 +311,10 @@ impl<'db> Check<'_, 'db> {
                 continue;
             }
             let Some(&(_, ty)) = hidden.iter().find(|(it, _)| *it == index) else { continue };
-            if ty.references_error() || ty.has_infer() {
+            if ty.references_error() || ty.has_non_region_infer() {
                 continue;
             }
-            let ty = outlives::outlived_as(db, ty);
+            let ty = outlives::without_body_regions(interner, outlives::outlived_as(db, ty));
             let site = Site::Opaque(function, index.into_raw().into_u32());
             let mut needs = Vec::new();
             let mut found = Vec::new();
@@ -295,6 +327,13 @@ impl<'db> Check<'_, 'db> {
                     && bounded.kind.def_id() == alias.kind.def_id()
                     && !region.has_escaping_bound_vars()
                 {
+                    let region = match region.kind() {
+                        RegionKind::ReError(_) => match elided {
+                            Some(elided) => elided,
+                            None => continue,
+                        },
+                        _ => region,
+                    };
                     found.push(Needs::Type(ty, region));
                 }
             }
@@ -420,9 +459,9 @@ impl<'db> Check<'_, 'db> {
         Some(Site::Bound(def, found as u32))
     }
 
-    /// E0309 or E0310 for each type parameter not known to outlive a region it must, unless a
-    /// region must outlive one it is not known to: rustc's `process_errors` keeps only that
-    /// error of one check, as the others follow from it.
+    /// E0309, E0310 or E0311 (an anonymous lifetime) for each type parameter not known to
+    /// outlive a region it must, unless a region must outlive one it is not known to: rustc's
+    /// `process_errors` keeps only that error of one check, as the others follow from it.
     fn resolve(&mut self, known: &Known<'db>, needs: Vec<(Needs<'db>, Site)>) {
         let region_fails = needs.iter().any(|&(need, _)| match need {
             Needs::Region(longer, shorter) => !known.region_outlives(longer, shorter),
@@ -440,6 +479,11 @@ impl<'db> Check<'_, 'db> {
                 let TyKind::Param(param) = param.kind() else { continue };
                 let code = match region.kind() {
                     RegionKind::ReStatic => "E0310",
+                    RegionKind::ReLateParam(late)
+                        if !matches!(late.bound_region.kind, BoundRegionKind::Named(_)) =>
+                    {
+                        "E0311"
+                    }
                     _ => "E0309",
                 };
                 let params = GenericParams::of(self.db, param.id.parent());
@@ -451,5 +495,32 @@ impl<'db> Check<'_, 'db> {
                 }
             }
         }
+    }
+}
+
+/// The lifetime elision gives a lifetime the return type elides: `&self`'s, else the one
+/// lifetime of the arguments.
+fn elided_output<'db>(
+    db: &'db dyn HirDatabase,
+    function: FunctionId,
+    inputs: &[Ty<'db>],
+) -> Option<Region<'db>> {
+    if FunctionSignature::of(db, function).has_self_param()
+        && let Some(TyKind::Ref(region, ..)) = inputs.first().map(|it| it.kind())
+    {
+        return Some(region);
+    }
+    let mut regions = Vec::new();
+    for &input in inputs {
+        rustc_type_ir::fold_regions(DbInterner::new_no_crate(db), input, |region, _| {
+            if !matches!(region.kind(), RegionKind::ReBound(..)) && !regions.contains(&region) {
+                regions.push(region);
+            }
+            region
+        });
+    }
+    match regions.as_slice() {
+        &[only] => Some(only),
+        _ => None,
     }
 }

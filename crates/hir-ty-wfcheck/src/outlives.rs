@@ -127,6 +127,40 @@ pub(crate) fn outlived_as<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Ty<'db>
     ty.fold_with(&mut Fold { db, depth: 0 })
 }
 
+/// `ty` without the regions of a function body, which only the borrow checker reasons
+/// about: a type with such a region of its own, as `&'r T`, is left out, what it needs
+/// following from the borrow checker's `'r`, and any other such region is erased.
+pub(crate) fn without_body_regions<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
+    fn is_body(region: Region<'_>) -> bool {
+        !matches!(
+            region.kind(),
+            RegionKind::ReEarlyParam(_)
+                | RegionKind::ReLateParam(_)
+                | RegionKind::ReBound(..)
+                | RegionKind::ReStatic
+        )
+    }
+    struct Fold<'db>(DbInterner<'db>);
+    impl<'db> TypeFolder<DbInterner<'db>> for Fold<'db> {
+        fn cx(&self) -> DbInterner<'db> {
+            self.0
+        }
+        fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
+            let own_body_region = match ty.kind() {
+                TyKind::Ref(region, ..) => is_body(region),
+                TyKind::Adt(_, args) => args.regions().any(is_body),
+                TyKind::Dynamic(_, region) => is_body(region),
+                _ => false,
+            };
+            if own_body_region { Ty::new_unit(self.0) } else { ty.super_fold_with(self) }
+        }
+        fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+            if is_body(region) { Region::new_erased(self.0) } else { region }
+        }
+    }
+    ty.fold_with(&mut Fold(interner))
+}
+
 /// A region rustc calls free: a lifetime parameter of the item, which inference may name.
 fn is_free(region: Region<'_>) -> bool {
     matches!(region.kind(), RegionKind::ReEarlyParam(_))
@@ -359,7 +393,7 @@ pub(crate) fn projection_needs<'db>(
 /// of its own parameters, `T: 'a` and `'b: 'a` with `'a` a lifetime parameter, never
 /// `'static`. Worked out to a fixed point, as ADTs can contain each other.
 #[derive(Default)]
-pub(crate) struct Inferred<'db> {
+pub struct Inferred<'db> {
     memo: FxHashMap<AdtId, Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>>,
     in_progress: FxHashSet<AdtId>,
     cyclic: bool,
@@ -367,7 +401,7 @@ pub(crate) struct Inferred<'db> {
 }
 
 impl<'db> Inferred<'db> {
-    pub(crate) fn of(
+    pub fn of(
         &mut self,
         db: &'db dyn HirDatabase,
         adt: AdtId,
@@ -554,7 +588,10 @@ impl<'db> Known<'db> {
     /// as an elided one rust-analyzer gives an error region, counts as outliving.
     pub(crate) fn region_outlives(&self, longer: Region<'db>, shorter: Region<'db>) -> bool {
         let named = |region: Region<'db>| {
-            matches!(region.kind(), RegionKind::ReEarlyParam(_) | RegionKind::ReStatic)
+            matches!(
+                region.kind(),
+                RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic
+            )
         };
         if longer == shorter
             || matches!(longer.kind(), RegionKind::ReStatic)
@@ -588,7 +625,10 @@ impl<'db> Known<'db> {
     /// about here.
     pub(crate) fn failing_params(&self, ty: Ty<'db>, region: Region<'db>) -> Vec<Ty<'db>> {
         let mut failing = Vec::new();
-        if !matches!(region.kind(), RegionKind::ReEarlyParam(_) | RegionKind::ReStatic) {
+        if !matches!(
+            region.kind(),
+            RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic
+        ) {
             return failing;
         }
         for component in components(ty) {
