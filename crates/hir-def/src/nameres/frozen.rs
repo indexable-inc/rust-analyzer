@@ -421,6 +421,12 @@ pub struct Enc<'a> {
     searched: FxHashSet<ModuleId>,
 }
 
+/// Whether `loc` is an `include!` that reads a file: not the call of its argument, which has
+/// the same definition and no argument of its own.
+fn includes(loc: &MacroCallLoc) -> bool {
+    loc.def.is_include() && matches!(loc.kind, MacroCallKind::FnLike { eager: Some(_), .. })
+}
+
 fn hash128(bytes: &[u8]) -> u128 {
     let half = |seed: u8| {
         #[allow(deprecated)]
@@ -669,12 +675,21 @@ impl Enc<'_> {
     }
 
     fn call_loc(&mut self, call: MacroCallId) -> R {
-        let MacroCallLoc { def, krate, kind, ctxt, macro_depth } = call.loc(self.db).clone();
+        let loc = call.loc(self.db).clone();
+        let included = includes(&loc).then(|| loc.include_file_id(self.db, call));
+        let MacroCallLoc { def, krate, kind, ctxt, macro_depth } = loc;
         self.def_id(def)?;
         self.krate(krate)?;
         self.call_kind(kind)?;
         self.context(ctxt)?;
         self.u32(macro_depth);
+        // What `include!` expands to is the file it reads, which the header must name: one a
+        // build script writes may not be there yet, or may have other text, where it is read.
+        match included {
+            None => {}
+            Some(Some(file)) => self.file(file)?,
+            Some(None) => return Err("an include! of a file that is not loaded".to_owned()),
+        }
         Ok(())
     }
 
@@ -1966,7 +1981,14 @@ impl Dec<'_> {
             }
             NEW => {
                 let loc = self.call_loc()?;
+                let include = includes(&loc);
                 let call = MacroCallId::new(self.db, loc);
+                if include {
+                    let written = self.file()?;
+                    if call.loc(self.db).include_file_id(self.db, call) != Some(written) {
+                        return Err("an include! of another file than was written".to_owned());
+                    }
+                }
                 self.calls.push(call);
                 Ok(call)
             }
@@ -2896,6 +2918,43 @@ pub fn made() {}
             why.as_ref().is_some_and(|it| it.ends_with("is not the file that was written")),
             "{why:?}"
         );
+    }
+
+    #[test]
+    fn an_included_file_is_read_only_as_written() {
+        const INCLUDED: &str = r#"
+//- /main.rs crate:main deps:lib
+lib::unroll!();
+//- /lib/src/lib.rs crate:lib
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+include!("../out/made.rs");
+//- /lib/out/made.rs
+#[macro_export]
+macro_rules! unroll { () => { pub fn made() {} } }
+"#;
+        let db = TestDB::with_files(INCLUDED);
+        let lib = crate_named(&db, "lib");
+        let bytes = encode(&db, lib).unwrap();
+        assert_eq!(unreadable(&db, lib, &bytes), None);
+        let mut served = TestDB::with_files(INCLUDED);
+        let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
+        let served_lib = crate_named(&served, "lib");
+        set(&mut served, [(served_lib, frozen)].into_iter().collect());
+        for name in ["lib", "main"] {
+            let dump =
+                |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
+            assert_eq!(dump(&served), dump(&db), "{name}");
+        }
+        let changed = TestDB::with_files(&INCLUDED.replace("unroll {", "unroll_more {"));
+        let why = unreadable(&changed, crate_named(&changed, "lib"), &bytes);
+        assert!(
+            why.as_ref().is_some_and(|it| it.ends_with("is not the file that was written")),
+            "{why:?}"
+        );
+        let missing = TestDB::with_files(INCLUDED.split("//- /lib/out").next().unwrap());
+        let why = unreadable(&missing, crate_named(&missing, "lib"), &bytes);
+        assert!(why.as_ref().is_some_and(|it| it.ends_with("is not loaded")), "{why:?}");
     }
 
     #[test]
