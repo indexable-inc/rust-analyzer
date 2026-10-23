@@ -65,7 +65,7 @@ pub fn mode() -> Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub struct BorrowckDiagnostic {
-    /// rustc's error code, as `E0382`.
+    /// rustc's error code, as `E0382`, or `unused_mut` for the lint the borrow checker gives.
     pub code: &'static str,
     pub span: MirSpan,
     pub message: String,
@@ -154,6 +154,7 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     // A closure after the closures in it and before the body that makes it, which proves what
     // the closure needs of it.
     let mut requirements = FxHashMap::default();
+    let mut mut_upvars = FxHashMap::default();
     let mut diagnostics = Vec::new();
     for (body, closure, inline_const) in bodies.into_iter().rev() {
         let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
@@ -162,13 +163,15 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
             return result;
         }
         let mut found = Vec::new();
-        let needs = check::check(&ctx, body, &requirements, &mut found);
+        let (count, needs, used_mut_upvars) =
+            check::check(&ctx, body, &requirements, &mut_upvars, &mut found);
         if ctx.tainted.get() {
             return result;
         }
         diagnostics.push(found);
         if let Some(nested) = closure.or(inline_const) {
-            requirements.insert(nested, needs);
+            requirements.insert(nested, (count, needs));
+            mut_upvars.insert(nested, used_mut_upvars);
         }
     }
     result.diagnostics.extend(diagnostics.into_iter().rev().flatten());

@@ -30,13 +30,15 @@ use super::{
 };
 
 /// Checks `body`, given what the closures it makes need of it; in a closure, returns what it
-/// needs of its creator, with how many regions its type has.
+/// needs of its creator, with how many regions its type has, and the captures it needs the
+/// `mut` of.
 pub(super) fn check<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     requirements: &FxHashMap<ExprId, (usize, Vec<regions::Requirement<'db>>)>,
+    mut_upvars: &FxHashMap<ExprId, Vec<usize>>,
     out: &mut Vec<BorrowckDiagnostic>,
-) -> (usize, Vec<regions::Requirement<'db>>) {
+) -> (usize, Vec<regions::Requirement<'db>>, Vec<usize>) {
     let cfg = Cfg::new(body);
     let moves = MoveData::gather(ctx, body, &cfg);
     let flow = InitFlow::compute(body, &cfg, &moves);
@@ -121,6 +123,9 @@ pub(super) fn check<'db>(
         matched: matched(ctx),
         mut_errors: FxHashMap::default(),
         requirements: Vec::new(),
+        mut_upvars,
+        used_mut: FxHashSet::default(),
+        used_mut_upvars: Vec::new(),
     };
     let guard_borrows = guard_borrows(ctx, body);
     let tested_at = tested_at(ctx);
@@ -189,10 +194,15 @@ pub(super) fn check<'db>(
             at_signature: true,
         }));
     }
+    let unused_mut = checker.unused_mut();
     out.extend(checker.errors.into_iter().flatten());
     out.extend(checker.move_reported.into_values().map(|(_, _, error)| error));
+    out.extend(unused_mut);
     let count = regions.creator_positions.values().filter(|&&it| it < regions::IMPL_ANON).count();
-    (count, checker.requirements)
+    let mut used_mut_upvars = checker.used_mut_upvars;
+    used_mut_upvars.sort_unstable();
+    used_mut_upvars.dedup();
+    (count, checker.requirements, used_mut_upvars)
 }
 
 /// rustc's `apply_member_constraint` for each region of a returned `impl Trait`'s hidden type:
@@ -407,6 +417,15 @@ enum Allowed {
     No,
 }
 
+/// What a mutation that may be made needs the `mut` of, as rustc's `RootPlace`: the variable
+/// mutated, a capture, or neither.
+#[derive(Clone, Copy, Debug)]
+enum Root {
+    Local(Allowed),
+    Upvar(usize, Allowed),
+    Other,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Access {
     Read,
@@ -516,6 +535,12 @@ struct Checker<'a, 'b, 'db> {
     mut_errors: FxHashMap<LocalId, (usize, usize)>,
     /// In a closure, what it needs of its creator's regions.
     requirements: Vec<regions::Requirement<'db>>,
+    /// For each closure this body makes, the captures it needs the `mut` of.
+    mut_upvars: &'a FxHashMap<ExprId, Vec<usize>>,
+    /// The variables a mutation needs the `mut` of, rustc's `used_mut`.
+    used_mut: FxHashSet<LocalId>,
+    /// In a closure, the captures a mutation needs the `mut` of.
+    used_mut_upvars: Vec<usize>,
 }
 
 impl<'a, 'db> Checker<'a, '_, 'db> {
@@ -906,6 +931,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 };
                 self.access_place(location, place, span, Access::Read, Allowed::No, depth);
                 self.check_if_path_or_subpath_is_moved(location, InitAction::Use, place, span);
+            }
+            Rvalue::Aggregate(hir_ty::mir::AggregateKind::Closure(ty), operands) => {
+                self.propagate_used_mut_upvars(ty.as_ref(), operands);
+                rvalue
+                    .for_each_operand(&mut |operand| self.consume_operand(location, operand, span))
             }
             _ if super::compares(rvalue) => rvalue.for_each_operand(&mut |operand| {
                 if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
@@ -1774,12 +1804,18 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             Access::MutableBorrow { closure_capture, two_phase } => {
                 let allowed = if closure_capture { Allowed::Yes } else { allowed };
                 match self.is_mutable(place, allowed) {
-                    Ok(()) => return false,
+                    Ok(root) => {
+                        self.add_used_mut(place.local, root);
+                        return false;
+                    }
                     Err(root) => (Access::MutableBorrow { closure_capture, two_phase }, root),
                 }
             }
             Access::Mutate => match self.is_mutable(place, allowed) {
-                Ok(()) => return false,
+                Ok(root) => {
+                    self.add_used_mut(place.local, root);
+                    return false;
+                }
                 Err(root) => (Access::Mutate, root),
             },
             Access::Read
@@ -1802,15 +1838,209 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         true
     }
 
-    /// Whether `place` may be mutated, or the longest part of it that may not.
-    fn is_mutable(&self, place: PlaceRef<'_>, allowed: Allowed) -> Result<(), usize> {
+    /// rustc's `propagate_closure_used_mut_upvar`: what the closure of type `ty`, made of
+    /// `operands`, mutates of its captures by value needs their `mut` here.
+    fn propagate_used_mut_upvars(&mut self, ty: Ty<'db>, operands: &[Operand]) {
+        let db = self.ctx.db;
+        let expr = match ty.kind() {
+            TyKind::Closure(def, _) => def.0.loc(db).expr,
+            TyKind::Coroutine(def, _) => def.0.loc(db).expr,
+            TyKind::CoroutineClosure(def, _) => def.0.loc(db).expr,
+            _ => return,
+        };
+        // A closure lowering does not support is not checked, and may mutate any of them.
+        let every: Vec<usize>;
+        let fields = match self.mut_upvars.get(&expr) {
+            Some(it) => it.as_slice(),
+            None => {
+                every = (0..operands.len()).collect();
+                &every
+            }
+        };
+        for &field in fields {
+            let Some(OperandKind::Copy(place) | OperandKind::Move(place)) =
+                operands.get(field).map(|it| &it.kind)
+            else {
+                continue;
+            };
+            let place = PlaceRef::of(place);
+            if place.projection.is_empty()
+                && !self.ctx.bindings.contains_key(&place.local)
+                && self.ctx.upvar_of_local(place.local).is_none()
+            {
+                // A capture by reference is a borrow, which needs the `mut` itself; one by
+                // value of a copy of what a reference points to is of what it points to.
+                let ty = self.ctx.place_ty(self.body, place.local, &[]).ty;
+                if !matches!(ty.kind(), TyKind::Ref(_, _, rustc_ast_ir::Mutability::Mut))
+                    && let Some(source) = self.temporary_source(place.local)
+                {
+                    self.propagate_used_mut_place(source);
+                }
+                continue;
+            }
+            self.propagate_used_mut_place(place);
+        }
+    }
+
+    /// The place the temporary `local` is a reference to or a copy of.
+    fn temporary_source(&self, local: LocalId) -> Option<PlaceRef<'a>> {
+        let body = self.body;
+        body.basic_blocks.iter().flat_map(|(_, block)| &block.statements).find_map(|statement| {
+            match &statement.kind {
+                StatementKind::Assign(place, rvalue)
+                    if place.local == local && place.projection.as_slice().is_empty() =>
+                {
+                    match rvalue {
+                        Rvalue::Ref(_, source)
+                        | Rvalue::Use(Operand {
+                            kind: OperandKind::Copy(source) | OperandKind::Move(source),
+                            ..
+                        }) => Some(PlaceRef::of(source)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// A mutation in a closure of what it captures by value, `place`: of a variable here, of
+    /// what this closure captures, or through a mutable reference, which needs neither.
+    fn propagate_used_mut_place(&mut self, place: PlaceRef<'_>) {
+        if let Some(upvar) = self.upvar_field_projection(place) {
+            self.used_mut_upvars.push(upvar);
+            return;
+        }
+        for len in (0..place.projection.len()).rev() {
+            let base = place.base(len);
+            if matches!(place.projection[len], ProjectionElem::Deref)
+                && matches!(
+                    self.ctx.place_ty(self.body, base.local, base.projection).ty.kind(),
+                    TyKind::Ref(_, _, rustc_ast_ir::Mutability::Mut)
+                )
+            {
+                return;
+            }
+            if let Some(upvar) = self.upvar_field_projection(base) {
+                self.used_mut_upvars.push(upvar);
+                return;
+            }
+        }
+        self.used_mut.insert(place.local);
+    }
+
+    /// rustc's `lint_unused_mut`: the variables declared `mut` that no mutation needs the `mut`
+    /// of. As rustc's `gather_used_muts`, a variable moved into a temporary that needs its
+    /// `mut` needs it too, and one never assigned is left to other lints.
+    fn unused_mut(&mut self) -> Vec<BorrowckDiagnostic> {
+        let body = self.body;
+        let temporaries: FxHashSet<LocalId> = self
+            .used_mut
+            .iter()
+            .copied()
+            .filter(|it| !self.ctx.bindings.contains_key(it))
+            .collect();
+        let mut assigned = FxHashSet::default();
+        let mut moved_into_temporary = |operand: &Operand| {
+            if let OperandKind::Move(moved) = &operand.kind
+                && moved.projection.as_slice().is_empty()
+            {
+                self.used_mut.insert(moved.local);
+            }
+        };
+        for &block in &self.cfg.order {
+            let data = &body.basic_blocks[block];
+            for statement in &data.statements {
+                if let StatementKind::Assign(place, rvalue) = &statement.kind {
+                    assigned.insert(place.local);
+                    if temporaries.contains(&place.local) {
+                        rvalue.for_each_operand(&mut moved_into_temporary);
+                    }
+                }
+            }
+            if let Some(TerminatorKind::Call { destination, args, .. }) =
+                data.terminator.as_ref().map(|it| &it.kind)
+            {
+                assigned.insert(destination.local);
+                if temporaries.contains(&destination.local) {
+                    args.iter().for_each(&mut moved_into_temporary);
+                }
+            }
+        }
+        // An `async fn` or `async` closure moves its arguments into the future it makes, whose
+        // body binds them as its own variables.
+        let moves_arguments = match self.ctx.closure_expr {
+            Some(expr) => matches!(
+                self.ctx.store[expr],
+                hir_def::hir::Expr::Closure {
+                    closure_kind: hir_def::hir::ClosureKind::CoroutineClosure(_),
+                    ..
+                }
+            ),
+            None => matches!(
+                self.ctx.owner,
+                hir_ty::InferBodyId::DefWithBodyId(hir_def::DefWithBodyId::FunctionId(function))
+                    if hir_def::signatures::FunctionSignature::of(self.ctx.db, function).is_async()
+            ),
+        };
+        let mut unused: Vec<(LocalId, BindingId)> = self
+            .ctx
+            .bindings
+            .iter()
+            .map(|(&local, &binding)| (local, binding))
+            .filter(|&(local, binding)| {
+                let data = &self.ctx.store[binding];
+                data.mode == BindingAnnotation::Mutable
+                    && !data.name.as_str().starts_with('_')
+                    && !self.used_mut.contains(&local)
+                    && self.ctx.upvar_of_local(local).is_none()
+                    && match body.param_locals.contains(&local) {
+                        true => !moves_arguments,
+                        false => assigned.contains(&local),
+                    }
+            })
+            .collect();
+        unused.sort_by_key(|&(local, _)| local.into_raw().into_u32());
+        let mut seen = FxHashSet::default();
+        unused.retain(|&(_, binding)| seen.insert(binding));
+        unused
+            .into_iter()
+            .map(|(_, binding)| BorrowckDiagnostic {
+                code: "unused_mut",
+                span: MirSpan::BindingId(binding),
+                message: "variable does not need to be mutable".to_owned(),
+                at_signature: false,
+            })
+            .collect()
+    }
+
+    /// rustc's `add_used_mut`: a mutation that needs the `mut` of the variable `local`, which
+    /// may have been initialized before, or of what a closure captures.
+    fn add_used_mut(&mut self, local: LocalId, root: Root) {
+        match root {
+            Root::Local(allowed)
+                if allowed != Allowed::Yes
+                    && self.ever.contains(local.into_raw().into_u32() as usize) =>
+            {
+                self.used_mut.insert(local);
+            }
+            Root::Upvar(upvar, allowed) if allowed != Allowed::Yes => {
+                self.used_mut_upvars.push(upvar)
+            }
+            _ => (),
+        }
+    }
+
+    /// Whether `place` may be mutated, with what that needs the `mut` of, or the longest part
+    /// of it that may not.
+    fn is_mutable(&self, place: PlaceRef<'_>, allowed: Allowed) -> Result<Root, usize> {
         let Some((elem, _)) = place.projection.split_last() else {
             if let Some(upvar) = self.ctx.upvar_of_local(place.local) {
                 return self.is_upvar_mutable(upvar, allowed, 0);
             }
             return match (self.ctx.is_immutable(place.local), allowed) {
                 (true, Allowed::No) => Err(0),
-                _ => Ok(()),
+                _ => Ok(Root::Local(allowed)),
             };
         };
         let len = place.projection.len();
@@ -1820,7 +2050,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 // rustc reaches a `static mut` through a `*mut` pointer, lowering through a
                 // reference.
                 if base.projection.is_empty() && self.static_muts.contains(&base.local) {
-                    return Ok(());
+                    return Ok(Root::Other);
                 }
                 let base_ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
                 match base_ty.kind() {
@@ -1833,7 +2063,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         self.is_mutable(base, mode)
                     }
                     TyKind::RawPtr(_, rustc_ast_ir::Mutability::Not) => Err(len),
-                    TyKind::RawPtr(_, rustc_ast_ir::Mutability::Mut) => Ok(()),
+                    TyKind::RawPtr(_, rustc_ast_ir::Mutability::Mut) => Ok(Root::Other),
                     _ => self.is_mutable(base, allowed),
                 }
             }
@@ -1844,7 +2074,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
     }
 
-    fn is_upvar_mutable(&self, upvar: usize, allowed: Allowed, len: usize) -> Result<(), usize> {
+    fn is_upvar_mutable(&self, upvar: usize, allowed: Allowed, len: usize) -> Result<Root, usize> {
         let upvar_data = &self.ctx.upvars[upvar];
         if !upvar_data.mutable && allowed != Allowed::Yes {
             // What is behind a reference the closure cannot mutate, rustc reports where the
@@ -1854,7 +2084,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         // Mutating what a closure captured mutates the closure: not one called by `&self`.
         match self.ctx.closure_kind {
             Some(rustc_type_ir::ClosureKind::Fn) => Err(usize::MAX),
-            _ => Ok(()),
+            _ => Ok(Root::Upvar(upvar, allowed)),
         }
     }
 

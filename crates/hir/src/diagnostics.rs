@@ -1374,6 +1374,14 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 false => node_of(diagnostic.span),
             };
             let Some(node) = node else { continue };
+            // A variable lowering declares `mut` itself, as an `async fn`'s argument, points
+            // at what the user wrote, which has no `mut` to remove.
+            if diagnostic.code == "unused_mut" {
+                let pat = node.value.to_node(&node.file_id.parse_or_expand(self.db));
+                if !ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()) {
+                    continue;
+                }
+            }
             self.acc.push(
                 BorrowckError {
                     node,

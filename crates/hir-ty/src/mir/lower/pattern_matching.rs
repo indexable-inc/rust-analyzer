@@ -73,13 +73,64 @@ impl<'db> MirLowerCtx<'_, 'db> {
         cond_place: Place<'db>,
         pattern: PatId,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
-        let (current, current_else) = self.pattern_match_inner(
+        self.pattern_match_then_bind(current, current_else, cond_place, pattern, false)
+    }
+
+    /// [`Self::pattern_match`] for a candidate rustc links to the one it tries next, a later
+    /// arm or what runs when a refutable `let` does not match: a false edge from where the
+    /// pattern has matched, before it binds, to the mismatched path, which the borrow checker
+    /// follows and nothing runs. So the borrow checker does not know which patterns cannot
+    /// fail, and the mismatched path is there even where this one cannot.
+    pub(super) fn pattern_match_linked(
+        &mut self,
+        current: BasicBlockId,
+        cond_place: Place<'db>,
+        pattern: PatId,
+    ) -> Result<'db, (BasicBlockId, BasicBlockId)> {
+        let (then, otherwise) =
+            self.pattern_match_then_bind(current, None, cond_place, pattern, true)?;
+        let otherwise = otherwise.ok_or(MirLowerError::ImplementationError(
+            "a linked pattern without a mismatched path".into(),
+        ))?;
+        Ok((then, otherwise))
+    }
+
+    /// A false edge from `current`, rustc's `false_edges`: on to the block returned, which
+    /// runs, and to `imaginary`, which only the borrow checker follows.
+    fn false_edge(
+        &mut self,
+        current: BasicBlockId,
+        imaginary: BasicBlockId,
+        span: MirSpan,
+    ) -> BasicBlockId {
+        let real = self.new_basic_block();
+        self.set_terminator(
+            current,
+            TerminatorKind::FalseEdge { real_target: real, imaginary_target: imaginary },
+            span,
+        );
+        real
+    }
+
+    fn pattern_match_then_bind(
+        &mut self,
+        current: BasicBlockId,
+        current_else: Option<BasicBlockId>,
+        cond_place: Place<'db>,
+        pattern: PatId,
+        linked: bool,
+    ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
+        let (mut current, mut current_else) = self.pattern_match_inner(
             current,
             current_else,
             cond_place,
             pattern,
             MatchingMode::Check,
         )?;
+        if linked {
+            let next = *current_else.get_or_insert_with(|| self.new_basic_block());
+            current = self.false_edge(current, next, pattern.into());
+        }
         let current = match std::mem::take(&mut self.arm_unreached) {
             true => self.unreached_block(current, pattern.into()),
             false => current,
@@ -223,16 +274,35 @@ impl<'db> MirLowerCtx<'_, 'db> {
             Pat::Or(pats) => {
                 let then_target = self.new_basic_block();
                 let mut finished = false;
-                for pat in &**pats {
-                    let (mut next, next_else) = self.pattern_match_inner(
+                // After an alternative that cannot fail, the rest are reached only by the
+                // false edge, and what they bind is not what a guard reads or moves after.
+                let mut imaginary = false;
+                for (index, pat) in pats.iter().enumerate() {
+                    let held = imaginary.then(|| {
+                        (self.guarded_moves.as_ref().map(Vec::len), self.guard_refs.clone())
+                    });
+                    let (mut next, mut next_else) = self.pattern_match_inner(
                         current,
                         None,
                         cond_place,
                         *pat,
                         MatchingMode::Check,
                     )?;
+                    // rustc binds each alternative as a candidate of its own, linked to the
+                    // next by a false edge, so what any of them binds may have been bound.
+                    if mode == MatchingMode::Bind && index + 1 < pats.len() {
+                        imaginary |= next_else.is_none();
+                        let start = *next_else.get_or_insert_with(|| self.new_basic_block());
+                        next = self.false_edge(next, start, pattern.into());
+                    }
                     if mode != MatchingMode::Check {
                         (next, _) = self.pattern_match_inner(next, None, cond_place, *pat, mode)?;
+                    }
+                    if let Some((moves, refs)) = held {
+                        if let (Some(len), Some(guarded)) = (moves, &mut self.guarded_moves) {
+                            guarded.truncate(len);
+                        }
+                        self.guard_refs = refs;
                     }
                     self.set_goto(next, then_target, pattern.into());
                     match next_else {

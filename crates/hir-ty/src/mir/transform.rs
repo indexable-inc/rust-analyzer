@@ -40,7 +40,7 @@ use crate::{
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
-use super::{MirBody, MirLowerError, MirPhase, monomorphization::monomorphized};
+use super::{MirBody, MirLowerError, MirPhase, TerminatorKind, monomorphization::monomorphized};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -118,6 +118,15 @@ impl<'db> Ctx<'db> {
 fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
     let ctx = Ctx::new(db, body.owner);
+    // rustc's `CleanupPostBorrowck` before these: a false edge, which only borrow checking
+    // follows, is a jump to its real target.
+    for (_, block) in body.basic_blocks.iter_mut() {
+        if let Some(terminator) = &mut block.terminator
+            && let TerminatorKind::FalseEdge { real_target, .. } = terminator.kind
+        {
+            terminator.kind = TerminatorKind::Goto { target: real_target };
+        }
+    }
     // `Assert`s first: lowering says where each panicking statement unwinds by its position.
     asserts::add_asserts(&ctx, &mut body);
     upvars::upvars_in_place(&mut body);

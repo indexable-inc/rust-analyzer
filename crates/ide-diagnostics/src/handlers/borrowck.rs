@@ -5,7 +5,9 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 // Diagnostic: borrowck
 //
 // An error of rustc's borrow checker: a use of a moved or uninitialized value, a mutation of
-// what is not mutable, a borrow that conflicts with another or does not live long enough.
+// what is not mutable, a borrow that conflicts with another or does not live long enough. Also
+// rustc's `unused_mut` lint, which its borrow checker gives: a variable declared `mut` that is
+// never mutated.
 pub(crate) fn borrowck_error(
     ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::BorrowckError,
@@ -13,6 +15,7 @@ pub(crate) fn borrowck_error(
     // rustc gives some errors no code, as "lifetime may not live long enough".
     let code = match d.code {
         "" => DiagnosticCode::Ra("borrowck", crate::Severity::Error),
+        "unused_mut" => DiagnosticCode::RustcLint("unused_mut"),
         code => DiagnosticCode::RustcHardError(code),
     };
     let mut diagnostic = Diagnostic::new_with_syntax_node_ptr(ctx, code, d.message.clone(), d.node);

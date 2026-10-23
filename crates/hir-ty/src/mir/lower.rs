@@ -1082,7 +1082,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
                 let reached = self.reached_arms(arms);
-                for (MatchArm { pat, guard, expr }, reached) in arms.iter().zip(reached) {
+                for (index, (MatchArm { pat, guard, expr }, reached)) in
+                    arms.iter().zip(reached).enumerate()
+                {
+                    // Each way an arm can match is linked to the next by a false edge, but for
+                    // the last way of the last arm.
+                    let last_arm = index + 1 == arms.len();
                     // When the guard fails, rustc goes on to the next way the or-patterns of
                     // the arm can match, and runs the guard again for it.
                     let expansions = match guard {
@@ -1095,11 +1100,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         && (2..=64).contains(&expansions.len())
                     {
                         let body = self.new_basic_block();
-                        for choice in expansions {
+                        let count = expansions.len();
+                        for (expansion, choice) in expansions.into_iter().enumerate() {
                             self.or_choices = choice.into_iter().collect();
                             let outer = self.guarded_moves.replace(Vec::new());
                             self.arm_unreached = !reached;
-                            let matched = self.pattern_match(current, None, cond_place, *pat);
+                            let matched = match last_arm && expansion + 1 == count {
+                                true => self.pattern_match(current, None, cond_place, *pat),
+                                false => self
+                                    .pattern_match_linked(current, cond_place, *pat)
+                                    .map(|(then, otherwise)| (then, Some(otherwise))),
+                            };
                             let moves = std::mem::replace(&mut self.guarded_moves, outer);
                             self.or_choices.clear();
                             let (then, otherwise) = matched?;
@@ -1129,7 +1140,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         None => self.guarded_moves.take(),
                     };
                     self.arm_unreached = !reached;
-                    let matched = self.pattern_match(current, None, cond_place, *pat);
+                    let matched = match last_arm {
+                        true => self.pattern_match(current, None, cond_place, *pat),
+                        false => self
+                            .pattern_match_linked(current, cond_place, *pat)
+                            .map(|(then, otherwise)| (then, Some(otherwise))),
+                    };
                     let moves = std::mem::replace(&mut self.guarded_moves, outer);
                     let (then, mut otherwise) = matched?;
                     let then = if let &Some(guard) = guard {
@@ -1157,11 +1173,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     }
                     match otherwise {
                         Some(o) => current = o,
-                        None => {
-                            // The current pattern was irrefutable, so there is no need to generate code
-                            // for the rest of patterns
-                            break;
-                        }
+                        // The last arm, which cannot fail.
+                        None => break,
                     }
                 }
                 self.resolver.reset_to_guard(resolver_guard);
@@ -2301,9 +2314,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.push_fake_read(current, place, condition.into());
         let resolver_guard =
             self.resolver.update_to_inner_scope(self.db, self.store_owner, condition);
-        let (matched, unmatched) = self.pattern_match(current, None, place, pat)?;
+        let (matched, unmatched) = self.pattern_match_linked(current, place, pat)?;
         self.resolver.reset_to_guard(resolver_guard);
-        Ok(Some((matched, unmatched.unwrap_or_else(|| self.new_basic_block()))))
+        Ok(Some((matched, unmatched)))
     }
 
     /// Lowers a condition that binds names, `a && let P = e && ..`, to the blocks where it
@@ -3270,7 +3283,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             *expr_id,
                         );
                         self.super_let = enclosing.filter(|_| *is_super);
-                        let matched = self.pattern_match(current, None, init_place, *pat);
+                        let matched = match else_branch {
+                            Some(_) => self
+                                .pattern_match_linked(current, init_place, *pat)
+                                .map(|(then, otherwise)| (then, Some(otherwise))),
+                            None => self.pattern_match(current, None, init_place, *pat),
+                        };
                         self.super_let = None;
                         (current, else_block) = matched?;
                         self.resolver.reset_to_guard(resolver_guard);
