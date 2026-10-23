@@ -252,6 +252,109 @@ fn wf_into<'db>(
     }
 }
 
+/// What the impls of the associated types in `ty` need of what outlives what, given the where
+/// clauses of `def`: rustc's well-formedness asks that the trait of each be implemented, and
+/// its inference of an ADT's outlives bounds (RFC 2093) does not infer these, so a lifetime
+/// parameter can fail them too. `<T as Dummy<'a>>::Out` with only
+/// `impl<'a, T: 'a> Dummy<'a> for T` needs `T: 'a`.
+pub(crate) fn projection_needs<'db>(
+    db: &'db dyn HirDatabase,
+    def: hir_def::GenericDefId,
+    ty: Ty<'db>,
+    out: &mut Vec<Needs<'db>>,
+) {
+    use hir_def::HasModule as _;
+    use hir_ty::next_solver::{
+        TypingMode,
+        infer::{
+            DbInternerInferExt as _,
+            region_constraints::Constraint,
+            traits::{Obligation, ObligationCause},
+        },
+        obligation_ctxt::ObligationCtxt,
+    };
+    let mut aliases = Vec::new();
+    walk(ty, &mut aliases);
+    aliases.retain(|it| {
+        matches!(it.kind(), TyKind::Alias(alias)
+            if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }))
+            && !it.has_escaping_bound_vars()
+            && !it.references_error()
+    });
+    if aliases.is_empty() {
+        return;
+    }
+    let interner = DbInterner::new_with(db, def.module(db).krate(db)).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let env = db.trait_environment(def);
+    for alias in aliases {
+        let TyKind::Alias(alias) = alias.kind() else { continue };
+        let mut ocx = ObligationCtxt::new(&infcx);
+        let predicate = rustc_type_ir::TraitPredicate {
+            trait_ref: alias.trait_ref(interner),
+            polarity: rustc_type_ir::PredicatePolarity::Positive,
+        };
+        ocx.register_obligation(Obligation::new(
+            interner,
+            ObligationCause::dummy(),
+            env,
+            predicate,
+        ));
+        if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+            return;
+        }
+    }
+    let mut inner = infcx.inner.borrow_mut();
+    let obligations: Vec<_> =
+        inner.region_obligations().iter().map(|it| (it.sup_type, it.sub_region)).collect();
+    let constraints =
+        inner.unwrap_region_constraints().region_constraint_data().constraints.clone();
+    drop(inner);
+    // The impl's lifetimes are inference variables the solver equates with the item's.
+    let mut equal: FxHashMap<rustc_type_ir::RegionVid, Region<'db>> = FxHashMap::default();
+    for constraint in &constraints {
+        if let Constraint::VarSubReg(var, region) | Constraint::RegSubVar(region, var) = *constraint
+            && matches!(region.kind(), RegionKind::ReEarlyParam(_) | RegionKind::ReStatic)
+        {
+            equal.entry(var).or_insert(region);
+        }
+    }
+    let resolve = |region: Region<'db>| match region.kind() {
+        RegionKind::ReVar(var) => equal.get(&var).copied(),
+        RegionKind::ReEarlyParam(_) | RegionKind::ReStatic => Some(region),
+        _ => None,
+    };
+    for (ty, region) in obligations {
+        let mut unresolved = false;
+        let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| {
+            resolve(it).unwrap_or_else(|| {
+                unresolved |= matches!(it.kind(), RegionKind::ReVar(_));
+                it
+            })
+        });
+        if let Some(region) = resolve(region)
+            && !unresolved
+        {
+            out.push(Needs::Type(ty, region));
+        }
+    }
+    for constraint in constraints {
+        let (shorter, longer) = match constraint {
+            Constraint::VarSubVar(a, b) => {
+                (Region::new_var(interner, a), Region::new_var(interner, b))
+            }
+            Constraint::RegSubVar(a, b) => (a, Region::new_var(interner, b)),
+            Constraint::VarSubReg(a, b) => (Region::new_var(interner, a), b),
+            Constraint::RegSubReg(a, b) => (a, b),
+        };
+        if let (Some(shorter), Some(longer)) = (resolve(shorter), resolve(longer))
+            && shorter != longer
+        {
+            out.push(Needs::Region(longer, shorter));
+        }
+    }
+}
+
 /// rustc's `inferred_outlives_of` the ADTs a check comes across: what each one's fields need
 /// of its own parameters, `T: 'a` and `'b: 'a` with `'a` a lifetime parameter, never
 /// `'static`. Worked out to a fixed point, as ADTs can contain each other.

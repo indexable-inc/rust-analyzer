@@ -1519,6 +1519,15 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 Category::Return => self.tail(blamed.span),
                 _ => blamed.span,
             };
+            if blamed.category == Category::Signature {
+                self.errors.push(Some(BorrowckDiagnostic {
+                    code,
+                    span,
+                    message,
+                    at_signature: true,
+                }));
+                continue;
+            }
             self.report(code, span, message);
         }
         let mut reported = FxHashSet::default();

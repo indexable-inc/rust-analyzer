@@ -138,6 +138,9 @@ impl<'db> Check<'_, 'db> {
                         })
                         .map(|it| (it, Site::Field(variant, field))),
                 );
+                let mut found = Vec::new();
+                outlives::projection_needs(self.db, adt.into(), ty, &mut found);
+                needs.extend(found.into_iter().map(|it| (it, Site::Field(variant, field))));
             }
         }
         needs.extend(self.where_needs(adt.into()));

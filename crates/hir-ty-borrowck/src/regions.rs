@@ -77,6 +77,8 @@ pub(super) enum Category {
     Predicate,
     Boring,
     Internal,
+    /// What normalizing the signature needs, which rustc points at the signature.
+    Signature,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -554,6 +556,7 @@ pub(super) fn build<'db>(
     builder.universal_regions();
     builder.env_aliases();
     builder.location = None;
+    builder.signature_projections();
     builder.annotations();
     for &block in &cfg.order {
         let data = &body.basic_blocks[block];
@@ -2045,6 +2048,40 @@ impl<'db> Builder<'_, '_, 'db> {
             .collect();
     }
 
+    /// What normalizing the signature needs, as rustc normalizes the type of each parameter
+    /// and the return type: the where clauses of the impl that a projection there is of,
+    /// `<&'a () as Visitor<'d>>::Value` with only `impl<'a, 'd: 'a> Visitor<'d> for &'a ()`
+    /// that `'d: 'a`.
+    fn signature_projections(&mut self) {
+        if self.ctx.closure_local.is_some() || self.ctx.inline_const {
+            return;
+        }
+        let interner = self.interner();
+        let mut trait_refs = Vec::new();
+        for &local in self
+            .body
+            .param_locals
+            .iter()
+            .chain((!self.returns_opaque).then_some(&super::return_slot()))
+        {
+            let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+            for arg in ty.walk() {
+                if let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg)
+                    && let TyKind::Alias(alias) = it.kind()
+                    && let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
+                {
+                    let trait_ref = alias.trait_ref(interner);
+                    if !trait_refs.contains(&trait_ref) {
+                        trait_refs.push(trait_ref);
+                    }
+                }
+            }
+        }
+        for trait_ref in trait_refs {
+            self.prove(trait_ref, At { category: Category::Signature, span: MirSpan::Unknown });
+        }
+    }
+
     /// What the signature says of which universal regions outlive which: its where clauses
     /// and what its parameters' types imply, as `&'a T` that `T: 'a`.
     fn known_relations(&mut self) {
@@ -2397,6 +2434,54 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn normalize(&mut self, ty: Ty<'db>) -> Option<Ty<'db>> {
         normalize(self.ctx, ty)
+    }
+
+    /// `ty` normalized, with what the solver needs of the regions already there for it as
+    /// constraints at `at`: `<T as Fun>::F<'x>` with `T: Fun<F<'a> = [u8]>` is `[u8]` only
+    /// where `'x` is `'a`.
+    fn normalize_at(&mut self, ty: Ty<'db>, at: At) -> Option<Ty<'db>> {
+        use hir_ty::next_solver::infer::region_constraints::Constraint;
+        let infcx = &self.ctx.infcx;
+        let before = infcx
+            .inner
+            .borrow_mut()
+            .unwrap_region_constraints()
+            .region_constraint_data()
+            .constraints
+            .len();
+        let first_new = infcx.num_region_vars();
+        let normalized = normalize(self.ctx, ty)?;
+        let constraints: Vec<_> = infcx
+            .inner
+            .borrow_mut()
+            .unwrap_region_constraints()
+            .region_constraint_data()
+            .constraints[before..]
+            .to_vec();
+        let rv = |this: &mut Self, region: Region<'db>| match region.kind() {
+            RegionKind::ReVar(vid) if vid.index() < first_new => Some(vid.as_usize()),
+            RegionKind::ReStatic => Some(this.regions.static_rv),
+            RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
+                this.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
+            }
+            _ => None,
+        };
+        let interner = self.interner();
+        // Only what a where clause or `'static` gives: the solver relates the variables it was
+        // given among themselves more tightly than rustc's relating of the normalized types.
+        for constraint in constraints {
+            // `a <= b`: `b` outlives `a`.
+            let (shorter, longer) = match constraint {
+                Constraint::VarSubVar(..) => continue,
+                Constraint::RegSubVar(a, b) => (a, Region::new_var(interner, b)),
+                Constraint::VarSubReg(a, b) => (Region::new_var(interner, a), b),
+                Constraint::RegSubReg(a, b) => (a, b),
+            };
+            if let (Some(shorter), Some(longer)) = (rv(self, shorter), rv(self, longer)) {
+                self.outlives(longer, shorter, at);
+            }
+        }
+        Some(normalized)
     }
 
     /// What outlives clauses a well-formed type needs imply.
@@ -2846,8 +2931,8 @@ impl<'db> Builder<'_, '_, 'db> {
                 // normalized: `<S as Q>::Item<'w, 's>` and `<S as Q>::Item<'w, 'static>` are
                 // both `&'w S` when the impl's `Item<'w, 's>` is.
                 if matches!(x.kind, rustc_type_ir::AliasTyKind::Projection { .. }) {
-                    let normalized_a = self.normalize(a).filter(|&it| it != a);
-                    let normalized_b = self.normalize(b).filter(|&it| it != b);
+                    let normalized_a = self.normalize_at(a, at).filter(|&it| it != a);
+                    let normalized_b = self.normalize_at(b, at).filter(|&it| it != b);
                     if normalized_a.is_some() || normalized_b.is_some() {
                         let (a, b) = (normalized_a.unwrap_or(a), normalized_b.unwrap_or(b));
                         if !matches!(a.kind(), TyKind::Infer(_))
@@ -2879,7 +2964,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 if matches!(x.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
             {
                 let normalize = |this: &mut Self, ty: Ty<'db>| match ty.kind() {
-                    TyKind::Alias(_) => this.normalize(ty).filter(|&it| it != ty),
+                    TyKind::Alias(_) => this.normalize_at(ty, at).filter(|&it| it != ty),
                     _ => Some(ty),
                 };
                 if let Some(a) = normalize(self, a)
@@ -5315,7 +5400,7 @@ pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
         | Category::Assignment
         | Category::Usage => 2,
         Category::Predicate => 4,
-        Category::Boring => 5,
+        Category::Boring | Category::Signature => 5,
         Category::Internal => 7,
     };
     let best = path.iter().map(interest).min()?;
