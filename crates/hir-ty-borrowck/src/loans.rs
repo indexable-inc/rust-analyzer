@@ -422,6 +422,23 @@ fn const_promotable(
             });
             callable && !dropped && all(args.to_vec())
         }
+        // `NAME.as_str()` of a `const NAME`, as tracing's `fieldset!` names its fields.
+        Expr::MethodCall { receiver, args, .. } => {
+            let callable = ctx.infer.method_resolution(expr).is_some_and(|(func, _)| {
+                hir_def::signatures::FunctionSignature::of(ctx.db, func).is_const()
+            });
+            let dropped = std::iter::once(receiver).chain(args.iter()).any(|&it| {
+                hir_ty::drop::has_drop_glue(&ctx.infcx, ctx.infer.expr_ty(it), ctx.env)
+                    != hir_ty::drop::DropGlue::None
+            });
+            callable && !dropped && all(std::iter::once(*receiver).chain(args.to_vec()).collect())
+        }
+        // A block of items and a tail is its tail in MIR, where rustc promotes.
+        Expr::Block { statements, tail: Some(tail), .. }
+            if statements.iter().all(|it| matches!(it, hir_def::hir::Statement::Item(_))) =>
+        {
+            const_promotable(ctx, body, *tail, depth + 1)
+        }
         _ => false,
     }
 }

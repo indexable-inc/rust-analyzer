@@ -28,7 +28,7 @@ use crate::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, PathGenericsSource,
     PathLoweringDiagnostic, Span, TyDefId, ValueTyDefId,
     db::HirDatabase,
-    generics::{Generics, generics},
+    generics::{Generics, ObjectLifetimeDefault, generics},
     infer::unify::InferenceTable,
     lower::{
         AssocTypeShorthandResolution, ForbidParamsAfterReason, GenericPredicateSource,
@@ -828,6 +828,16 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 self.ctx.ctx.elided_lifetime()
             }
 
+            fn provided_object(
+                &mut self,
+                type_ref: TypeRefId,
+                region: Region<'db>,
+            ) -> Option<Ty<'db>> {
+                let store = self.ctx.ctx.store;
+                let TypeRef::DynTrait(bounds) = &store[type_ref] else { return None };
+                Some(self.ctx.ctx.lower_dyn_trait(bounds, region))
+            }
+
             fn inferred_kind(
                 &mut self,
                 def: GenericDefId,
@@ -1132,6 +1142,12 @@ pub(crate) trait GenericArgsLowerer<'db> {
     fn elided_lifetime(&mut self) -> Option<Region<'db>> {
         None
     }
+
+    /// A type argument written as a trait object with no lifetime, `dyn Trait`, with the
+    /// lifetime `region` its parameter's bounds give it; None for any other type.
+    fn provided_object(&mut self, _type_ref: TypeRefId, _region: Region<'db>) -> Option<Ty<'db>> {
+        None
+    }
 }
 
 /// Returns true if there was an error.
@@ -1342,7 +1358,17 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                 (HirGenericArg::Lifetime(_), GenericParamDataRef::LifetimeParamData(_))
                 | (HirGenericArg::Type(_), GenericParamDataRef::TypeParamData(_))
                 | (HirGenericArg::Const(_), GenericParamDataRef::ConstParamData(_)) => {
-                    substs.push(ctx.provided_kind(param_id, param, arg));
+                    let object = match (arg, param_id) {
+                        (&HirGenericArg::Type(type_ref), GenericParamId::TypeParamId(param)) => {
+                            object_lifetime_default(interner, &def_generics, param, &substs)
+                                .and_then(|region| ctx.provided_object(type_ref, region))
+                        }
+                        _ => None,
+                    };
+                    substs.push(match object {
+                        Some(ty) => ty.into(),
+                        None => ctx.provided_kind(param_id, param, arg),
+                    });
                     args.next();
                     params.next();
                 }
@@ -1469,6 +1495,25 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
     }
 
     GenericArgs::new_from_slice(&substs)
+}
+
+/// The lifetime of a trait object given for `param` with no lifetime of its own, by the
+/// parameter's one outlives bound and the arguments before it; None where that bound is not
+/// what decides it.
+fn object_lifetime_default<'db>(
+    interner: DbInterner<'db>,
+    generics: &Generics<'db>,
+    param: TypeParamId,
+    substs: &[GenericArg<'db>],
+) -> Option<Region<'db>> {
+    match generics.object_lifetime_default(param)? {
+        ObjectLifetimeDefault::Static => Some(Region::new_static(interner)),
+        ObjectLifetimeDefault::Param(lifetime) => {
+            let (index, late_bound) = generics.lifetime_param_idx(lifetime, false);
+            let region = substs.get(index as usize)?.region()?;
+            (!late_bound && !region.is_error()).then_some(region)
+        }
+    }
 }
 
 fn type_looks_like_const(

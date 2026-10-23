@@ -171,7 +171,68 @@ impl<'db> SingleGenerics<'db> {
     }
 }
 
+/// rustc's `ObjectLifetimeDefault` of a type parameter with one outlives bound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectLifetimeDefault {
+    Static,
+    Param(LifetimeParamId),
+}
+
 impl<'db> Generics<'db> {
+    /// rustc's `object_lifetime_default` (RFC 599): the lifetime a type parameter's one
+    /// outlives bound names, of its inline bounds and where clauses, `T: 'a + ?Sized` making
+    /// `Ref<'x, dyn Trait>` mean `Ref<'x, dyn Trait + 'x>`. None for no bound, for several,
+    /// and for `for<'b> T: 'a`.
+    pub(crate) fn object_lifetime_default(
+        &self,
+        param: TypeParamId,
+    ) -> Option<ObjectLifetimeDefault> {
+        use hir_def::hir::type_ref::{LifetimeRef, TypeBound, TypeRef};
+        let owner = self.chain.iter().find(|it| it.def == param.parent())?;
+        let mut found = None;
+        for predicate in owner.params.where_predicates() {
+            let &WherePredicate::TypeBound {
+                lifetimes: None,
+                target,
+                bound: TypeBound::Lifetime(lifetime),
+            } = predicate
+            else {
+                continue;
+            };
+            let bounded = match &owner.store[target] {
+                &TypeRef::TypeParam(it) => it == param,
+                TypeRef::Path(path) => {
+                    path.type_anchor().is_none()
+                        && path.segments().len() == 1
+                        && path.segments().first().is_some_and(|it| it.args_and_bindings.is_none())
+                        && path.mod_path().and_then(|it| it.as_ident()).is_some_and(|name| {
+                            owner.params.find_type_by_name(name, owner.def) == Some(param)
+                        })
+                }
+                _ => false,
+            };
+            if !bounded {
+                continue;
+            }
+            let default = match &owner.store[lifetime] {
+                LifetimeRef::Static => ObjectLifetimeDefault::Static,
+                &LifetimeRef::Param(it) => ObjectLifetimeDefault::Param(it),
+                LifetimeRef::Named(name) => ObjectLifetimeDefault::Param(
+                    self.chain
+                        .iter()
+                        .rev()
+                        .find_map(|it| it.params.find_lifetime_by_name(name, it.def))?,
+                ),
+                LifetimeRef::Placeholder | LifetimeRef::Error => return None,
+            };
+            if found.is_some_and(|it| it != default) {
+                return None;
+            }
+            found = Some(default);
+        }
+        found
+    }
+
     pub(crate) fn iter_owners(&self) -> impl DoubleEndedIterator<Item = &SingleGenerics<'db>> {
         self.chain.iter()
     }
