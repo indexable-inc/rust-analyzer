@@ -165,12 +165,17 @@ pub(super) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
 /// The temporaries a `const` or `static` item's value borrows where rustc extends their
 /// lifetime, into the value itself: the operand of a `&` the value is, or that is an element,
 /// a field, a tuple struct's or variant's constructor argument, a block's value or a cast
-/// operand of such.
+/// operand of such. Likewise a `const { .. }` block's value.
 fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
     let mut refs = FxHashSet::default();
-    let mut stack: Vec<_> = ctx.store.expr_roots().next_back().into_iter().collect();
+    let root = match body.owner {
+        InferBodyId::AnonConstId(konst) if ctx.inline_const => Some(konst.loc(ctx.db).expr),
+        _ => ctx.store.expr_roots().next_back(),
+    };
+    let mut stack: Vec<_> = root.into_iter().collect();
     while let Some(expr) = stack.pop() {
         match &ctx.store[expr] {
+            Expr::Const(inner) => stack.push(*inner),
             Expr::Ref { expr: inner, .. } => {
                 refs.insert(expr);
                 stack.push(*inner);
@@ -326,6 +331,8 @@ impl Loans {
         if item {
             statics.extend(extended_temporaries(ctx, body));
             statics.extend(const_promoted(ctx, body));
+        } else if ctx.inline_const {
+            statics.extend(extended_temporaries(ctx, body));
         }
         // A function item is a constant of a type with no data, promoted where it is borrowed:
         // `&Trait::method`, which inference may leave without a type when it cannot tell `Self`.

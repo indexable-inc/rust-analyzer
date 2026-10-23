@@ -103,13 +103,13 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
         }
     };
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
-    let mut bodies = vec![(body, None)];
+    let mut bodies = vec![(body, None, None)];
     let mut index = 0;
-    while let Some(&(body, _)) = bodies.get(index) {
+    while let Some(&(body, _, _)) = bodies.get(index) {
         index += 1;
         for &closure in &body.closures {
             match db.mir_body_for_closure(closure) {
-                Ok(it) => bodies.push((it, Some(closure.loc(db).expr))),
+                Ok(it) => bodies.push((it, Some(closure.loc(db).expr), None)),
                 Err(error) => {
                     result.skipped.get_or_insert_with(|| format!("closure: {error:?}"));
                 }
@@ -119,9 +119,19 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
         // a closure of the body that makes it.
         for coroutine in coroutines(body) {
             match db.mir_body_for_coroutine(coroutine) {
-                Ok(it) => bodies.push((it, Some(coroutine.loc(db).expr))),
+                Ok(it) => bodies.push((it, Some(coroutine.loc(db).expr), None)),
                 Err(error) => {
                     result.skipped.get_or_insert_with(|| format!("coroutine: {error:?}"));
+                }
+            }
+        }
+        // A `const { .. }` block, which MIR lowering makes a constant of its own, checked with
+        // the body as rustc checks an inline const.
+        for konst in inline_consts(db, body) {
+            match db.mir_body(InferBodyId::AnonConstId(konst)) {
+                Ok(it) => bodies.push((it, None, Some(konst.loc(db).expr))),
+                Err(error) => {
+                    result.skipped.get_or_insert_with(|| format!("inline const: {error:?}"));
                 }
             }
         }
@@ -130,13 +140,14 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     // the closure needs of it.
     let mut requirements = FxHashMap::default();
     let mut diagnostics = Vec::new();
-    for (body, closure) in bodies.into_iter().rev() {
-        let ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
+    for (body, closure, inline_const) in bodies.into_iter().rev() {
+        let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
+        ctx.inline_const = inline_const.is_some();
         let mut found = Vec::new();
         let needs = check::check(&ctx, body, &requirements, &mut found);
         diagnostics.push(found);
-        if let Some(closure) = closure {
-            requirements.insert(closure, needs);
+        if let Some(nested) = closure.or(inline_const) {
+            requirements.insert(nested, needs);
         }
     }
     result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
@@ -157,6 +168,32 @@ fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
                 && !out.contains(&id.0)
             {
                 out.push(id.0);
+            }
+        }
+    }
+    out
+}
+
+/// The `const { .. }` blocks `body` evaluates, in the order it does.
+fn inline_consts<'db>(
+    db: &'db dyn HirDatabase,
+    body: &MirBody<'db>,
+) -> Vec<hir_ty::db::AnonConstId<'db>> {
+    use hir_ty::db::GeneralConstId;
+    use hir_ty::mir::{OperandKind, Rvalue, StatementKind};
+    use hir_ty::next_solver::ConstKind;
+    use rustc_type_ir::inherent::IntoKind;
+    let mut out = Vec::new();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(_, Rvalue::Use(operand)) = &statement.kind
+                && let OperandKind::Constant { konst, .. } = &operand.kind
+                && let ConstKind::Unevaluated(unevaluated) = konst.as_ref().kind()
+                && let GeneralConstId::AnonConstId(id) = unevaluated.def.0
+                && id.is_inline_const(db)
+                && !out.contains(&id)
+            {
+                out.push(id);
             }
         }
     }
@@ -185,6 +222,8 @@ pub(crate) struct Ctx<'a, 'db> {
     pub(crate) closure_local: Option<LocalId>,
     /// The closure or `async` block this is the body of.
     pub(crate) closure_expr: Option<ExprId>,
+    /// This is the body of a `const { .. }` block, whose type's lifetimes are its function's.
+    pub(crate) inline_const: bool,
     /// For each expression in a `match` arm's guard, the variables the arm's pattern binds:
     /// rustc binds them by reference in the guard, so it cannot move out of them.
     pub(crate) guard_bindings: FxHashMap<ExprId, Vec<BindingId>>,
@@ -278,6 +317,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             closure_kind,
             closure_local,
             closure_expr: closure,
+            inline_const: false,
             guard_bindings: guard_bindings(store),
         }
     }

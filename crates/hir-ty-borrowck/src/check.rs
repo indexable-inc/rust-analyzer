@@ -1269,7 +1269,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             return;
         }
         let universals = &self.regions.universals;
-        let in_closure = self.ctx.closure_local.is_some();
+        let in_closure = self.ctx.closure_local.is_some() || self.ctx.inline_const;
         for (longer, &(longer_rv, kind)) in universals.iter().enumerate() {
             if matches!(kind, UniversalKind::Static | UniversalKind::FnBody) {
                 continue;

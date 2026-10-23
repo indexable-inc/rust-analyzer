@@ -110,6 +110,10 @@ pub(super) enum UniversalKind {
 /// lifetime 0, past those of the closure's type.
 pub(super) const LATE_PARENT: usize = 1 << 24;
 
+/// In a `const { .. }` block, the position of its function's lifetime parameter at `index`:
+/// [`EARLY_PARENT`] + `index`.
+pub(super) const EARLY_PARENT: usize = 1 << 28;
+
 /// What a closure needs of its creator's regions that it cannot prove itself, as rustc's
 /// `ClosureOutlivesRequirement`: that the region at position `longer` among the regions of
 /// the closure's type outlives the one at `shorter`, or `'static` for `None`. With a `subject`,
@@ -476,6 +480,7 @@ pub(super) fn build<'db>(
         location: None,
         env_aliases: Vec::new(),
         annotated: FxHashSet::default(),
+        const_positions: 0,
     };
     builder.universal_regions();
     builder.env_aliases();
@@ -505,6 +510,8 @@ struct Builder<'c, 'a, 'db> {
     env_aliases: Vec<Ty<'db>>,
     /// The variables a `let` writes the type of.
     annotated: FxHashSet<LocalId>,
+    /// In a `const { .. }` block, how many regions of its type have a position.
+    const_positions: usize,
     body: &'c MirBody<'db>,
     regions: Regions<'db>,
     /// What each closure checked so far needs of the body that creates it, with how many
@@ -555,6 +562,12 @@ impl<'db> Builder<'_, '_, 'db> {
         })
     }
 
+    /// Whether this is the body of a closure or a `const { .. }` block, whose type's regions
+    /// and enclosing item's lifetimes are its creator's.
+    fn nested(&self) -> bool {
+        self.ctx.closure_local.is_some() || self.ctx.inline_const
+    }
+
     fn new_universal(&mut self, kind: UniversalKind) -> Region<'db> {
         let region = self.fresh();
         let rv = rv_of(region).expect("a fresh region is a variable");
@@ -574,12 +587,18 @@ impl<'db> Builder<'_, '_, 'db> {
         if let Some(&it) = self.early.get(&index) {
             return it;
         }
-        // A closure's enclosing item's lifetime parameters are its creator's.
-        let kind = match self.ctx.closure_local {
-            Some(_) => UniversalKind::Creator,
-            None => UniversalKind::Named,
+        // A closure's or `const { .. }` block's enclosing item's lifetime parameters are its
+        // creator's.
+        let kind = match self.nested() {
+            true => UniversalKind::Creator,
+            false => UniversalKind::Named,
         };
         let region = self.new_universal(kind);
+        if self.ctx.inline_const {
+            self.regions
+                .creator_positions
+                .insert(self.regions.universals.len() - 1, EARLY_PARENT + index as usize);
+        }
         self.early.insert(index, region);
         self.regions.early.insert(index, rv_of(region).unwrap());
         region
@@ -589,7 +608,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// in the item, a creator's region of a closure's, at the position [`LATE_PARENT`] + `var`,
     /// as rustc's `for_each_late_bound_region_in_recursive_scope` makes them external.
     fn parent_late_region(&mut self, var: u32) -> Region<'db> {
-        if self.ctx.closure_local.is_none() {
+        if !self.nested() {
             if let Some(&it) = self.late.get(&var) {
                 return it;
             }
@@ -634,11 +653,11 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             RegionKind::ReBound(..) => Some(region),
             // In a closure, a late-bound lifetime of the enclosing item is its creator's.
-            RegionKind::ReLateParam(late) if self.ctx.closure_local.is_some() => {
+            RegionKind::ReLateParam(late) if self.nested() => {
                 Some(self.parent_late_region(late.bound_region.var.as_u32()))
             }
             // A late-bound lifetime the body names, the same as in the signature.
-            RegionKind::ReLateParam(late) if self.ctx.closure_local.is_none() => {
+            RegionKind::ReLateParam(late) => {
                 let var = late.bound_region.var.as_u32();
                 if let Some(&it) = self.late.get(&var) {
                     return Some(it);
@@ -833,6 +852,15 @@ impl<'db> Builder<'_, '_, 'db> {
                     return self.fresh();
                 }
                 self.signature_region(region, depth).unwrap_or_else(|| match (elided, is_fn) {
+                    // A `const { .. }` block's type is its creator's, by position.
+                    _ if self.ctx.inline_const => {
+                        let region = self.new_universal(UniversalKind::Creator);
+                        self.regions
+                            .creator_positions
+                            .insert(self.regions.universals.len() - 1, self.const_positions);
+                        self.const_positions += 1;
+                        region
+                    }
                     _ if hidden_static => self.static_region(),
                     _ if opaque => self.fresh(),
                     (Some(it), _) => it,
@@ -2130,13 +2158,22 @@ impl<'db> Builder<'_, '_, 'db> {
             let own = self.early_region(index);
             self.relate_regions(region, own, Variance::Invariant, at);
         }
-        let Some((count, requirements)) = self.requirements.get(&closure) else { return };
         let mut regions = Vec::new();
         regions_of(ty, &mut regions);
+        self.apply_requirements(closure, regions);
+    }
+
+    /// What the closure or `const { .. }` block `nested` needs of this body's regions, the
+    /// regions of its type at their positions being `regions`.
+    fn apply_requirements(&mut self, nested: hir_def::hir::ExprId, regions: Vec<Rv>) {
+        let Some((count, requirements)) = self.requirements.get(&nested) else { return };
         if regions.len() != *count {
             return;
         }
         let at_position = |this: &mut Self, position: usize| match position {
+            _ if position >= EARLY_PARENT => {
+                rv_of(this.early_region((position - EARLY_PARENT) as u32))
+            }
             _ if position >= LATE_PARENT => {
                 rv_of(this.parent_late_region((position - LATE_PARENT) as u32))
             }
@@ -2728,7 +2765,11 @@ impl<'db> Builder<'_, '_, 'db> {
     fn constant_ty(&mut self, operand: &Operand, span: MirSpan) -> Option<Ty<'db>> {
         let OperandKind::Constant { konst, .. } = &operand.kind else { return None };
         let ConstKind::Unevaluated(unevaluated) = konst.as_ref().kind() else { return None };
-        let GeneralConstId::ConstId(id) = unevaluated.def.0 else { return None };
+        let id = match unevaluated.def.0 {
+            GeneralConstId::ConstId(id) => id,
+            GeneralConstId::AnonConstId(konst) => return self.inline_const_ty(konst, operand),
+            _ => return None,
+        };
         let span = operand.span().unwrap_or(span);
         let path = match span {
             MirSpan::ExprId(expr) => match &self.ctx.store[expr] {
@@ -2755,6 +2796,38 @@ impl<'db> Builder<'_, '_, 'db> {
         if let Some(path) = path {
             self.written_self(path, id.lookup(db).container, args, span);
         }
+        Some(ty)
+    }
+
+    /// The type of a `const { .. }` block where it is evaluated, its function's lifetimes this
+    /// body's, with what the block needs of the regions of its type, as rustc relates an
+    /// inline const's arguments.
+    fn inline_const_ty(
+        &mut self,
+        konst: hir_ty::db::AnonConstId<'db>,
+        operand: &Operand,
+    ) -> Option<Ty<'db>> {
+        let db = self.ctx.db;
+        if !konst.is_inline_const(db) {
+            return None;
+        }
+        let OperandKind::Constant { ty, .. } = &operand.kind else { return None };
+        let mut positions = Vec::new();
+        let ty =
+            rustc_type_ir::fold_regions(self.interner(), ty.as_ref(), |region, depth| match region
+                .kind()
+            {
+                RegionKind::ReBound(..) => region,
+                RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {
+                    self.signature_region(region, depth).unwrap_or_else(|| self.fresh())
+                }
+                _ => {
+                    let region = self.fresh();
+                    positions.extend(rv_of(region));
+                    region
+                }
+            });
+        self.apply_requirements(konst.loc(db).expr, positions);
         Some(ty)
     }
 
