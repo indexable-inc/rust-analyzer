@@ -625,7 +625,9 @@ mod tests {
                 let read: Vec<_> = tree.children(at).map(|it| f.flat_element(it)).collect();
                 assert_eq!(read, children.into_iter().map(NodeOrToken::Node).collect::<Vec<_>>());
                 let descendants = f.descendants().map(|it| (it.kind(), it.text_range()));
-                assert!(descendants.eq(tree.descendants(at).map(|it| (tree.kind(it), tree.range(it)))));
+                assert!(
+                    descendants.eq(tree.descendants(at).map(|it| (tree.kind(it), tree.range(it))))
+                );
             }
         }
     }

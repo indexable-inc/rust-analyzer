@@ -725,9 +725,11 @@ impl AstIdMap {
                         {
                             let block_kind = kind_of(*last_block);
                             let parent = parent_of(parent_idx, &res);
-                            let block_ast_id = block_expr_ast_id(block_kind, &mut index_map, parent)
-                                .expect("not a BlockExpr");
-                            let ptr = SyntaxNodePtr::from_parts(block_kind, tree.range(*last_block));
+                            let block_ast_id =
+                                block_expr_ast_id(block_kind, &mut index_map, parent)
+                                    .expect("not a BlockExpr");
+                            let ptr =
+                                SyntaxNodePtr::from_parts(block_kind, tree.range(*last_block));
                             res.arena.alloc((ptr, block_ast_id));
                             *already_allocated = ContainsItems::Yes;
                         }
