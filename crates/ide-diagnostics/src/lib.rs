@@ -379,8 +379,23 @@ pub fn semantic_diagnostics(
     resolve: &AssistResolveStrategy,
     file_id: FileId,
 ) -> Vec<Diagnostic> {
+    semantic_diagnostics_within(db, config, resolve, file_id, None)
+}
+
+/// [`semantic_diagnostics`], with the file read as a module of only those of `within` it is
+/// in, when it is in any: see [`Semantics::new_within`].
+pub fn semantic_diagnostics_within(
+    db: &RootDatabase,
+    config: &DiagnosticsConfig,
+    resolve: &AssistResolveStrategy,
+    file_id: FileId,
+    within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
+) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("semantic_diagnostics").entered();
-    let sema = Semantics::new(db);
+    let sema = match within {
+        Some(crates) => Semantics::new_within(db, crates),
+        None => Semantics::new(db),
+    };
     let editioned_file_id = sema.attach_first_edition(file_id);
 
     let (file_id, edition) = editioned_file_id.unpack(db);

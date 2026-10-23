@@ -26,8 +26,8 @@ use crate::{
     db::{HirDatabase, InternedClosure},
     generics::generics,
     next_solver::{
-        BoundExistentialPredicates, DbInterner, ExistentialProjection, ExistentialTraitRef,
-        GenericArg, GenericArgs, RegionKind, TermId, TraitRef, Ty, TyKind,
+        BoundExistentialPredicates, Const, ConstKind, DbInterner, ExistentialProjection,
+        ExistentialTraitRef, GenericArg, GenericArgs, RegionKind, TermId, TraitRef, Ty, TyKind,
     },
     utils::fn_traits,
 };
@@ -590,7 +590,10 @@ fn write_args<'db>(
         written += 1;
         match (arg.ty(), arg.konst()) {
             (Some(ty), _) => write_ty(db, out, ty)?,
-            (_, Some(konst)) => write!(out, "{}", try_const_usize(db, konst)?).ok()?,
+            (_, Some(konst)) => match type_name_value(konst) {
+                Some(value) if out.spelling == Spelling::TypeName => out.push_str(&value),
+                _ => write!(out, "{}", try_const_usize(db, konst)?).ok()?,
+            },
             _ => out.push_str("'_"),
         }
     }
@@ -598,6 +601,50 @@ fn write_args<'db>(
         out.push('>');
     }
     Some(())
+}
+
+/// A constant argument that is a value as `type_name` writes it: `true`, `'a'`, `-1`, or the
+/// name of the least or the greatest value of its type, as `i8::MIN`.
+fn type_name_value(konst: Const<'_>) -> Option<String> {
+    let ConstKind::Value(value) = konst.kind() else { return None };
+    let rustc_type_ir::ValTreeKind::Leaf(leaf) = value.value.inner() else { return None };
+    let leaf = *leaf;
+    let unused = 128 - leaf.size().bits();
+    let named = |name: &str, end: &str| Some(format!("{name}::{end}"));
+    match value.ty.kind() {
+        TyKind::Bool => Some(leaf.try_to_bool().ok()?.to_string()),
+        TyKind::Char => Some(format!("{:?}", char::from_u32(leaf.to_uint_unchecked() as u32)?)),
+        TyKind::Int(int) => {
+            let name = match int {
+                rustc_type_ir::IntTy::Isize => "isize",
+                rustc_type_ir::IntTy::I8 => "i8",
+                rustc_type_ir::IntTy::I16 => "i16",
+                rustc_type_ir::IntTy::I32 => "i32",
+                rustc_type_ir::IntTy::I64 => "i64",
+                rustc_type_ir::IntTy::I128 => "i128",
+            };
+            match leaf.to_int_unchecked() {
+                it if it == i128::MIN >> unused => named(name, "MIN"),
+                it if it == i128::MAX >> unused => named(name, "MAX"),
+                it => Some(it.to_string()),
+            }
+        }
+        TyKind::Uint(uint) => {
+            let name = match uint {
+                rustc_type_ir::UintTy::Usize => "usize",
+                rustc_type_ir::UintTy::U8 => "u8",
+                rustc_type_ir::UintTy::U16 => "u16",
+                rustc_type_ir::UintTy::U32 => "u32",
+                rustc_type_ir::UintTy::U64 => "u64",
+                rustc_type_ir::UintTy::U128 => "u128",
+            };
+            match leaf.to_uint_unchecked() {
+                it if it == u128::MAX >> unused => named(name, "MAX"),
+                it => Some(it.to_string()),
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The closure or `async` block written at `expr` of `func`.

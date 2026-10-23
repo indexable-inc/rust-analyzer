@@ -584,10 +584,6 @@ fn expand_repeat(
                 }
             };
         }
-
-        if RepeatKind::ZeroOrOne == kind {
-            break;
-        }
     }
     // Lose the last separator and last after-the-end round.
     builder.restore(restore_point);

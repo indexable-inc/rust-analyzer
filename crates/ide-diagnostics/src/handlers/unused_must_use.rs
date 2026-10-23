@@ -196,7 +196,7 @@ fn main() {
     }
 
     #[test]
-    fn if_branches_in_stmt_position() {
+    fn if_branches_in_stmt_position_are_not_linted() {
         check_diagnostics(
             r#"
 #[must_use]
@@ -204,10 +204,8 @@ fn produces() -> i32 { 0 }
 fn main() {
     if true {
         produces()
-      //^^^^^^^^^^ warn: unused return value that must be used
     } else {
         produces()
-      //^^^^^^^^^^ warn: unused return value that must be used
     };
 }
 "#,
@@ -215,7 +213,7 @@ fn main() {
     }
 
     #[test]
-    fn match_arms_in_stmt_position() {
+    fn match_arms_in_stmt_position_are_not_linted() {
         check_diagnostics(
             r#"
 #[must_use]
@@ -223,9 +221,7 @@ fn produces() -> i32 { 0 }
 fn main() {
     match 0 {
         0 => produces(),
-           //^^^^^^^^^^ warn: unused return value that must be used
         _ => produces(),
-           //^^^^^^^^^^ warn: unused return value that must be used
     };
 }
 "#,
@@ -233,7 +229,7 @@ fn main() {
     }
 
     #[test]
-    fn const_block_in_stmt_position() {
+    fn const_block_in_stmt_position_is_not_linted() {
         check_diagnostics(
             r#"
 #[must_use]
@@ -241,7 +237,6 @@ const fn produces() -> i32 { 0 }
 fn main() {
     const {
         produces()
-      //^^^^^^^^^^ warn: unused return value that must be used
     };
 }
 "#,
@@ -260,6 +255,43 @@ fn main() {
         produces()
       //^^^^^^^^^^ warn: unused return value that must be used
     };
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn result_and_control_flow_with_an_uninhabited_side_are_what_they_hold() {
+        check_diagnostics(
+            r#"
+//- minicore: result, try
+#[must_use]
+struct Important;
+enum Never {}
+fn unit() -> Result<(), Never> { Ok(()) }
+fn important() -> Result<Important, Never> { Ok(Important) }
+fn flow() -> core::ops::ControlFlow<Never, Important> { core::ops::ControlFlow::Continue(Important) }
+fn never() -> Never { loop {} }
+fn main() {
+    unit();
+    important();
+  //^^^^^^^^^^^ warn: unused return value that must be used
+    flow();
+  //^^^^^^ warn: unused return value that must be used
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn a_local_holding_a_function_is_not_linted() {
+        check_diagnostics(
+            r#"
+#[must_use]
+fn produces() -> i32 { 0 }
+fn main() {
+    let local = produces;
+    local();
 }
 "#,
         );

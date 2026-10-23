@@ -217,6 +217,17 @@ impl<DB: HirDatabase> Semantics<'_, DB> {
         let impl_ = SemanticsImpl::new(db);
         Semantics { db, imp: impl_ }
     }
+
+    /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
+    /// is in any.
+    pub fn new_within(
+        db: &DB,
+        crates: std::sync::Arc<rustc_hash::FxHashSet<base_db::Crate>>,
+    ) -> Semantics<'_, DB> {
+        let mut impl_ = SemanticsImpl::new(db);
+        impl_.s2d_cache.get_mut().within = Some(crates);
+        Semantics { db, imp: impl_ }
+    }
 }
 
 // Note: We take `DB` as `?Sized` here in order to support type-erased

@@ -2186,11 +2186,12 @@ impl<'db> Interner for DbInterner<'db> {
     fn evaluate_root_goal_for_proof_tree_raw(
         self,
         canonical_goal: rustc_type_ir::solve::CanonicalInput<Self>,
+        root_depth: usize,
     ) -> (rustc_type_ir::solve::QueryResult<Self>, Self::Probe) {
         rustc_next_trait_solver::solve::evaluate_root_goal_for_proof_tree_raw_provider::<
             SolverContext<'db>,
             Self,
-        >(self, canonical_goal)
+        >(self, canonical_goal, root_depth)
     }
 
     fn is_sizedness_trait(self, def_id: Self::TraitId) -> bool {

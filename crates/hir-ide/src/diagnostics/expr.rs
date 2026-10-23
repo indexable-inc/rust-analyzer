@@ -7,16 +7,18 @@ use std::fmt;
 use base_db::Crate;
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, CallableDefId, DefWithBodyId, HasModule, ItemContainerId, Lookup,
+    AdtId, AssocItemId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId,
+    Lookup,
     attrs::AttrFlags,
+    expr_store::scope::ExprScopes,
     lang_item::LangItems,
-    resolver::{HasResolver, ValueNs},
+    resolver::{HasResolver, ValueNs, resolver_for_scope},
 };
 use intern::sym;
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
 use rustc_pattern_analysis::constructor::Constructor;
-use rustc_type_ir::inherent::IntoKind;
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind};
 use syntax::{
     AstNode,
     ast::{self, UnaryOp},
@@ -33,6 +35,7 @@ use crate::{
         pat_analysis::{self, DeconstructedPat, MatchCheckCtx, WitnessPat},
     },
     display::{DisplayTarget, HirDisplay},
+    inhabitedness::is_ty_uninhabited_from,
     next_solver::{
         CallableIdWrapper, DbInterner, ParamEnv, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
@@ -411,32 +414,14 @@ impl<'db> ExprValidator<'db> {
         mut expr: ExprId,
         acc: &mut Vec<BodyValidationDiagnostic<'db>>,
     ) {
-        // Walk through container expressions so that the value-producing leaf is
-        // checked even when wrapped in a block, `unsafe { .. }`, `if`/`match`, or
-        // a `const { .. }` block.  Single-tail chains are followed by reassigning
-        // `expr`; branching containers (`if`/`match`) recurse on each arm.
-        loop {
-            match &self.body[expr] {
-                Expr::Block { tail: Some(tail), .. } | Expr::Const(tail) => expr = *tail,
-                Expr::If { then_branch, else_branch, .. } => {
-                    self.check_unused_must_use(*then_branch, acc);
-                    if let Some(else_branch) = else_branch {
-                        self.check_unused_must_use(*else_branch, acc);
-                    }
-                    return;
-                }
-                Expr::Match { arms, .. } => {
-                    for arm in arms.iter() {
-                        self.check_unused_must_use(arm.expr, acc);
-                    }
-                    return;
-                }
-                _ => break,
-            }
+        // As rustc's `UnusedResults`: the value of the statement, through the tails of
+        // blocks (`unsafe` and labeled ones too) but not into `if`, `match` or `const`.
+        while let Expr::Block { tail: Some(tail), .. } = &self.body[expr] {
+            expr = *tail;
         }
 
         let fn_def = match &self.body[expr] {
-            Expr::Call { callee, .. } => {
+            Expr::Call { callee, .. } if self.names_an_item(*callee) => {
                 let callee_ty = self.infer.expr_ty(*callee);
                 if let TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(func)), _) =
                     callee_ty.kind()
@@ -451,10 +436,11 @@ impl<'db> ExprValidator<'db> {
             }
             _ => None,
         };
-        let ty_def = self.infer.type_of_expr_with_adjust(expr).and_then(|ty| match ty.kind() {
-            TyKind::Adt(adt, _) => Some(adt.def_id().into()),
-            _ => None,
-        });
+        let ty_def = self
+            .infer
+            .type_of_expr_with_adjust(expr)
+            .and_then(|ty| self.must_use_adt(ty))
+            .map(Into::into);
         let must_use_diag = |owner| {
             AttrFlags::must_use_message(self.db(), owner?)
                 .map(|message| BodyValidationDiagnostic::UnusedMustUse { expr, message })
@@ -462,6 +448,45 @@ impl<'db> ExprValidator<'db> {
         if let Some(diag) = must_use_diag(fn_def).or_else(|| must_use_diag(ty_def)) {
             acc.push(diag);
         }
+    }
+
+    /// Whether `callee` is a path to an item, as rustc's `check_fn_must_use` asks: a local
+    /// that holds a function is not one.
+    fn names_an_item(&self, callee: ExprId) -> bool {
+        let Expr::Path(path) = &self.body[callee] else { return false };
+        let db = self.db();
+        let scope = ExprScopes::of(db, self.owner).scope_for(callee);
+        let resolved = resolver_for_scope(db, self.owner, scope).resolve_path_in_value_ns_fully(
+            db,
+            path,
+            self.body.expr_path_hygiene(callee),
+        );
+        !matches!(resolved, Some(ValueNs::LocalBinding(_)))
+    }
+
+    /// The ADT whose `#[must_use]` makes a value of `ty` one to use, as rustc's
+    /// `is_ty_must_use` has it: none for an uninhabited type, and `Result<T, E>` and
+    /// `ControlFlow<B, T>` with `E` or `B` uninhabited are what `T` is.
+    fn must_use_adt(&self, ty: Ty<'db>) -> Option<AdtId> {
+        let TyKind::Adt(adt, args) = ty.kind() else { return None };
+        let db = self.db();
+        let module = self.owner.module(db);
+        let uninhabited = |ty| is_ty_uninhabited_from(&self.infcx, ty, module, self.env);
+        if uninhabited(ty) {
+            return None;
+        }
+        let lang = self.infcx.interner.lang_items();
+        let enum_of = |variant: Option<EnumVariantId>| variant.map(|it| it.lookup(db).parent);
+        let id = adt.def_id();
+        if let AdtId::EnumId(it) = id {
+            if Some(it) == enum_of(lang.ResultOk) && uninhabited(args.type_at(1)) {
+                return self.must_use_adt(args.type_at(0));
+            }
+            if Some(it) == enum_of(lang.ControlFlowBreak) && uninhabited(args.type_at(0)) {
+                return self.must_use_adt(args.type_at(1));
+            }
+        }
+        Some(id)
     }
 
     fn check_for_trailing_return(&mut self, body_expr: ExprId, body: &Body) {

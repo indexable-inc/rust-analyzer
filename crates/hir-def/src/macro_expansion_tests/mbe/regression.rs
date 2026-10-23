@@ -1190,3 +1190,28 @@ fn foo() {
 "#]],
     );
 }
+
+#[test]
+fn shallow_variable_in_deeper_repetition() {
+    check(
+        r#"
+macro_rules! m {
+    ($(, field($getter:ident $(, $($setter:ident)?)?))*) => {
+        $($(fn $getter() {} $(fn $setter() {})?)*)?
+    };
+}
+m!(, field(a, set_a), field(b), field(c, set_c));
+"#,
+        expect![[r#"
+macro_rules! m {
+    ($(, field($getter:ident $(, $($setter:ident)?)?))*) => {
+        $($(fn $getter() {} $(fn $setter() {})?)*)?
+    };
+}
+fn a() {}
+fn set_a() {}
+fn c() {}
+fn set_c() {}
+"#]],
+    );
+}

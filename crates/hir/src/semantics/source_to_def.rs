@@ -85,7 +85,9 @@
 //! active crate for a given position, and then provide an API to resolve all
 //! syntax nodes against this specific crate.
 
-use base_db::relevant_crates;
+use std::sync::Arc;
+
+use base_db::{Crate, relevant_crates};
 use either::Either;
 use hir_def::{
     AdtId, BlockId, BuiltinDeriveImplId, ConstId, ConstParamId, DefWithBodyId, EnumId,
@@ -104,7 +106,7 @@ use hir_expand::{
     EditionedFileId, ExpansionInfo, HirFileId, InMacroFile, MacroCallId, attrs::AttrId,
     name::AsName,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::FileId;
 use stdx::impl_from;
@@ -127,6 +129,21 @@ pub(super) struct SourceToDefCache<'db> {
     pub(super) included_file_cache: FxHashMap<EditionedFileId, Option<MacroCallId>>,
     /// Rootnode to HirFileId cache
     pub(super) root_to_file_cache: FxHashMap<SyntaxNode, HirFileId>,
+    /// The crates a file is taken to be a module of, of those it may be, when any is.
+    pub(super) within: Option<Arc<FxHashSet<Crate>>>,
+}
+
+/// The crates `file` may be a module of: those `within` first, then the others. The file of a
+/// package is in the source root of each of its targets, and each would otherwise have its
+/// module tree built.
+fn crates_of(
+    db: &dyn HirDatabase,
+    within: Option<&FxHashSet<Crate>>,
+    file: FileId,
+) -> [Vec<Crate>; 2] {
+    let (some, rest) = (relevant_crates(db, file).iter())
+        .partition(|it| within.is_some_and(|within| within.contains(it)));
+    [some, rest]
 }
 
 impl<'db> SourceToDefCache<'db> {
@@ -149,12 +166,17 @@ impl<'db> SourceToDefCache<'db> {
             return m;
         }
         self.included_file_cache.insert(file, None);
-        for &crate_id in relevant_crates(db, file.file_id(db)) {
-            for &(macro_call_id, file_id) in hir_def::include_macro_invoc(db, crate_id) {
-                self.included_file_cache.insert(file_id, Some(macro_call_id));
+        for crates in crates_of(db, self.within.as_deref(), file.file_id(db)) {
+            for crate_id in crates {
+                for &(macro_call_id, file_id) in hir_def::include_macro_invoc(db, crate_id) {
+                    self.included_file_cache.insert(file_id, Some(macro_call_id));
+                }
+            }
+            if let Some(&Some(it)) = self.included_file_cache.get(&file) {
+                return Some(it);
             }
         }
-        self.included_file_cache.get(&file).copied().flatten()
+        None
     }
 
     pub(super) fn get_or_insert_expansion(
@@ -193,39 +215,48 @@ pub(super) struct SourceToDefCtx<'db, 'cache> {
 impl<'db> SourceToDefCtx<'db, '_> {
     pub(super) fn file_to_def(&mut self, file: FileId) -> &SmallVec<[ModuleId; 1]> {
         let _p = tracing::info_span!("SourceToDefCtx::file_to_def").entered();
-        self.cache.file_to_def_cache.entry(file).or_insert_with(|| {
-            let mut mods = SmallVec::new();
-
-            for &crate_id in relevant_crates(self.db, file) {
-                // Note: `mod` declarations in block modules cannot be supported here
-                let crate_def_map = crate_def_map(self.db, crate_id);
-                let n_mods = mods.len();
-                let modules = |file| crate_def_map.modules_for_file(self.db, file);
-                mods.extend(modules(file));
-                if mods.len() == n_mods {
-                    mods.extend(
-                        hir_def::include_macro_invoc(self.db, crate_id)
-                            .iter()
-                            .filter(|&&(_, file_id)| file_id.file_id(self.db) == file)
-                            .flat_map(|&(macro_call_id, file_id)| {
-                                self.cache.included_file_cache.insert(file_id, Some(macro_call_id));
-                                modules(
-                                    macro_call_id
-                                        .lookup(self.db)
-                                        .kind
-                                        .file_id()
-                                        .original_file(self.db)
-                                        .file_id(self.db),
-                                )
-                            }),
-                    );
-                }
-            }
+        if !self.cache.file_to_def_cache.contains_key(&file) {
+            let [some, rest] = crates_of(self.db, self.cache.within.as_deref(), file);
+            let mut mods = self.modules_in(&some, file);
             if mods.is_empty() {
-                // FIXME: detached file
+                mods = self.modules_in(&rest, file);
             }
-            mods
-        })
+            self.cache.file_to_def_cache.insert(file, mods);
+        }
+        &self.cache.file_to_def_cache[&file]
+    }
+
+    fn modules_in(&mut self, crates: &[Crate], file: FileId) -> SmallVec<[ModuleId; 1]> {
+        let mut mods = SmallVec::new();
+        for &crate_id in crates {
+            // Note: `mod` declarations in block modules cannot be supported here
+            let crate_def_map = crate_def_map(self.db, crate_id);
+            let n_mods = mods.len();
+            let modules = |file| crate_def_map.modules_for_file(self.db, file);
+            mods.extend(modules(file));
+            if mods.len() == n_mods {
+                mods.extend(
+                    hir_def::include_macro_invoc(self.db, crate_id)
+                        .iter()
+                        .filter(|&&(_, file_id)| file_id.file_id(self.db) == file)
+                        .flat_map(|&(macro_call_id, file_id)| {
+                            self.cache.included_file_cache.insert(file_id, Some(macro_call_id));
+                            modules(
+                                macro_call_id
+                                    .lookup(self.db)
+                                    .kind
+                                    .file_id()
+                                    .original_file(self.db)
+                                    .file_id(self.db),
+                            )
+                        }),
+                );
+            }
+        }
+        if mods.is_empty() {
+            // FIXME: detached file
+        }
+        mods
     }
 
     pub(super) fn module_to_def(&mut self, src: InFile<&ast::Module>) -> Option<ModuleId> {
