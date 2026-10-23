@@ -1864,6 +1864,35 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             self.report_use_of_moved_or_uninitialized(location, action, place, span, path);
             return;
         }
+        // A subslice of an array is moved if an element of it is, which a move of the array's
+        // elements has a path for (rustc's `check_if_subslice_element_is_moved`).
+        if let Some((&ProjectionElem::Subslice { from, to }, _)) = place.projection.split_last() {
+            let base = place.base(place.projection.len() - 1);
+            if let TyKind::Array(_, len) =
+                self.ctx.place_ty(self.body, base.local, base.projection).ty.kind()
+            {
+                let Some(len) = hir_ty::consteval::try_const_usize(self.ctx.db, len) else {
+                    return;
+                };
+                let Some(array) = self.move_path_for(base) else { return };
+                let range = from..(len as u64).saturating_sub(to);
+                let uninit = &self.uninit;
+                let moved = self.moves.paths[array].children.iter().find_map(|&child| {
+                    match self.moves.paths[child].projection.last() {
+                        Some(ProjectionElem::ConstantIndex { offset, .. })
+                            if range.contains(offset) =>
+                        {
+                            self.moves.find_in_descendants(child, &|it| uninit.contains(it))
+                        }
+                        _ => None,
+                    }
+                });
+                if let Some(moved) = moved {
+                    self.report_use_of_moved_or_uninitialized(location, action, base, span, moved);
+                }
+                return;
+            }
+        }
         if let Some(path) = self.move_path_for(place) {
             let uninit = &self.uninit;
             if let Some(moved) = self.moves.find_in_descendants(path, &|it| uninit.contains(it)) {
@@ -1886,7 +1915,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 && let TyKind::Array(..) =
                     self.ctx.place_ty(self.body, base.local, base.projection).ty.kind()
             {
-                self.check_if_full_path_is_moved(location, InitAction::Use, base, span);
+                self.check_if_path_or_subpath_is_moved(location, InitAction::Use, base, span);
             }
         }
         for len in (0..place.projection.len()).rev() {

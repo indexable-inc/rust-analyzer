@@ -17,7 +17,9 @@ use hir_def::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     ClauseKind, OutlivesPredicate, RegionKind, Variance,
-    inherent::{GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _, Ty as _},
+    inherent::{
+        GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _, Term as _, Ty as _,
+    },
 };
 
 use hir_ty::{
@@ -3840,6 +3842,24 @@ impl<'db> Builder<'_, '_, 'db> {
                         for test in &mut self.regions.type_tests[tests..] {
                             test.forall = true;
                         }
+                    }
+                }
+                // `I: IntoIterator<Item = T>`: what the projection normalizes to is `T`, so
+                // `v.extend(d.iter())` makes the borrow of `d` the vector's element lifetime.
+                ClauseKind::Projection(projection)
+                    if type_outlives
+                        && !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(
+                            &projection,
+                        ) =>
+                {
+                    let interner = self.interner();
+                    if let Some(term) = projection.term.as_type()
+                        && let Some(alias) = projection.projection_term.to_term(interner).as_type()
+                        && rustc_type_ir::TypeVisitableExt::has_free_regions(&alias)
+                        && let Some(normalized) = self.normalize(alias)
+                        && !matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(_))
+                    {
+                        self.relate(normalized, term, Variance::Invariant, at);
                     }
                 }
                 ClauseKind::Trait(predicate) if type_outlives => {
