@@ -69,6 +69,9 @@ pub(super) fn check<'db>(
             eprintln!("_{local}: {ty:?}");
         }
         eprintln!("universals {:?}", regions.universals);
+        if !regions.members.is_empty() {
+            eprintln!("members {:?} choices {:?}", regions.members, regions.choices);
+        }
         for constraint in &regions.outlives {
             eprintln!("{constraint:?}");
         }
@@ -1208,8 +1211,10 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 regions::constraint_path(self.regions, self.region_count, loan.region, target);
             if let Some(blamed) = regions::blame_with(&path, self.regions.returns_static_opaque) {
                 match (capture, blamed.category) {
+                    // Not into an `impl Trait` that captures no lifetime, which rustc's
+                    // `OpaqueType` constraint makes E0597.
                     (Some(closure), Category::Return | Category::CallArgument)
-                        if !blamed.from_closure =>
+                        if !blamed.from_closure && !self.regions.returns_static_opaque =>
                     {
                         let what = self.quoted(place, "value");
                         self.report(

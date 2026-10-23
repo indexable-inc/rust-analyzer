@@ -1316,6 +1316,13 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
     ) {
         use hir_ide::mir::MirSpan;
         let result = hir_ty_borrowck::borrowck(self.db, def);
+        // An `async fn`'s body is the future it makes, which rustc points at as its block.
+        let block = || -> Option<InFile<SyntaxNodePtr>> {
+            let DefWithBodyId::FunctionId(function) = def else { return None };
+            let source = hir_def::src::HasSource::source(function.lookup(self.db), self.db);
+            let block = source.value.body()?;
+            Some(InFile::new(source.file_id, SyntaxNodePtr::new(syntax::AstNode::syntax(&block))))
+        };
         let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
             let source = match span {
                 MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => {
@@ -1332,6 +1339,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                                         .map(|(template, _)| template.wrap_left()),
                                 }
                             }
+                            _ if expr == body.root_expr() => return block(),
                             _ => return None,
                         },
                     }
@@ -1346,7 +1354,10 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         .self_param_syntax()
                         .map(|it| it.map(|it| it.syntax_node_ptr()));
                 }
-                MirSpan::Unknown => source_map.expr_syntax(body.root_expr()).ok()?,
+                MirSpan::Unknown => match source_map.expr_syntax(body.root_expr()) {
+                    Ok(it) => it,
+                    Err(_) => return block(),
+                },
             };
             Some(source.map(|it| it.syntax_node_ptr()))
         };
