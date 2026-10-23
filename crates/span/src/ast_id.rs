@@ -317,6 +317,12 @@ impl<N> fmt::Debug for FileAstId<N> {
 }
 
 impl<N> FileAstId<N> {
+    /// The id `raw` is, read back as an id of an `N`: `raw` must have been one.
+    #[inline]
+    pub fn from_erased_unchecked(raw: ErasedFileAstId) -> Self {
+        FileAstId { raw, _marker: PhantomData }
+    }
+
     // Can't make this a From implementation because of coherence
     #[inline]
     pub fn upcast<M: AstIdNode>(self) -> FileAstId<M>

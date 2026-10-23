@@ -37,6 +37,9 @@ impl_from!(
 #[salsa::tracked(returns(as_deref))]
 pub fn crate_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
+    if let Some(frozen) = crate::nameres::frozen::served_lang_items(db, krate) {
+        return frozen;
+    }
 
     let mut lang_items = LangItems::default();
 
@@ -398,6 +401,19 @@ macro_rules! language_item_table {
                 }
             }
 
+            /// Sets `which` to `target`, or is `false` and leaves it when `target` is not of
+            /// its kind.
+            pub fn set(&mut self, which: LangItemEnum, target: LangItemTarget) -> bool {
+                match (which, target) {
+                    $( (LangItemEnum::$lang_item, LangItemTarget::$target(it)) => self.$lang_item = Some(it), )*
+                    $( (LangItemEnum::$non_lang_trait, LangItemTarget::TraitId(it)) => self.$non_lang_trait = Some(it), )*
+                    $( (LangItemEnum::$non_lang_macro_field, LangItemTarget::MacroId(it)) => self.$non_lang_macro_field = Some(it), )*
+                    $( (LangItemEnum::$resolve_manually, LangItemTarget::$resolve_manually_type(it)) => self.$resolve_manually = Some(it), )*
+                    _ => return false,
+                }
+                true
+            }
+
             fn fill_non_lang_core_items(&mut self, db: &dyn SourceDatabase, core_def_map: &DefMap) {
                 $( self.$non_lang_trait = resolve_core_trait(db, core_def_map, &[ $(sym::$non_lang_trait_module),* ], sym::$non_lang_trait); )*
                 $( self.$non_lang_macro_field = resolve_core_macro(db, core_def_map, &[ $(sym::$non_lang_macro_module),* ], sym::$non_lang_macro); )*
@@ -417,6 +433,14 @@ macro_rules! language_item_table {
         }
 
         impl LangItemEnum {
+            /// Every lang item, in the order of the fields of `LangItems`.
+            pub const ALL: &[LangItemEnum] = &[
+                $( LangItemEnum::$lang_item, )*
+                $( LangItemEnum::$non_lang_trait, )*
+                $( LangItemEnum::$non_lang_macro_field, )*
+                $( LangItemEnum::$resolve_manually, )*
+            ];
+
             #[inline]
             pub fn from_lang_items(self, lang_items: &LangItems) -> Option<LangItemTarget> {
                 match self {

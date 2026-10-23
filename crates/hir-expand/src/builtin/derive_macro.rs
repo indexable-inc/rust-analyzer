@@ -35,6 +35,9 @@ macro_rules! register_builtin {
         }
 
         impl BuiltinDeriveExpander {
+            /// Every variant, in declaration order.
+            pub const ALL: &[Self] = &[$(Self::$trait),*];
+
             pub fn expander(&self) -> fn(&dyn SourceDatabase, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree>  {
                 match *self {
                     $( BuiltinDeriveExpander::$trait => $expand, )*

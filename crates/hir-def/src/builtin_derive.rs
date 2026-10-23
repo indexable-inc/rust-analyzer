@@ -27,6 +27,9 @@ macro_rules! declare_enum {
         }
 
         impl BuiltinDeriveImplTrait {
+            /// Every variant, in declaration order.
+            pub const ALL: &[Self] = &[$(Self::$trait),*];
+
             #[inline]
             pub fn name(self) -> Symbol {
                 match self {

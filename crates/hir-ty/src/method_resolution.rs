@@ -7,6 +7,7 @@
 //! [`rustc_hir_typeck/method/probe.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/method/probe.rs
 
 mod confirm;
+pub mod frozen;
 mod probe;
 
 use crate::next_solver::StoredGenericArgs;
@@ -928,6 +929,9 @@ impl<'db> InherentImpls<'db> {
     #[salsa::tracked(returns(ref))]
     pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> InherentImpls<'db> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
+        if let Some(frozen) = frozen::inherent_impls(db, krate) {
+            return frozen;
+        }
 
         let crate_def_map = crate_def_map(db, krate);
 
@@ -1052,6 +1056,9 @@ impl<'db> TraitImpls<'db> {
     #[salsa::tracked(returns(ref))]
     pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> Arc<TraitImpls<'db>> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
+        if let Some(frozen) = frozen::trait_impls(db, krate) {
+            return Arc::new(frozen);
+        }
 
         let crate_def_map = crate_def_map(db, krate);
         let result = Self::collect_def_map(db, crate_def_map);

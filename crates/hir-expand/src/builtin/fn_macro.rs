@@ -32,6 +32,9 @@ macro_rules! register_builtin {
         }
 
         impl $EXPANDER {
+            /// Every variant, in declaration order.
+            pub const ALL: &[Self] = &[$(Self::$kind),*];
+
             fn expander(&self) -> fn (&dyn SourceDatabase, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
                 match *self {
                     $( Self::$kind => $expand, )*

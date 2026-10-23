@@ -51,6 +51,7 @@ pub mod assoc;
 pub mod attr_resolution;
 mod collector;
 pub mod diagnostics;
+pub mod frozen;
 mod mod_resolution;
 mod path_resolution;
 pub mod proc_macro;
@@ -477,6 +478,9 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
     )
     .entered();
 
+    if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
+        return DefMapPair::new(db, def_map, local_def_map);
+    }
     let root_file_id = crate_id.root_file_id(db);
     let module_data = ModuleData::new(
         ModuleOrigin::CrateRoot { definition: root_file_id },
@@ -494,6 +498,7 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
     let (mut def_map, local_def_map) =
         collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
     def_map.hand_over_scopes(db);
+    frozen::check(db, crate_id, &def_map, &local_def_map);
 
     DefMapPair::new(db, def_map, local_def_map)
 }

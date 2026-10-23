@@ -126,29 +126,29 @@ pub struct ItemScope {
     /// Defs visible in this scope. This includes `declarations`, but also
     /// imports. The imports belong to this module and can be resolved by using them on
     /// the `use_imports_*` fields.
-    types: FxIndexMap<Name, TypesItem>,
-    values: FxIndexMap<Name, ValuesItem>,
-    macros: FxIndexMap<Name, MacrosItem>,
-    unresolved: FxHashSet<Name>,
+    pub(crate) types: FxIndexMap<Name, TypesItem>,
+    pub(crate) values: FxIndexMap<Name, ValuesItem>,
+    pub(crate) macros: FxIndexMap<Name, MacrosItem>,
+    pub(crate) unresolved: FxHashSet<Name>,
 
     /// The defs declared in this scope. Each def has a single scope where it is
     /// declared.
-    declarations: ThinVec<ModuleDefId>,
+    pub(crate) declarations: ThinVec<ModuleDefId>,
 
-    impls: ThinVec<(ImplId, /* trait impl */ bool)>,
-    builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
-    extern_blocks: ThinVec<ExternBlockId>,
-    unnamed_consts: ThinVec<ConstId>,
+    pub(crate) impls: ThinVec<(ImplId, /* trait impl */ bool)>,
+    pub(crate) builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
+    pub(crate) extern_blocks: ThinVec<ExternBlockId>,
+    pub(crate) unnamed_consts: ThinVec<ConstId>,
     /// Traits imported via `use Trait as _;`.
-    unnamed_trait_imports: ThinVec<(TraitId, Item<()>)>,
+    pub(crate) unnamed_trait_imports: ThinVec<(TraitId, Item<()>)>,
 
     // the resolutions of the imports of this scope
-    use_imports_types: FxHashMap<ImportOrExternCrate, ImportOrDef>,
-    use_imports_values: FxHashMap<ImportOrGlob, ImportOrDef>,
-    use_imports_macros: FxHashMap<ImportOrExternCrate, ImportOrDef>,
+    pub(crate) use_imports_types: FxHashMap<ImportOrExternCrate, ImportOrDef>,
+    pub(crate) use_imports_values: FxHashMap<ImportOrGlob, ImportOrDef>,
+    pub(crate) use_imports_macros: FxHashMap<ImportOrExternCrate, ImportOrDef>,
 
-    use_decls: ThinVec<UseId>,
-    extern_crate_decls: ThinVec<ExternCrateId>,
+    pub(crate) use_decls: ThinVec<UseId>,
+    pub(crate) extern_crate_decls: ThinVec<ExternCrateId>,
     /// Macros visible in current module in legacy textual scope
     ///
     /// For macros invoked by an unqualified identifier like `bar!()`, `legacy_macros` will be searched in first.
@@ -161,22 +161,22 @@ pub struct ItemScope {
     /// Module scoped macros will be inserted into `items` instead of here.
     // FIXME: Macro shadowing in one module is not properly handled. Non-item place macros will
     // be all resolved to the last one defined if shadowing happens.
-    legacy_macros: FxHashMap<Name, SmallVec<[MacroId; 1]>>,
+    pub(crate) legacy_macros: FxHashMap<Name, SmallVec<[MacroId; 1]>>,
     /// The attribute macro invocations in this scope.
-    attr_macros: FxHashMap<AstId<ast::Item>, MacroCallId>,
+    pub(crate) attr_macros: FxHashMap<AstId<ast::Item>, MacroCallId>,
     /// The macro invocations in this scope.
-    macro_invocations: FxHashMap<AstId<ast::MacroCall>, MacroCallId>,
+    pub(crate) macro_invocations: FxHashMap<AstId<ast::MacroCall>, MacroCallId>,
     /// The derive macro invocations in this scope, keyed by the owner item over the actual derive attributes
     /// paired with the derive macro invocations for the specific attribute.
-    derive_macros: FxHashMap<AstId<ast::Adt>, SmallVec<[DeriveMacroInvocation; 1]>>,
+    pub(crate) derive_macros: FxHashMap<AstId<ast::Adt>, SmallVec<[DeriveMacroInvocation; 1]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DeriveMacroInvocation {
-    attr_id: AttrId,
+pub(crate) struct DeriveMacroInvocation {
+    pub(crate) attr_id: AttrId,
     /// The `#[derive]` call
-    attr_call_id: MacroCallId,
-    derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
+    pub(crate) attr_call_id: MacroCallId,
+    pub(crate) derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
 }
 
 pub(crate) static BUILTIN_SCOPE: LazyLock<FxIndexMap<Name, PerNs>> = LazyLock::new(|| {
