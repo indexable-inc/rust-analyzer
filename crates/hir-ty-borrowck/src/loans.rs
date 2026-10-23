@@ -52,6 +52,8 @@ pub(super) struct Loans {
     pub(super) activations: FxHashMap<Location, Vec<usize>>,
     /// The loans that go out of scope at the start of each point.
     out_of_scope: FxHashMap<usize, Vec<usize>>,
+    /// The borrows of a promoted copy, which make no loan and read nothing.
+    pub(super) promoted: FxHashSet<Location>,
 }
 
 /// How much of a place an access touches, as rustc's `AccessDepth`.
@@ -275,6 +277,88 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
     found
 }
 
+/// The borrows rustc's `promote_consts` makes of a promoted copy: a shared borrow, through
+/// any projection but a dereference, of a temporary assigned once from constants and
+/// aggregates of them, of a type with no drop glue or interior mutability. The borrow
+/// neither reads the temporary nor holds it, so the `ref a` of `let ref a @ b = U;` does
+/// not borrow what `b` moves out.
+fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location> {
+    fn define<'b>(
+        defs: &mut FxHashMap<LocalId, Option<&'b Rvalue>>,
+        local: LocalId,
+        rvalue: Option<&'b Rvalue>,
+    ) {
+        defs.entry(local).and_modify(|it| *it = None).or_insert(rvalue);
+    }
+    let mut defs = FxHashMap::default();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::Assign(place, rvalue) => {
+                    define(&mut defs, place.local, place.projection.is_empty().then_some(rvalue))
+                }
+                StatementKind::Deinit(place) => define(&mut defs, place.local, None),
+                _ => (),
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+        {
+            define(&mut defs, destination.local, None);
+        }
+    }
+    let temp = |local: LocalId| {
+        local != super::return_slot()
+            && !body.param_locals.contains(&local)
+            && !ctx.bindings.contains_key(&local)
+    };
+    fn promotable(
+        defs: &FxHashMap<LocalId, Option<&Rvalue>>,
+        temp: &dyn Fn(LocalId) -> bool,
+        local: LocalId,
+        depth: usize,
+    ) -> bool {
+        let operand = |operand: &hir_ty::mir::Operand| match &operand.kind {
+            OperandKind::Constant { .. } | OperandKind::Allocation { .. } => true,
+            OperandKind::Copy(place) | OperandKind::Move(place) => {
+                place.projection.is_empty() && promotable(defs, temp, place.local, depth + 1)
+            }
+            OperandKind::Static(_) => false,
+        };
+        depth < 16
+            && temp(local)
+            && match defs.get(&local) {
+                Some(Some(Rvalue::Use(it))) => operand(it),
+                Some(Some(Rvalue::Aggregate(kind, operands))) => {
+                    !matches!(
+                        kind,
+                        hir_ty::mir::AggregateKind::Union(..)
+                            | hir_ty::mir::AggregateKind::Closure(_)
+                    ) && operands.iter().all(operand)
+                }
+                _ => false,
+            }
+    }
+    let mut found = FxHashSet::default();
+    for (block, data) in body.basic_blocks.iter() {
+        for (statement, it) in data.statements.iter().enumerate() {
+            if let StatementKind::Assign(_, Rvalue::Ref(BorrowKind::Shared, place)) = &it.kind
+                && !place.projection.as_slice().contains(&ProjectionElem::Deref)
+                && promotable(&defs, &temp, place.local, 0)
+            {
+                let ty = body.locals[place.local].ty.as_ref();
+                if hir_ty::drop::is_freeze(ctx.db, ctx.infcx.interner, ty)
+                    && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
+                        == hir_ty::drop::DropGlue::None
+                {
+                    found.insert(Location { block, statement });
+                }
+            }
+        }
+    }
+    found
+}
+
 fn const_promotable(
     ctx: &Ctx<'_, '_>,
     body: &MirBody<'_>,
@@ -410,6 +494,7 @@ impl Loans {
             of_local: FxHashMap::default(),
             activations: FxHashMap::default(),
             out_of_scope: FxHashMap::default(),
+            promoted: promoted_borrows(ctx, body),
         };
         let mut two_phase: FxHashMap<LocalId, usize> = FxHashMap::default();
         for &block in &cfg.order {
@@ -419,7 +504,9 @@ impl Loans {
                 };
                 let location = Location { block, statement };
                 let projection = borrowed.projection.as_slice();
-                if ignored(ctx, body, borrowed.local, projection, &statics) {
+                if ignored(ctx, body, borrowed.local, projection, &statics)
+                    || loans.promoted.contains(&location)
+                {
                     continue;
                 }
                 let Some(&region) = regions.loan_regions.get(&location) else { continue };
@@ -715,7 +802,7 @@ pub(super) fn places_conflict<'db>(
                     return false;
                 }
                 (ProjectionElem::Field(_), TyKind::Adt(def, _), Depth::Drop)
-                    if base_ty.variant_id.is_none() && ctx.has_destructor(def.def_id()) =>
+                    if ctx.has_destructor(def.def_id()) =>
                 {
                     return true;
                 }

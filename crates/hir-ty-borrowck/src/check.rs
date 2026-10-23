@@ -861,6 +861,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
 
     fn consume_rvalue(&mut self, location: Location, rvalue: &Rvalue, span: MirSpan) {
         match rvalue {
+            Rvalue::Ref(..) if self.loans.promoted.contains(&location) => (),
             Rvalue::Ref(kind, place) => {
                 let place = PlaceRef::of(place);
                 let (access, depth, action) = match kind {

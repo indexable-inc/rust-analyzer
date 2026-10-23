@@ -535,6 +535,24 @@ fn drop_components<'db>(
             cache,
             depth + 1,
         ),
+        // rustc's dropck drops what a coroutine captures too, all of it where what it keeps
+        // across an `await` needs dropping, which is not known here.
+        TyKind::CoroutineClosure(_, args) => drop_components(
+            ctx,
+            regions,
+            args.as_coroutine_closure().tupled_upvars_ty(),
+            &mut found,
+            cache,
+            depth + 1,
+        ),
+        TyKind::Coroutine(_, args) => drop_components(
+            ctx,
+            regions,
+            args.as_coroutine().tupled_upvars_ty(),
+            &mut found,
+            cache,
+            depth + 1,
+        ),
         TyKind::Dynamic(..) => regions_of(ty, &mut found),
         // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
         // another alias holds what its bounds and captures let it, as for liveness.

@@ -71,13 +71,16 @@ impl Cfg {
                 predecessors[index(cleanup)].push(from);
             }
         }
+        // rustc's `Postorder` takes each block's successors from the last, so its reverse
+        // postorder, the order errors are found in, has a loop's exit before its body.
         let mut reachable = vec![false; count];
         let mut postorder = Vec::with_capacity(count);
         let mut stack = vec![(body.start_block, 0usize)];
         reachable[index(body.start_block)] = true;
         while let Some((block, next)) = stack.last_mut() {
             let block = *block;
-            if let Some(&target) = successors[index(block)].get(*next) {
+            let all = &successors[index(block)];
+            if let Some(&target) = all.len().checked_sub(*next + 1).map(|it| &all[it]) {
                 *next += 1;
                 if !reachable[index(target)] {
                     reachable[index(target)] = true;
