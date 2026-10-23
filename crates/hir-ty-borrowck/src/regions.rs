@@ -79,6 +79,9 @@ pub(super) enum Category {
     Internal,
     /// What normalizing the signature needs, which rustc points at the signature.
     Signature,
+    /// A region of a returned `impl Trait`'s hidden type outliving the lifetime chosen for
+    /// it, rustc's `OpaqueType`.
+    Opaque,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1144,8 +1147,7 @@ impl<'db> Builder<'_, '_, 'db> {
             if opaque
                 && !hidden_static
                 && let Some((_, output)) = &signature
-                && let TyKind::Alias(alias) = output.kind()
-                && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+                && let Some((alias, hidden)) = returned_opaque(*output, ty)
                 && let Some(captured) =
                     opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
                         .or_else(|| variadic.then(|| vec![true; alias.args.len()]))
@@ -1210,14 +1212,14 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                 }
                 let mut members = Vec::new();
-                member_regions(self.ctx.db, ty, true, &mut members);
+                member_regions(self.ctx.db, hidden, true, &mut members);
                 members.retain(|&it| it != self.regions.static_rv);
                 members.sort_unstable();
                 members.dedup();
                 // An alias's own bounds may already say it outlives them, so the regions within
                 // one are left to the member constraints.
                 let mut bounded = Vec::new();
-                member_regions(self.ctx.db, ty, false, &mut bounded);
+                member_regions(self.ctx.db, hidden, false, &mut bounded);
                 bounded.retain(|&it| it != self.regions.static_rv);
                 bounded.sort_unstable();
                 bounded.dedup();
@@ -5312,6 +5314,49 @@ fn names_through_type(
     }
 }
 
+/// The `impl Trait` a function's return type `output` has, when it has one, and the part of
+/// `ty`, the type its body returns, that hides it: `(impl Iterator, &'b str)` hides it in
+/// the tuple's first field.
+fn returned_opaque<'db>(
+    output: Ty<'db>,
+    ty: Ty<'db>,
+) -> Option<(rustc_type_ir::AliasTy<hir_ty::next_solver::DbInterner<'db>>, Ty<'db>)> {
+    fn find<'db>(
+        output: Ty<'db>,
+        ty: Ty<'db>,
+    ) -> Option<(rustc_type_ir::AliasTy<hir_ty::next_solver::DbInterner<'db>>, Ty<'db>)> {
+        match (output.kind(), ty.kind()) {
+            (TyKind::Alias(alias), _)
+                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) =>
+            {
+                Some((alias, ty))
+            }
+            (TyKind::Tuple(outputs), TyKind::Tuple(tys)) if outputs.len() == tys.len() => {
+                outputs.iter().zip(tys.iter()).find_map(|(output, ty)| find(output, ty))
+            }
+            (TyKind::Ref(_, output, _), TyKind::Ref(_, ty, _)) => find(output, ty),
+            (TyKind::Adt(def, outputs), TyKind::Adt(other, tys))
+                if def == other && outputs.len() == tys.len() =>
+            {
+                outputs.iter().zip(tys.iter()).find_map(|(output, ty)| find(output.ty()?, ty.ty()?))
+            }
+            _ => None,
+        }
+    }
+    let opaques = output
+        .walk()
+        .filter_map(|it| rustc_type_ir::inherent::GenericArg::as_type(&it))
+        .filter(|ty| {
+            matches!(ty.kind(), TyKind::Alias(alias)
+                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }))
+        })
+        .count();
+    if opaques != 1 {
+        return None;
+    }
+    find(output, ty)
+}
+
 fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
     path.type_anchor().is_some()
         || path.generic_args().is_some_and(|args| args.iter().any(Option::is_some))
@@ -5537,7 +5582,7 @@ pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
         | Category::Assignment
         | Category::Usage => 2,
         Category::Predicate => 4,
-        Category::Boring | Category::Signature => 5,
+        Category::Boring | Category::Signature | Category::Opaque => 5,
         Category::Internal => 7,
     };
     let best = path.iter().map(interest).min()?;

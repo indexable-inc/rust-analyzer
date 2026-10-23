@@ -136,7 +136,8 @@ impl<'db> MirLowerCtx<'_, 'db> {
             false => current,
         };
         // Bindings are dropped in the reverse of the order the pattern names them, whichever
-        // alternative of an or-pattern ends up binding them.
+        // alternative of an or-pattern ends up binding them. Of a guarded arm, what the first
+        // alternative binds by value is declared once the guard holds, after the rest.
         let mut bindings = Vec::new();
         let mut alternatives = false;
         self.store.walk_pats(pattern, &mut |pat| match &self.store[pat] {
@@ -145,8 +146,14 @@ impl<'db> MirLowerCtx<'_, 'db> {
             _ => (),
         });
         if alternatives {
+            let mut by_value = Vec::new();
+            if self.guarded_moves.is_some() {
+                self.first_alternative_by_value(pattern, &mut by_value);
+            }
             for binding in bindings {
-                self.push_storage_live(binding, current)?;
+                if !by_value.contains(&binding) {
+                    self.push_storage_live(binding, current)?;
+                }
             }
         }
         let (current, current_else) = self.pattern_match_inner(
@@ -157,6 +164,28 @@ impl<'db> MirLowerCtx<'_, 'db> {
             MatchingMode::Bind,
         )?;
         Ok((current, current_else))
+    }
+
+    /// The bindings `pattern` binds by value in the first alternative of each of its
+    /// or-patterns, which rustc's binding modes for a guarded arm follow.
+    fn first_alternative_by_value(&self, pattern: PatId, found: &mut Vec<BindingId>) {
+        match &self.store[pattern] {
+            Pat::Or(alternatives) => {
+                if let Some(&first) = alternatives.first() {
+                    self.first_alternative_by_value(first, found);
+                }
+            }
+            &Pat::Bind { id, .. } => {
+                if let BindingMode(ByRef::No, _) = self.infer.binding_modes[pattern] {
+                    found.push(id);
+                }
+                self.store
+                    .walk_pats_shallow(pattern, |it| self.first_alternative_by_value(it, found));
+            }
+            _ => self
+                .store
+                .walk_pats_shallow(pattern, |it| self.first_alternative_by_value(it, found)),
+        }
     }
 
     /// Goes on from `current` in a block that rustc has no way into: what is moved out there
@@ -717,11 +746,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
         current_else: Option<BasicBlockId>,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
         let target_place = self.binding_local(id)?;
-        self.push_storage_live(id, current)?;
         let ty = self.result.locals[target_place].ty.as_ref();
         if let BindingMode(ByRef::No, _) = mode
             && self.guarded_moves.is_some()
-            && !self.is_copy(ty)
         {
             let interner = self.interner();
             let erased = crate::next_solver::Region::new_erased(interner);
@@ -735,10 +762,16 @@ impl<'db> MirLowerCtx<'_, 'db> {
             );
             self.guard_refs.insert(id, reference);
             if let Some(moves) = &mut self.guarded_moves {
-                moves.push(super::GuardedMove { local: target_place, place: cond_place, span });
+                moves.push(super::GuardedMove {
+                    binding: id,
+                    local: target_place,
+                    place: cond_place,
+                    span,
+                });
             }
             return Ok((current, current_else));
         }
+        self.push_storage_live(id, current)?;
         self.push_match_assignment(current, target_place, mode, cond_place, span);
         Ok((current, current_else))
     }

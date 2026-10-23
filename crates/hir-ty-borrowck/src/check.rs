@@ -44,15 +44,40 @@ pub(super) fn check<'db>(
     let flow = InitFlow::compute(body, &cfg, &moves);
     let dominators = Dominators::new(&cfg);
     let capture_temps = capture_temps(body);
-    let regions = regions::build(ctx, body, &cfg, requirements);
+    let mut regions = regions::build(ctx, body, &cfg, requirements);
     let count = ctx.infcx.num_region_vars();
     let live = liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count);
     let live_loans_input = (ctx.mode == Mode::Polonius).then(|| live.clone());
-    let values = regions::infer(&regions, count, cfg.points, live);
+    let again = (!regions.members.is_empty()).then(|| live.clone());
+    let mut values = regions::infer(&regions, count, cfg.points, live);
     // rustc's member constraints: a region of a returned `impl Trait`'s hidden type that can
     // be none of the lifetimes it captures is an error, reported only when the body has no
-    // other region error.
-    let unnamed = member_choices(&regions, &values, count).iter().any(|(_, it)| it.is_none());
+    // other region error. One that can is made to outlive the least it can be, as rustc's
+    // `apply_member_constraint`, which what it must outlive in turn may not.
+    let chosen = member_choices(&regions, &values, count);
+    let unnamed = chosen.iter().any(|(_, it)| it.is_none());
+    let applied: Vec<regions::Outlives> = chosen
+        .iter()
+        .filter_map(|&(member, choice)| {
+            let choice = choice?;
+            (member != choice
+                && !values.universals_of(member).any(|it| regions.universals[it].0 == choice))
+            .then_some(regions::Outlives {
+                sup: member,
+                sub: choice,
+                location: None,
+                category: Category::Opaque,
+                span: MirSpan::Unknown,
+                from_closure: false,
+            })
+        })
+        .collect();
+    if let Some(live) = again
+        && !applied.is_empty()
+    {
+        regions.outlives.extend(applied);
+        values = regions::infer(&regions, count, cfg.points, live);
+    }
     let unique = |assigned: LocalId, local: LocalId, projection: &[PlaceElem]| {
         capture_temps.contains_key(&assigned)
             && is_immutable_root(ctx, PlaceRef { local, projection })
@@ -1285,7 +1310,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             let target = self.regions.universals[universal].0;
             let path =
                 regions::constraint_path(self.regions, self.region_count, loan.region, target);
-            if let Some(blamed) = regions::blame_with(&path, self.regions.returns_static_opaque) {
+            // Through the lifetime chosen for an `impl Trait`'s hidden type it is rustc's
+            // `OpaqueType` constraint that the loan breaks, which makes it E0597.
+            let chosen = path.iter().any(|it| it.category == Category::Opaque);
+            if !chosen
+                && let Some(blamed) = regions::blame_with(&path, self.regions.returns_static_opaque)
+            {
                 match (capture, blamed.category) {
                     // Not into an `impl Trait` that captures no lifetime, which rustc's
                     // `OpaqueType` constraint makes E0597.

@@ -253,16 +253,32 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
 /// The temporaries a `const` or `static` item's value borrows that rustc promotes there: in
 /// a const context a call of a `const fn` is promotable too, as are the literals, constants
 /// and aggregates its arguments are made of, of a type with no drop glue and no interior
-/// mutability (`Ms::new(&[M::new("a")])`).
+/// mutability (`Ms::new(&[M::new("a")])`). A borrow is promoted only if it is shared, or of
+/// an empty array, and a call only where the item's value certainly runs it, not in a branch
+/// that may be dead code.
 fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
+    let certain = certain_blocks(body);
+    let calls = |expr: hir_def::hir::ExprId| {
+        let mut stack = vec![expr];
+        while let Some(expr) = stack.pop() {
+            if is_call(ctx, expr) {
+                return true;
+            }
+            ctx.store.walk_child_exprs(expr, |it| stack.push(it));
+        }
+        false
+    };
     let mut found = FxHashSet::default();
-    for (_, block) in body.basic_blocks.iter() {
+    for (id, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
                 && let MirSpan::ExprId(expr) = statement.span
-                && let Expr::Ref { expr: inner, .. } = ctx.store[expr]
+                && let Expr::Ref { expr: inner, mutability, .. } = ctx.store[expr]
+                && (mutability.is_shared()
+                    || matches!(&ctx.store[inner], Expr::Array(Array::ElementList { elements }) if elements.is_empty()))
                 && place.projection.is_empty()
                 && const_promotable(ctx, body, inner, 0)
+                && (certain.contains(&id) || !calls(inner))
             {
                 let ty = body.locals[place.local].ty.as_ref();
                 if hir_ty::drop::is_freeze(ctx.db, ctx.infcx.interner, ty)
@@ -273,6 +289,25 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
                 }
             }
         }
+    }
+    found
+}
+
+/// The blocks a body certainly runs if it returns, rustc's `promotion_safe_blocks`: from the
+/// start on through gotos, calls, drops and asserts.
+fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty::mir::BasicBlockId> {
+    let mut found = FxHashSet::default();
+    let mut block = body.start_block;
+    while found.insert(block) {
+        block = match body.basic_blocks[block].terminator.as_ref().map(|it| &it.kind) {
+            Some(
+                TerminatorKind::Goto { target }
+                | TerminatorKind::Call { target: Some(target), .. }
+                | TerminatorKind::Drop { target, .. }
+                | TerminatorKind::Assert { target, .. },
+            ) => *target,
+            _ => break,
+        };
     }
     found
 }
