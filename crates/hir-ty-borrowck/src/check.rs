@@ -185,7 +185,7 @@ pub(super) fn check<'db>(
     }
     out.extend(checker.errors.into_iter().flatten());
     out.extend(checker.move_reported.into_values().map(|(_, _, error)| error));
-    let count = regions.creator_positions.values().filter(|&&it| it < regions::LATE_PARENT).count();
+    let count = regions.creator_positions.values().filter(|&&it| it < regions::IMPL_ANON).count();
     (count, checker.requirements)
 }
 

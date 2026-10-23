@@ -108,8 +108,12 @@ pub(super) enum UniversalKind {
     Creator,
 }
 
+/// The position among a closure's creator's regions of the anonymous lifetime 0 of the impl
+/// its enclosing method is in (`impl Foo<'_>`), past those of the closure's type.
+pub(super) const IMPL_ANON: usize = 1 << 20;
+
 /// The position among a closure's creator's regions of the enclosing item's late-bound
-/// lifetime 0, past those of the closure's type.
+/// lifetime 0.
 pub(super) const LATE_PARENT: usize = 1 << 24;
 
 /// In a `const { .. }` block, the position of its function's lifetime parameter at `index`:
@@ -478,6 +482,7 @@ pub(super) fn build<'db>(
         parent_late: FxHashMap::default(),
         impl_self: None,
         returns_opaque: false,
+        opaque_bounds: Vec::new(),
         elided_output: None,
         location: None,
         env_aliases: Vec::new(),
@@ -532,6 +537,9 @@ struct Builder<'c, 'a, 'db> {
     /// The return type is an `impl Trait`, so the return slot has the type it hides, which
     /// implies nothing to the body.
     returns_opaque: bool,
+    /// The trait and projection bounds of the returned `impl Trait`, of the type it hides,
+    /// proven where the body first assigns the return slot.
+    opaque_bounds: Vec<Clause<'db>>,
     /// The region lifetime elision gives the elided lifetimes of the return type.
     elided_output: Option<Region<'db>>,
     location: Option<Location>,
@@ -718,7 +726,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         // Only where `Self` is written: an elided `&str` in `impl Trait for &str`
                         // is the same type to rust-analyzer, but a lifetime of its own.
                         let store = &written.store;
-                        let mut folder = ImplSelf { interner: self.interner(), impl_self };
+                        let mut folder = Replace::new(self.interner(), impl_self);
                         for (input, &param) in inputs.iter_mut().zip(&written.params) {
                             if writes_self(store, param) {
                                 *input =
@@ -833,7 +841,25 @@ impl<'db> Builder<'_, '_, 'db> {
                 );
                 region
             });
-            let hidden_static = opaque && self.regions.universals.len() == 2 && !names_parameter;
+            // A lifetime parameter it captures is not a universal region until something names
+            // it.
+            let captures_parameter = signature.as_ref().is_some_and(|(_, output)| {
+                let TyKind::Alias(alias) = output.kind() else { return false };
+                let Some(captured) =
+                    opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
+                else {
+                    return false;
+                };
+                alias.args.iter().zip(captured).any(|(arg, captured)| {
+                    captured
+                        && matches!(arg.kind(), GenericArgKind::Lifetime(region)
+                            if !matches!(region.kind(), RegionKind::ReStatic))
+                })
+            });
+            let hidden_static = opaque
+                && self.regions.universals.len() == 2
+                && !names_parameter
+                && !captures_parameter;
             let captures_lifetime = signature.as_ref().is_some_and(|(_, output)| {
                 let TyKind::Alias(alias) = output.kind() else { return true };
                 let Some(captured) =
@@ -872,6 +898,38 @@ impl<'db> Builder<'_, '_, 'db> {
                 })
             });
             local_tys[return_local.into_raw().into_u32() as usize] = Some(ty);
+            // rustc proves an `impl Trait`'s bounds of the type it hides where the body
+            // defines it: `impl Iterator<Item = Box<dyn Foo>>` hiding `Iter<'a, T>` needs the
+            // where clauses of `Iter<'a, T>`'s `Iterator` impl and its `Item` the bound's.
+            if opaque
+                && let Some((_, output)) = &signature
+                && let TyKind::Alias(alias) = output.kind()
+                && let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
+            {
+                let interner = self.interner();
+                let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+                let mut hidden = Replace::new(interner, (*output, ty));
+                for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
+                    let clause = clause.skip_norm_wip();
+                    if !matches!(
+                        clause.kind().skip_binder(),
+                        ClauseKind::Trait(_) | ClauseKind::Projection(_)
+                    ) {
+                        continue;
+                    }
+                    let clause = rustc_type_ir::TypeFoldable::fold_with(clause, &mut hidden);
+                    let clause =
+                        rustc_type_ir::fold_regions(interner, clause, |region, depth| match region
+                            .kind()
+                        {
+                            RegionKind::ReVar(_) => region,
+                            _ => {
+                                self.signature_region(region, depth).unwrap_or_else(|| self.fresh())
+                            }
+                        });
+                    self.opaque_bounds.push(clause);
+                }
+            }
             let mut unsuggested = Vec::new();
             regions_of(ty, &mut unsuggested);
             if let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)) = owner
@@ -1890,20 +1948,55 @@ impl<'db> Builder<'_, '_, 'db> {
             return None;
         };
         let raw = self.ctx.db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
-        let mut anonymous = false;
+        let mut anonymous = 0;
         let named =
             rustc_type_ir::fold_regions(self.interner(), raw, |region, _| match region.kind() {
+                // In a closure, the impl's anonymous lifetimes are its creator's.
+                RegionKind::ReError(_) if self.nested() => {
+                    let region = self.new_universal(UniversalKind::Creator);
+                    self.regions
+                        .creator_positions
+                        .insert(self.regions.universals.len() - 1, IMPL_ANON + anonymous);
+                    anonymous += 1;
+                    region
+                }
                 RegionKind::ReError(_) => {
-                    anonymous = true;
+                    anonymous += 1;
                     self.new_universal(UniversalKind::AnonParam)
                 }
                 _ => region,
             });
-        if !anonymous {
+        if anonymous == 0 {
             return None;
         }
         self.impl_self = Some((raw, named));
         self.impl_self
+    }
+
+    /// The universal region of the anonymous lifetime `index` of the impl the body's method
+    /// is in, `impl Foo<'_>`.
+    fn impl_anon_region(&mut self, index: usize) -> Option<Region<'db>> {
+        if self.impl_self.is_none()
+            && let GenericDefId::FunctionId(function) = self.ctx.owner.generic_def(self.ctx.db)
+        {
+            self.impl_self_of(function);
+        }
+        let (raw, named) = self.impl_self?;
+        let mut anonymous = Vec::new();
+        let mut errors = Vec::new();
+        rustc_type_ir::fold_regions(self.interner(), raw, |region, _| {
+            errors.push(matches!(region.kind(), RegionKind::ReError(_)));
+            region
+        });
+        let mut position = 0;
+        rustc_type_ir::fold_regions(self.interner(), named, |region, _| {
+            if errors.get(position).copied().unwrap_or(false) {
+                anonymous.push(region);
+            }
+            position += 1;
+            region
+        });
+        anonymous.get(index).copied()
     }
 
     /// The self type and trait arguments of the impl a method is in, whose well-formedness the
@@ -2185,6 +2278,9 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             _ if position >= LATE_PARENT => {
                 rv_of(this.parent_late_region((position - LATE_PARENT) as u32))
+            }
+            _ if position >= IMPL_ANON => {
+                this.impl_anon_region(position - IMPL_ANON).and_then(rv_of)
             }
             _ => regions.get(position).copied(),
         };
@@ -2650,12 +2746,33 @@ impl<'db> Builder<'_, '_, 'db> {
         self.prove(trait_ref, At { category: Category::Predicate, span });
     }
 
+    /// rustc's `check_local`: a variable's or temporary's type is `Sized`, which a where clause
+    /// on an associated type, `<&'static T as A>::X: Sized`, proves for those lifetimes only.
+    fn sized_local(&mut self, local: LocalId, ty: Ty<'db>, span: MirSpan) {
+        if local == super::return_slot()
+            || self.body.param_locals.contains(&local)
+            || !matches!(ty.kind(), TyKind::Alias(alias) if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }))
+        {
+            return;
+        }
+        let Some(sized) = self.interner().lang_items().Sized else { return };
+        let trait_ref = rustc_type_ir::TraitRef::new(self.interner(), sized.into(), [ty]);
+        self.prove(trait_ref, At { category: Category::Predicate, span });
+    }
+
     fn statement(&mut self, kind: &StatementKind, span: MirSpan) {
         kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
         let StatementKind::Assign(place, rvalue) = kind else { return };
         let projection = place.projection.as_slice();
         let dest = self.place_ty(place.local, projection).ty;
         let at = At { category: self.category_of_assignment(place.local, projection), span };
+        if projection.is_empty() {
+            self.sized_local(place.local, dest, span);
+            if place.local == super::return_slot() && !self.opaque_bounds.is_empty() {
+                let bounds = std::mem::take(&mut self.opaque_bounds);
+                self.clauses(bounds, At { category: Category::Predicate, span }, true);
+            }
+        }
         let first = self.regions.outlives.len();
         self.assign(place, rvalue, dest, at, span);
         // rustc relates a variable with a type written out to its annotation, so what flows
@@ -2755,9 +2872,9 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             _ => {
                 let constant = match rvalue {
-                    Rvalue::Use(operand) => self
-                        .constant_ty(operand, span)
-                        .or_else(|| self.written_fn_item(operand, span)),
+                    Rvalue::Use(operand) => {
+                        self.constant_ty(operand, span).or_else(|| self.fn_item(operand, span))
+                    }
                     _ => None,
                 };
                 if let Some(ty) = constant.or_else(|| self.rvalue_ty(rvalue, span)) {
@@ -2869,13 +2986,27 @@ impl<'db> Builder<'_, '_, 'db> {
         }
     }
 
-    /// A function item used as a value whose path spells out generic arguments,
-    /// `let f = <&'static u32 as Trait>::method;`, with the lifetimes written there and its
-    /// where clauses proven, as rustc's user type annotation on the path.
-    fn written_fn_item(&mut self, operand: &Operand, span: MirSpan) -> Option<Ty<'db>> {
-        let ty = self.written_callee(operand, span)?;
+    /// A function item used as a value, with its where clauses proven, as rustc's type check
+    /// proves those of every function item it names (`let f: fn(&'a str) -> _ = extend;` or
+    /// passing `extend` to a call); where its path spells out generic arguments,
+    /// `let f = <&'static u32 as Trait>::method;`, with the lifetimes written there, as
+    /// rustc's user type annotation on the path.
+    fn fn_item(&mut self, operand: &Operand, span: MirSpan) -> Option<Ty<'db>> {
+        let ty = match self.written_callee(operand, span) {
+            Some(ty) => ty,
+            None => match &operand.kind {
+                OperandKind::Constant { .. } | OperandKind::Allocation { .. } => {
+                    self.operand_ty(operand).filter(|it| matches!(it.kind(), TyKind::FnDef(..)))?
+                }
+                _ => return None,
+            },
+        };
         if let TyKind::FnDef(def, args) = ty.kind() {
-            self.callee_predicates(def.0, args, operand.span().unwrap_or(span));
+            let span = operand.span().unwrap_or(span);
+            self.callee_predicates(def.0, args, span);
+            for ty in args.types() {
+                self.well_formed(ty, At { category: Category::Boring, span }, 0);
+            }
         }
         Some(ty)
     }
@@ -2904,6 +3035,9 @@ impl<'db> Builder<'_, '_, 'db> {
             return None;
         }
         // The impl's anonymous lifetimes (`impl MyStruct<'_>`) are universal regions.
+        if self.nested() && self.impl_self.is_none() {
+            self.impl_self_of(function);
+        }
         if let Some((raw, named)) = self.impl_self
             && raw == ty
             && let TyKind::Adt(_, named) = named.kind()
@@ -3082,7 +3216,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 let target = self.renumber(target.as_ref());
                 let source = match kind {
                     CastKind::PointerCoercion(hir_ty::PointerCast::ReifyFnPointer) => {
-                        self.written_callee(operand, span).or_else(|| self.operand_ty(operand))?
+                        self.fn_item(operand, span).or_else(|| self.operand_ty(operand))?
                     }
                     _ => self.operand_ty(operand)?,
                 };
@@ -3666,7 +3800,8 @@ impl<'db> Builder<'_, '_, 'db> {
                     _ => inputs,
                 };
                 for (arg, input) in args.iter().zip(inputs) {
-                    if let Some(ty) = self.operand_ty(arg) {
+                    let fn_item = arg.span().and_then(|it| self.fn_item(arg, it));
+                    if let Some(ty) = fn_item.or_else(|| self.operand_ty(arg)) {
                         let at = At { category, span: arg.span().unwrap_or(span) };
                         self.relate(ty, input, Variance::Covariant, at);
                     }
@@ -3840,6 +3975,11 @@ impl<'db> Builder<'_, '_, 'db> {
             .iter_instantiated(self.interner(), args.as_slice())
             .map(|it| it.skip_norm_wip())
             .collect();
+        self.clauses(clauses, at, type_outlives);
+    }
+
+    /// `clauses`, which hold where `at` is.
+    fn clauses(&mut self, clauses: Vec<Clause<'db>>, at: At, type_outlives: bool) {
         // Outliving every `'a` of the clause's own `for<'a>` is outliving `'static`.
         let forall = |region: Region<'db>| match region.kind() {
             RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(binder), _) => {
@@ -4162,21 +4302,44 @@ impl<'db> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>> for Ob
     }
 }
 
-/// Each occurrence of an impl's self type made the one with universal regions for its
-/// anonymous lifetimes.
-struct ImplSelf<'db> {
+/// Each occurrence of one type made another: an impl's self type the one with universal
+/// regions for its anonymous lifetimes, an `impl Trait` the type it hides. The first may name
+/// bound lifetimes, shifted under each binder; the second names none.
+struct Replace<'db> {
     interner: hir_ty::next_solver::DbInterner<'db>,
-    impl_self: (Ty<'db>, Ty<'db>),
+    replace: (Ty<'db>, Ty<'db>),
+    binders: u32,
 }
 
-impl<'db> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>> for ImplSelf<'db> {
+impl<'db> Replace<'db> {
+    fn new(interner: hir_ty::next_solver::DbInterner<'db>, replace: (Ty<'db>, Ty<'db>)) -> Self {
+        Replace { interner, replace, binders: 0 }
+    }
+}
+
+impl<'db> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>> for Replace<'db> {
     fn cx(&self) -> hir_ty::next_solver::DbInterner<'db> {
         self.interner
     }
 
+    fn fold_binder<T: rustc_type_ir::TypeFoldable<hir_ty::next_solver::DbInterner<'db>>>(
+        &mut self,
+        binder: rustc_type_ir::Binder<hir_ty::next_solver::DbInterner<'db>, T>,
+    ) -> rustc_type_ir::Binder<hir_ty::next_solver::DbInterner<'db>, T> {
+        use rustc_type_ir::TypeSuperFoldable;
+        self.binders += 1;
+        let binder = binder.super_fold_with(self);
+        self.binders -= 1;
+        binder
+    }
+
     fn fold_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
         use rustc_type_ir::TypeSuperFoldable;
-        if ty == self.impl_self.0 { self.impl_self.1 } else { ty.super_fold_with(self) }
+        if ty == rustc_type_ir::shift_vars(self.interner, self.replace.0, self.binders) {
+            self.replace.1
+        } else {
+            ty.super_fold_with(self)
+        }
     }
 }
 
