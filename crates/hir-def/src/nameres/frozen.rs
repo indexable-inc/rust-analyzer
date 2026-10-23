@@ -106,11 +106,19 @@ pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
     }
 }
 
-static DIFFERENCES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Each difference found, by the crate and the kind of what was frozen: a crate's `DefMap`
+/// is resolved again when an `include!` loads a file, and only the last one is the crate's.
+static DIFFERENCES: Mutex<Vec<(Crate, &'static str, String)>> = Mutex::new(Vec::new());
 
 /// The differences [`Mode::Check`] and [`Mode::Verify`] found since this was last called.
 pub fn differences() -> Vec<String> {
-    std::mem::take(&mut *DIFFERENCES.lock().unwrap())
+    let found = std::mem::take(&mut *DIFFERENCES.lock().unwrap());
+    found.into_iter().map(|(_, _, it)| it).collect()
+}
+
+/// Forgets a difference found before in the frozen `kind` of `krate`, which agrees now.
+fn agrees(krate: Crate, kind: &str) {
+    DIFFERENCES.lock().unwrap().retain(|(at, of, _)| (*at, *of) != (krate, kind));
 }
 
 fn differs(db: &dyn SourceDatabase, krate: Crate, what: &str, written: &[u8], frozen: &[u8]) {
@@ -121,19 +129,21 @@ fn differs(db: &dyn SourceDatabase, krate: Crate, what: &str, written: &[u8], fr
 pub fn record_difference(
     db: &dyn SourceDatabase,
     krate: Crate,
-    kind: &str,
+    kind: &'static str,
     what: &str,
     written: &[u8],
     frozen: &[u8],
 ) {
     let at = written.iter().zip(frozen).position(|(a, b)| a != b).unwrap_or(written.len());
     let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
-    DIFFERENCES.lock().unwrap().push(format!(
+    let said = format!(
         "the frozen {kind} of `{}` differs from {what}: {} bytes against {}, first at byte {at}",
         name.as_deref().unwrap_or("?"),
         written.len(),
         frozen.len(),
-    ));
+    );
+    agrees(krate, kind);
+    DIFFERENCES.lock().unwrap().push((krate, kind, said));
 }
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
@@ -166,7 +176,7 @@ pub(super) fn check(db: &dyn SourceDatabase, krate: Crate, def_map: &DefMap, loc
         return;
     }
     match encode_maps(db, krate, def_map, local) {
-        Ok(written) if *written == *frozen.bytes => {}
+        Ok(written) if *written == *frozen.bytes => agrees(krate, "def map"),
         Ok(written) => differs(db, krate, "the live one", &written, &frozen.bytes),
         Err(why) => {
             differs(db, krate, &format!("the live one, which it cannot write ({why})"), &[], &[])
@@ -1914,9 +1924,11 @@ impl Dec<'_> {
 
     /// The files the bytes name, as named in the header: the first that is not loaded, or
     /// that is outside its crate's directory and whose text is not what was written, is an
-    /// error.
+    /// error. Each that is not loaded is noted as an `include!` that found nothing is, for
+    /// whoever owns the VFS to load.
     fn files(&mut self) -> R {
         let n = self.len()?;
+        let mut not_loaded = None;
         for _ in 0..n {
             let owner = self.u32()?;
             let path = self.str()?.to_owned();
@@ -1937,7 +1949,13 @@ impl Dec<'_> {
             let full = joined(dir, &path);
             let source_root = self.db.source_root(*source_root).source_root(self.db);
             let found = source_root.file_for_path(&vfs_path(*real, full.clone())).copied();
-            let found = found.ok_or_else(|| format!("{full} is not loaded"))?;
+            let Some(found) = found else {
+                let krate = self.closure[owner as usize];
+                let anchor = krate.data(self.db).root_file_id;
+                self.db.include_source(base_db::AnchoredPath { anchor, path: &path });
+                not_loaded.get_or_insert_with(|| format!("{full} is not loaded"));
+                continue;
+            };
             if let Some(written) = written
                 && hash128(self.db.file_text(found).text(self.db).as_bytes()) != written
             {
@@ -1945,7 +1963,7 @@ impl Dec<'_> {
             }
             self.files.push(found);
         }
-        Ok(())
+        not_loaded.map_or(Ok(()), Err)
     }
 
     fn file(&mut self) -> R<base_db::EditionedFileId> {
