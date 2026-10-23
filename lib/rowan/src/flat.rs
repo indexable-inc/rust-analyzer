@@ -4,9 +4,14 @@
 //! start in the text, the number after its subtree and its parent; the text is kept once,
 //! whole, and a token's text is a slice of it. Nothing is allocated per element, and walking
 //! is stepping through the arrays. The cursor ([`crate::cursor`]) serves these trees through
-//! the same API as green ones, and makes a green tree of a part only when asked for one.
+//! the same API as green ones, and makes a green tree of a part only when asked for one; a
+//! walk that reads many elements reads them here, by number, and makes a cursor only of what
+//! it keeps ([`crate::cursor::SyntaxNode::flat`]).
 
-use std::fmt;
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+};
 
 use crate::{GreenNode, GreenNodeBuilder, NodeCache, SyntaxKind, TextRange, TextSize};
 
@@ -58,25 +63,75 @@ impl FlatTree {
     }
 
     #[inline]
-    pub(crate) fn kind(&self, at: u32) -> SyntaxKind {
+    pub fn kind(&self, at: u32) -> SyntaxKind {
         SyntaxKind(self.kinds[at as usize])
     }
 
     #[inline]
-    pub(crate) fn is_token(&self, at: u32) -> bool {
+    pub fn is_token(&self, at: u32) -> bool {
         self.parents[at as usize] & TOKEN != 0
     }
 
     #[inline]
-    pub(crate) fn parent(&self, at: u32) -> Option<u32> {
+    pub fn parent(&self, at: u32) -> Option<u32> {
         let parent = self.parents[at as usize] & !TOKEN;
         (parent != NO_PARENT).then_some(parent)
     }
 
     /// The number after the element's subtree.
     #[inline]
-    pub(crate) fn end(&self, at: u32) -> u32 {
+    pub fn end(&self, at: u32) -> u32 {
         self.ends[at as usize]
+    }
+
+    /// The children and tokens of `at`, in order.
+    #[inline]
+    pub fn children_with_tokens(&self, at: u32) -> impl Iterator<Item = u32> + '_ {
+        let end = self.end(at);
+        let mut next = at + 1;
+        std::iter::from_fn(move || {
+            let it = next;
+            (it < end).then(|| {
+                next = self.end(it);
+                it
+            })
+        })
+    }
+
+    /// The children of `at` that are nodes, in order.
+    #[inline]
+    pub fn children(&self, at: u32) -> impl Iterator<Item = u32> + '_ {
+        self.children_with_tokens(at).filter(|&it| !self.is_token(it))
+    }
+
+    /// `at` and the nodes under it, in preorder.
+    #[inline]
+    pub fn descendants(&self, at: u32) -> impl Iterator<Item = u32> + '_ {
+        (at..self.end(at)).filter(|&it| !self.is_token(it))
+    }
+
+    /// Hashes what the subtree of `at` is made of, as the same subtree is hashed anywhere in
+    /// any tree: its text, and its elements' kinds and shape, numbered from `at`.
+    pub fn hash_subtree<H: Hasher>(&self, at: u32, state: &mut H) {
+        const CHUNK: usize = 64;
+        let (lo, hi) = (at as usize, self.end(at) as usize);
+        let base = self.starts[lo];
+        self.text[self.range(at)].hash(state);
+        self.kinds[lo..hi].hash(state);
+        let mut shape = [0u32; 3 * CHUNK];
+        for from in (lo..hi).step_by(CHUNK) {
+            let to = (from + CHUNK).min(hi);
+            for (slot, it) in shape.chunks_exact_mut(3).zip(from..to) {
+                let parent = self.parents[it];
+                slot[0] = self.starts[it] - base;
+                slot[1] = self.ends[it] - at;
+                slot[2] = match it == lo {
+                    true => NO_PARENT,
+                    false => (parent & TOKEN) | ((parent & !TOKEN) - at),
+                };
+            }
+            u32::hash_slice(&shape[..3 * (to - from)], state);
+        }
     }
 
     #[inline]
@@ -88,14 +143,14 @@ impl FlatTree {
     }
 
     #[inline]
-    pub(crate) fn range(&self, at: u32) -> TextRange {
+    pub fn range(&self, at: u32) -> TextRange {
         let start = self.offset(at);
         let end = self.offset(self.end(at));
         TextRange::new(TextSize::from(start), TextSize::from(end))
     }
 
     #[inline]
-    pub(crate) fn token_text(&self, at: u32) -> &str {
+    pub fn token_text(&self, at: u32) -> &str {
         &self.text[self.range(at)]
     }
 
@@ -206,7 +261,8 @@ impl FlatTree {
     /// The first node of `kind` and `range` that `child_at_range` steps down to from `at`, for
     /// a range that is not empty: those steps go through the ancestors of the last element to
     /// start at or before the range, and stop at the first that does not hold it or is a
-    /// token. Found from the bottom up, so the depth is walked once.
+    /// token. Found from the bottom up, up to the first ancestor larger than the range, above
+    /// which every one is larger too.
     pub(crate) fn node_at_range(&self, at: u32, range: TextRange, kind: SyntaxKind) -> Option<u32> {
         debug_assert!(!range.is_empty());
         let (lo, hi) = (at as usize, self.end(at) as usize);
@@ -215,8 +271,13 @@ impl FlatTree {
         let mut it = (lo + n).checked_sub(1).filter(|&it| it >= lo)? as u32;
         let mut found = None;
         loop {
-            if !self.is_token(it) && self.range(it) == range && self.kind(it) == kind {
-                found = Some(it);
+            let of_it = self.range(it);
+            if of_it == range {
+                if !self.is_token(it) && self.kind(it) == kind {
+                    found = Some(it);
+                }
+            } else if of_it.contains_range(range) {
+                return found;
             }
             if it == at {
                 return found;
@@ -350,7 +411,7 @@ impl FlatTreeBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{hash::Hasher, sync::Arc};
 
     use crate::{
         cursor::{SyntaxElement, SyntaxNode},
@@ -531,6 +592,40 @@ mod tests {
                     }
                 }
                 assert_eq!(alone.flat_tree().map(|it| &**it), Some(&again.finish()));
+                let hash = |it: &SyntaxNode| {
+                    let (tree, at) = it.flat().unwrap();
+                    let mut state = std::collections::hash_map::DefaultHasher::new();
+                    tree.hash_subtree(at, &mut state);
+                    state.finish()
+                };
+                assert_eq!(hash(f), hash(&alone), "seed {seed}");
+                let twin = g.to_flat();
+                assert_eq!(describe(Some(twin.clone().into())), describe(Some(f.clone().into())));
+                assert_eq!(twin.parent().is_none(), g.parent().is_none());
+                assert_eq!(hash(&twin), hash(f));
+                for node in [g, f] {
+                    for kind in (0..5).chain(100..105).map(SyntaxKind) {
+                        let ancestor = node.ancestors().find(|it| it.kind() == kind);
+                        assert_eq!(node.ancestor_where(|it| it == kind), ancestor);
+                        let child = node.children().find(|it| it.kind() == kind);
+                        assert_eq!(node.child_where(|it| it == kind), child);
+                        let token = node
+                            .children_with_tokens()
+                            .filter_map(NodeOrToken::into_token)
+                            .find(|it| it.kind() == kind);
+                        assert_eq!(node.child_token(kind), token);
+                    }
+                    let mut odd = node.children_where();
+                    let by_kind = std::iter::from_fn(|| odd.next_where(|it| it.0 % 2 == 1));
+                    let children = node.children().filter(|it| it.kind().0 % 2 == 1);
+                    assert!(by_kind.eq(children));
+                }
+                let (tree, at) = f.flat().unwrap();
+                let children: Vec<_> = f.children().collect();
+                let read: Vec<_> = tree.children(at).map(|it| f.flat_element(it)).collect();
+                assert_eq!(read, children.into_iter().map(NodeOrToken::Node).collect::<Vec<_>>());
+                let descendants = f.descendants().map(|it| (it.kind(), it.text_range()));
+                assert!(descendants.eq(tree.descendants(at).map(|it| (tree.kind(it), tree.range(it)))));
             }
         }
     }

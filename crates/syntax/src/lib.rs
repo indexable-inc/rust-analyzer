@@ -60,8 +60,8 @@ pub use crate::{
 };
 pub use parser::{Edition, LexedStr, SyntaxKind, T};
 pub use rowan::{
-    Direction, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset, WalkEvent,
-    api::Preorder,
+    Direction, FlatTree, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
+    WalkEvent, api::Preorder,
 };
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};

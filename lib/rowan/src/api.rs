@@ -106,6 +106,41 @@ impl<L: Language> SyntaxNode<L> {
     pub fn flat_tree(&self) -> Option<&std::sync::Arc<crate::FlatTree>> {
         self.raw.flat_tree()
     }
+    /// The flat tree this node is in and the node's number in it, if it is in one.
+    #[inline]
+    pub fn flat(&self) -> Option<(&std::sync::Arc<crate::FlatTree>, u32)> {
+        self.raw.flat()
+    }
+    /// Element `at` of the flat tree this node is in.
+    #[inline]
+    pub fn flat_element(&self, at: u32) -> SyntaxElement<L> {
+        self.raw.flat_element(at).into()
+    }
+    /// This node in a flat tree, for a walk that reads the arrays: itself when it is in one,
+    /// else the same node of a flat tree made of the green tree it is in.
+    pub fn to_flat(&self) -> SyntaxNode<L> {
+        SyntaxNode::from(self.raw.to_flat())
+    }
+    /// The first child node whose kind `pred` accepts.
+    #[inline]
+    pub fn child_where(&self, mut pred: impl FnMut(L::Kind) -> bool) -> Option<SyntaxNode<L>> {
+        self.raw.child_where(|it| pred(L::kind_from_raw(it))).map(SyntaxNode::from)
+    }
+    /// The nearest of this node and its ancestors whose kind `pred` accepts.
+    #[inline]
+    pub fn ancestor_where(&self, mut pred: impl FnMut(L::Kind) -> bool) -> Option<SyntaxNode<L>> {
+        self.raw.ancestor_where(|it| pred(L::kind_from_raw(it))).map(SyntaxNode::from)
+    }
+    /// The first child token of `kind`.
+    #[inline]
+    pub fn child_token(&self, kind: L::Kind) -> Option<SyntaxToken<L>> {
+        self.raw.child_token(L::kind_to_raw(kind)).map(SyntaxToken::from)
+    }
+    /// The child nodes whose kinds `pred` accepts.
+    #[inline]
+    pub fn children_where(&self, pred: fn(L::Kind) -> bool) -> SyntaxNodeChildrenWhere<L> {
+        SyntaxNodeChildrenWhere { raw: self.raw.children_where(), pred }
+    }
     /// Returns a green tree, equal to the green tree this node
     /// belongs two, except with this node substitute. The complexity
     /// of operation is proportional to the depth of the tree
@@ -405,6 +440,21 @@ impl<L: Language> Iterator for SyntaxNodeChildren<L> {
     type Item = SyntaxNode<L>;
     fn next(&mut self) -> Option<Self::Item> {
         self.raw.next().map(SyntaxNode::from)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntaxNodeChildrenWhere<L: Language> {
+    raw: cursor::SyntaxNodeChildrenWhere,
+    pred: fn(L::Kind) -> bool,
+}
+
+impl<L: Language> Iterator for SyntaxNodeChildrenWhere<L> {
+    type Item = SyntaxNode<L>;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let pred = self.pred;
+        self.raw.next_where(|it| pred(L::kind_from_raw(it))).map(SyntaxNode::from)
     }
 }
 

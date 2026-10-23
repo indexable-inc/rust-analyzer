@@ -17,7 +17,7 @@ use either::Either;
 
 use crate::{
     SyntaxKind,
-    syntax_node::{SyntaxNode, SyntaxNodeChildren, SyntaxToken},
+    syntax_node::{RustLanguage, SyntaxNode, SyntaxToken},
 };
 
 pub use self::{
@@ -87,18 +87,19 @@ pub trait AstToken {
 /// An iterator over `SyntaxNode` children of a particular AST type.
 #[derive(Debug, Clone)]
 pub struct AstChildren<N> {
-    inner: SyntaxNodeChildren,
+    inner: rowan::SyntaxNodeChildrenWhere<RustLanguage>,
     ph: PhantomData<N>,
 }
 
-impl<N> AstChildren<N> {
+impl<N: AstNode> AstChildren<N> {
     fn new(parent: &SyntaxNode) -> Self {
-        AstChildren { inner: parent.children(), ph: PhantomData }
+        AstChildren { inner: parent.children_where(N::can_cast), ph: PhantomData }
     }
 }
 
 impl<N: AstNode> Iterator for AstChildren<N> {
     type Item = N;
+    #[inline]
     fn next(&mut self) -> Option<N> {
         self.inner.find_map(N::cast)
     }
@@ -154,7 +155,8 @@ mod support {
 
     #[inline]
     pub(super) fn child<N: AstNode>(parent: &SyntaxNode) -> Option<N> {
-        parent.children().find_map(N::cast)
+        let mut children = parent.children_where(N::can_cast);
+        children.find_map(N::cast)
     }
 
     #[inline]
@@ -164,7 +166,7 @@ mod support {
 
     #[inline]
     pub(super) fn token(parent: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
-        parent.children_with_tokens().filter_map(|it| it.into_token()).find(|it| it.kind() == kind)
+        parent.child_token(kind)
     }
 }
 

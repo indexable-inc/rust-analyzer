@@ -107,7 +107,11 @@ impl Body {
         let anchor = item
             .ancestors()
             .find(|it| {
-                it.text_range().start() == start && hash_kept(it.clone_subtree()) == syntax.tree
+                let range = it.text_range();
+                it.kind() == syntax.kind
+                    && range.start() == start
+                    && range.len() == syntax.range.len()
+                    && kept(it).0 == syntax.tree
             })
             .expect("the anchor is not around the item");
         debug_assert_eq!(Some(start), Self::anchor_offset(db, def));
@@ -311,7 +315,7 @@ impl BodySyntax {
         let kept = trees::get(self.tree).filter(|_| !check_relative());
         kept.unwrap_or_else(|| {
             let root = self.reparse().unwrap_or_else(|| self.from_file(db));
-            trees::put(self.tree, root.clone());
+            trees::put(self.tree, root.clone(), None);
             root
         })
     }
@@ -348,67 +352,96 @@ impl BodySyntax {
         let file = self.file_id.file_id().expect("a body written in a file").parse(db);
         file.syntax_node()
             .descendants()
-            .filter(|it| it.text_range() == self.range)
-            .map(|it| it.clone_subtree())
-            .find(|it| hash_kept(it.clone()) == self.tree)
+            .filter(|it| it.text_range() == self.range && it.kind() == self.kind)
+            .map(|it| kept(&it))
+            .find(|it| it.0 == self.tree)
             .expect("the anchor is not in its file")
+            .1
     }
 }
 
-/// What the tree of `root` is made of, so that two trees made of the same are the same.
-fn tree_hash(root: &SyntaxNode) -> u128 {
+/// What the subtree of `node` is made of, as the root of a tree of its own, so that two trees
+/// made of the same are the same. A flat node's is read in place.
+fn tree_hash(node: &SyntaxNode) -> u128 {
     use std::hash::{Hash, Hasher};
+    let alone;
+    let node = match node.flat() {
+        Some(_) => node,
+        None => {
+            alone = node.clone_subtree().to_flat();
+            &alone
+        }
+    };
+    let (tree, at) = node.flat().expect("a flat tree");
     let half = |seed: u8| {
         let mut hasher = std::hash::DefaultHasher::new();
         seed.hash(&mut hasher);
-        match root.flat_tree() {
-            Some(tree) => tree.hash(&mut hasher),
-            None => root.green().to_owned().hash(&mut hasher),
-        }
+        tree.hash_subtree(at, &mut hasher);
         hasher.finish() as u128
     };
     half(0) << 64 | half(1)
 }
 
-/// [`tree_hash`] of `root`, which is kept among the trees of this thread.
-fn hash_kept(root: SyntaxNode) -> u128 {
-    trees::hash_of(&root).unwrap_or_else(|| {
-        let tree = tree_hash(&root);
-        trees::put(tree, root);
-        tree
-    })
+/// `anchor` as the root of a tree of its own, with its [`tree_hash`]: the one kept among the
+/// trees of this thread when that is of this anchor or made of the same, else a copy, kept.
+/// The bodies of an anchor are made one after another, and hashing or copying it again for
+/// each is long when it is a whole `impl` or module.
+fn kept(anchor: &SyntaxNode) -> (u128, SyntaxNode) {
+    if let Some(found) = trees::of_anchor(anchor) {
+        return found;
+    }
+    let tree = tree_hash(anchor);
+    let root = trees::get(tree).unwrap_or_else(|| anchor.clone_subtree());
+    trees::put(tree, root.clone(), Some(anchor));
+    (tree, root)
 }
 
 /// The trees of the anchors last parsed or lowered on this thread: what a body is lowered from
 /// right after its [`BodySyntax`] is made, and where its places are found while it is compiled.
 mod trees {
-    use std::{cell::RefCell, collections::VecDeque};
+    use std::{
+        cell::RefCell,
+        collections::VecDeque,
+        sync::{Arc, Weak},
+    };
 
-    use syntax::SyntaxNode;
+    use syntax::{FlatTree, SyntaxNode};
 
     const KEPT: usize = 32;
 
+    /// A tree, its root, and the anchor in a file's flat tree it was made of: that tree, which
+    /// is not let go of while this holds it, and the anchor's number in it.
+    type Kept = (u128, SyntaxNode, Option<(Weak<FlatTree>, u32)>);
+
     thread_local! {
-        static TREES: RefCell<VecDeque<(u128, SyntaxNode)>> = const { RefCell::new(VecDeque::new()) };
+        static TREES: RefCell<VecDeque<Kept>> = const { RefCell::new(VecDeque::new()) };
     }
 
     pub(super) fn get(tree: u128) -> Option<SyntaxNode> {
         TREES.with_borrow(|trees| trees.iter().find(|it| it.0 == tree).map(|it| it.1.clone()))
     }
 
-    /// What [`super::tree_hash`] gives for `root`, when it is one of these: the bodies of an
-    /// anchor are made one after another, and hashing a green anchor again for each is long
-    /// when it is a whole `impl` or module.
-    pub(super) fn hash_of(root: &SyntaxNode) -> Option<u128> {
-        TREES.with_borrow(|trees| trees.iter().find(|it| it.1 == *root).map(|it| it.0))
+    /// The tree kept of `anchor`, when it is one of these.
+    pub(super) fn of_anchor(anchor: &SyntaxNode) -> Option<(u128, SyntaxNode)> {
+        let (file, at) = anchor.flat()?;
+        TREES.with_borrow(|trees| {
+            let of = |it: &&Kept| {
+                it.2.as_ref().is_some_and(|(of, of_at)| {
+                    *of_at == at && std::ptr::eq(of.as_ptr(), Arc::as_ptr(file))
+                })
+            };
+            trees.iter().find(of).map(|it| (it.0, it.1.clone()))
+        })
     }
 
-    pub(super) fn put(tree: u128, root: SyntaxNode) {
+    pub(super) fn put(tree: u128, root: SyntaxNode, anchor: Option<&SyntaxNode>) {
+        let anchor = anchor.and_then(|it| it.flat()).map(|(file, at)| (Arc::downgrade(file), at));
         TREES.with_borrow_mut(|trees| {
+            trees.retain(|it| it.0 != tree);
             if trees.len() == KEPT {
                 trees.pop_front();
             }
-            trees.push_back((tree, root));
+            trees.push_back((tree, root, anchor));
         })
     }
 }
@@ -427,7 +460,7 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
             item.ancestors().find(|it| SyntaxNodePtr::new(it) == ptr)?
         }
     };
-    let root = anchor.clone_subtree();
+    let (tree, root) = kept(&anchor);
     let range = item.text_range() - start;
     let relative = match root.covering_element(range) {
         NodeOrToken::Node(it) => it,
@@ -436,7 +469,6 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
     let relative =
         relative.ancestors().find(|it| it.text_range() == range && it.kind() == item.kind())?;
     let (file, edition) = src.file_id.file_id()?.unpack(db);
-    let tree = hash_kept(root.clone());
     Some(BodySyntax {
         file_id: src.file_id,
         tree,

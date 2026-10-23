@@ -607,15 +607,13 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
         if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
             continue;
         }
-        let identifiers: FxHashSet<_> = file
-            .parse(db)
-            .syntax_node()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .filter(|it| it.kind() == SyntaxKind::IDENT)
-            .map(|it| Symbol::intern(it.text()))
+        let root = file.parse(db).syntax_node().to_flat();
+        let (tree, at) = root.flat().expect("a flat tree");
+        let identifiers: FxHashSet<&str> = (at..tree.end(at))
+            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
+            .map(|it| tree.token_text(it))
             .collect();
-        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol()));
+        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol().as_str()));
     }
     let mut loaded = FxHashSet::default();
     let mut ordered = vec![krate];

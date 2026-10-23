@@ -60,6 +60,11 @@ impl<L: Language> SyntaxNodePtr<L> {
         Self { kind: node.kind(), range: node.text_range() }
     }
 
+    /// The pointer to a node of `kind` at `range`, for a walk that reads a flat tree's arrays.
+    pub fn from_parts(kind: L::Kind, range: TextRange) -> Self {
+        Self { kind, range }
+    }
+
     /// Like [`Self::try_to_node`] but panics instead of returning `None` on
     /// failure.
     pub fn to_node(&self, root: &SyntaxNode<L>) -> SyntaxNode<L> {

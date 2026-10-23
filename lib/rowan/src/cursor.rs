@@ -490,6 +490,109 @@ impl SyntaxNode {
         }
     }
 
+    /// The flat tree this node is in and the node's number in it, if it is in one.
+    #[inline]
+    pub fn flat(&self) -> Option<(&Arc<FlatTree>, u32)> {
+        match &self.0 {
+            Ref::Green(_) => None,
+            Ref::Flat(root, at) => Some((&flat(root).tree, *at)),
+        }
+    }
+
+    /// Element `at` of the flat tree this node is in.
+    #[inline]
+    pub fn flat_element(&self, at: u32) -> SyntaxElement {
+        match self.0 {
+            Ref::Flat(root, _) => flat_element(root, at),
+            Ref::Green(_) => panic!("a green node is in no flat tree"),
+        }
+    }
+
+    /// This node in a flat tree, for a walk that reads the arrays: itself when it is in one,
+    /// else the same node of a flat tree made of the green tree it is in.
+    pub fn to_flat(&self) -> SyntaxNode {
+        if let Ref::Flat(..) = self.0 {
+            return self.clone();
+        }
+        let mut builder = crate::FlatTreeBuilder::new();
+        let (mut elements, mut at) = (0, 0);
+        for event in self.tree_top().preorder_with_tokens() {
+            match event {
+                WalkEvent::Enter(NodeOrToken::Node(node)) => {
+                    if node == *self {
+                        at = elements;
+                    }
+                    builder.start_node(node.kind());
+                    elements += 1;
+                }
+                WalkEvent::Enter(NodeOrToken::Token(token)) => {
+                    builder.token(token.kind(), token.text());
+                    elements += 1;
+                }
+                WalkEvent::Leave(NodeOrToken::Node(_)) => builder.finish_node(),
+                WalkEvent::Leave(NodeOrToken::Token(_)) => {}
+            }
+        }
+        let root = SyntaxNode::new_flat_root(Arc::new(builder.finish()));
+        root.flat_element(at).into_node().expect("a node's twin is a node")
+    }
+
+    /// The first child node whose kind `pred` accepts.
+    #[inline]
+    pub fn child_where(&self, mut pred: impl FnMut(SyntaxKind) -> bool) -> Option<SyntaxNode> {
+        match self.0 {
+            Ref::Flat(root, at) => {
+                let tree = &flat(&root).tree;
+                let child = tree.children(at).find(|&it| pred(tree.kind(it)))?;
+                Some(SyntaxNode(flat_ref(root, child)))
+            }
+            Ref::Green(_) => self.children().find(|it| pred(it.kind())),
+        }
+    }
+
+    /// The nearest of this node and its ancestors whose kind `pred` accepts.
+    #[inline]
+    pub fn ancestor_where(&self, mut pred: impl FnMut(SyntaxKind) -> bool) -> Option<SyntaxNode> {
+        match self.0 {
+            Ref::Flat(root, at) => {
+                let tree = &flat(&root).tree;
+                let mut it = at;
+                while !pred(tree.kind(it)) {
+                    it = tree.parent(it)?;
+                }
+                Some(SyntaxNode(flat_ref(root, it)))
+            }
+            Ref::Green(_) => self.ancestors().find(|it| pred(it.kind())),
+        }
+    }
+
+    /// The first child token of `kind`.
+    #[inline]
+    pub fn child_token(&self, kind: SyntaxKind) -> Option<SyntaxToken> {
+        match self.0 {
+            Ref::Flat(root, at) => {
+                let tree = &flat(&root).tree;
+                let token = tree
+                    .children_with_tokens(at)
+                    .find(|&it| tree.is_token(it) && tree.kind(it) == kind)?;
+                Some(SyntaxToken(flat_ref(root, token)))
+            }
+            Ref::Green(_) => self
+                .children_with_tokens()
+                .filter_map(NodeOrToken::into_token)
+                .find(|it| it.kind() == kind),
+        }
+    }
+
+    /// The child nodes, each step taking the next whose kind a predicate accepts.
+    #[inline]
+    pub fn children_where(&self) -> SyntaxNodeChildrenWhere {
+        SyntaxNodeChildrenWhere(match self.0 {
+            Ref::Flat(_, at) => ChildrenWhere::Flat { parent: self.clone(), next: at + 1 },
+            Ref::Green(_) => ChildrenWhere::Green(self.children()),
+        })
+    }
+
     fn new_child(
         green: &GreenNodeData,
         parent: SyntaxNode,
@@ -1158,6 +1261,41 @@ impl Iterator for SyntaxNodeChildren {
             self.next = next.next_sibling();
             next
         })
+    }
+}
+
+/// The child nodes of a node whose kinds a predicate accepts, from
+/// [`SyntaxNode::children_where`]: a flat node's are read off the arrays, and only those
+/// taken are made cursors.
+#[derive(Clone, Debug)]
+pub struct SyntaxNodeChildrenWhere(ChildrenWhere);
+
+#[derive(Clone, Debug)]
+enum ChildrenWhere {
+    Flat { parent: SyntaxNode, next: u32 },
+    Green(SyntaxNodeChildren),
+}
+
+impl SyntaxNodeChildrenWhere {
+    /// The next child whose kind `pred` accepts.
+    #[inline]
+    pub fn next_where(&mut self, mut pred: impl FnMut(SyntaxKind) -> bool) -> Option<SyntaxNode> {
+        match &mut self.0 {
+            ChildrenWhere::Flat { parent, next } => {
+                let Ref::Flat(root, at) = parent.0 else { unreachable!("a flat node's parent") };
+                let tree = &flat(&root).tree;
+                let end = tree.end(at);
+                while *next < end {
+                    let it = *next;
+                    *next = tree.end(it);
+                    if !tree.is_token(it) && pred(tree.kind(it)) {
+                        return Some(SyntaxNode(flat_ref(root, it)));
+                    }
+                }
+                None
+            }
+            ChildrenWhere::Green(children) => children.find(|it| pred(it.kind())),
+        }
     }
 }
 
