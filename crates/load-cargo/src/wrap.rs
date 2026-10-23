@@ -9,7 +9,8 @@ use vfs::AbsPath;
 
 /// Takes the expander of the macro `name` of the dylib at the path, of its kind, and gives
 /// back the one to expand with.
-pub type Wrap = fn(Arc<dyn ProcMacroExpander>, &AbsPath, &str, ProcMacroKind) -> Arc<dyn ProcMacroExpander>;
+pub type Wrap =
+    fn(Arc<dyn ProcMacroExpander>, &AbsPath, &str, ProcMacroKind) -> Arc<dyn ProcMacroExpander>;
 
 static WRAP: OnceLock<Wrap> = OnceLock::new();
 

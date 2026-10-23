@@ -236,7 +236,8 @@ fn ready_question(cmd: &mut Command) {
 
 fn utf8_stdout(cmd: &mut Command) -> anyhow::Result<String> {
     let answered = ANSWERER.get().and_then(|answerer| answerer(cmd));
-    let output = answered.unwrap_or_else(|| cmd.output()).with_context(|| format!("{cmd:?} failed"))?;
+    let output =
+        answered.unwrap_or_else(|| cmd.output()).with_context(|| format!("{cmd:?} failed"))?;
     if !output.status.success() {
         match String::from_utf8(output.stderr) {
             Ok(stderr) if !stderr.is_empty() => {

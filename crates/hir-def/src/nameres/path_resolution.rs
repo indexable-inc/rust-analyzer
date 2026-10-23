@@ -447,6 +447,21 @@ impl DefMap {
         }
     }
 
+    /// Whether `module` is ra-jit's test harness, which names every test of its crate as the
+    /// harness rustc writes does: a private one too.
+    fn is_test_harness(&self, db: &dyn SourceDatabase, module: ModuleId) -> bool {
+        let def_map = match module.krate(db) == self.krate && module.block(db) == self.block_id() {
+            true => self,
+            false => module.def_map(db),
+        };
+        let Some(parent) = def_map.module(db, module).parent else { return false };
+        def_map
+            .module(db, parent)
+            .children(db)
+            .iter()
+            .any(|(name, &it)| it == module && name.as_str() == "__ra_jit_test_harness")
+    }
+
     /// The visibility `e` is declared with. Its variants are that visible, even when the
     /// path reached the enum through a more private import.
     fn declared_enum_visibility(&self, db: &dyn SourceDatabase, e: EnumId) -> Option<Visibility> {
@@ -628,8 +643,15 @@ impl DefMap {
                 }
             };
 
-            curr_per_ns = curr_per_ns
+            let visible = curr_per_ns
                 .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
+            curr_per_ns = match visible.is_none()
+                && !curr_per_ns.is_none()
+                && self.is_test_harness(db, original_module)
+            {
+                true => curr_per_ns,
+                false => visible,
+            };
         }
 
         ResolvePathResult::new(

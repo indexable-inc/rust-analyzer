@@ -1,8 +1,8 @@
-mod node;
-mod token;
-mod element;
 mod builder;
+mod element;
+mod node;
 mod node_cache;
+mod token;
 
 use self::element::GreenElement;
 
