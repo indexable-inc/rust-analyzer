@@ -481,7 +481,7 @@ pub(super) fn build<'db>(
         elided_output: None,
         location: None,
         env_aliases: Vec::new(),
-        annotated: FxHashSet::default(),
+        annotated: FxHashMap::default(),
         const_positions: 0,
     };
     builder.universal_regions();
@@ -510,8 +510,8 @@ struct Builder<'c, 'a, 'db> {
     /// outlive some region: rustc's declared bounds from the environment, known before
     /// `known_relations` says which regions.
     env_aliases: Vec<Ty<'db>>,
-    /// The variables a `let` writes the type of.
-    annotated: FxHashSet<LocalId>,
+    /// The variables a `let` writes the type of, with that type where it is theirs.
+    annotated: FxHashMap<LocalId, Option<Ty<'db>>>,
     /// In a `const { .. }` block, how many regions of its type have a position.
     const_positions: usize,
     body: &'c MirBody<'db>,
@@ -997,10 +997,9 @@ impl<'db> Builder<'_, '_, 'db> {
                 );
             }
         }
-        // A variable with a type written out keeps the lifetimes the type names, as rustc
-        // relates it to the annotation.
+        // A variable with a type written out is related to it, lifetimes and all, as rustc
+        // relates it to the user type annotation.
         let annotated = self.annotated_locals();
-        self.annotated = annotated.keys().copied().collect();
         for (local, data) in body.locals.iter() {
             let index = local.into_raw().into_u32() as usize;
             if local_tys[index].is_some() {
@@ -1008,9 +1007,8 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             let ty = data.ty.as_ref();
             local_tys[index] = Some(match annotated.get(&local) {
-                Some(&annotation) => self
-                    .annotation_ty(annotation)
-                    .filter(|it| {
+                Some(&annotation) => {
+                    let written = self.annotation_ty(annotation).filter(|it| {
                         let interner = self.interner();
                         let erase = |ty: Ty<'db>| {
                             rustc_type_ir::fold_regions(interner, ty, |_, _| {
@@ -1018,8 +1016,13 @@ impl<'db> Builder<'_, '_, 'db> {
                             })
                         };
                         erase(*it) == erase(ty)
-                    })
-                    .unwrap_or_else(|| self.written(ty)),
+                    });
+                    self.annotated.insert(local, written);
+                    match written {
+                        Some(_) => self.renumber(ty),
+                        None => self.written(ty),
+                    }
+                }
                 None => self.renumber(ty),
             });
         }
@@ -1218,14 +1221,18 @@ impl<'db> Builder<'_, '_, 'db> {
                 Pat::Bind { id, subpat: None } => self.body.binding_locals.get(id).copied(),
                 _ => None,
             };
-            let ty = match local {
-                Some(local) if self.annotated.contains(&local) => {
-                    Some(self.regions.local_tys[local.into_raw().into_u32() as usize])
+            let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
+            let ty = match local.and_then(|it| Some((it, *self.annotated.get(&it)?))) {
+                Some((local, written)) => {
+                    let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+                    if let Some(written) = written {
+                        self.relate(local_ty, written, Variance::Invariant, at);
+                    }
+                    Some(local_ty)
                 }
-                _ => self.annotation_ty(annotation),
+                None => self.annotation_ty(annotation),
             };
             let Some(ty) = ty else { continue };
-            let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
             self.well_formed(ty, at, 0);
             if !matches!(self.ctx.store[pat], Pat::Bind { subpat: None, .. }) {
                 self.annotated_bindings(pat, ty, at, true);
@@ -2653,7 +2660,7 @@ impl<'db> Builder<'_, '_, 'db> {
         self.assign(place, rvalue, dest, at, span);
         // rustc relates a variable with a type written out to its annotation, so what flows
         // into a lifetime the annotation names, `let p: &'static T = ..`, is blamed on that.
-        if projection.is_empty() && self.annotated.contains(&place.local) {
+        if projection.is_empty() && self.annotated.contains_key(&place.local) {
             for index in first..self.regions.outlives.len() {
                 let constraint = &self.regions.outlives[index];
                 if constraint.category == Category::Assignment
@@ -3469,6 +3476,32 @@ impl<'db> Builder<'_, '_, 'db> {
             (TyKind::Dynamic(..), TyKind::Dynamic(..)) => {
                 self.relate(source, target, Variance::Covariant, at)
             }
+            // rustc's struct unsizing, `RefCell<T>: Unsize<RefCell<dyn Trait>>`: the argument
+            // its tail unsizes does so, and the others are the same.
+            (TyKind::Adt(source_def, from), TyKind::Adt(target_def, to))
+                if source_def == target_def =>
+            {
+                let interner = self.interner();
+                let erase = |ty| {
+                    rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_erased(interner))
+                };
+                for (x, y) in from.iter().zip(to.iter()) {
+                    match (x.kind(), y.kind()) {
+                        (GenericArgKind::Type(x), GenericArgKind::Type(y))
+                            if erase(x) == erase(y) =>
+                        {
+                            self.relate(x, y, Variance::Invariant, at)
+                        }
+                        (GenericArgKind::Type(x), GenericArgKind::Type(y)) => {
+                            self.unsize_pointee(x, y, at)
+                        }
+                        (GenericArgKind::Lifetime(x), GenericArgKind::Lifetime(y)) => {
+                            self.relate_regions(x, y, Variance::Invariant, at)
+                        }
+                        _ => (),
+                    }
+                }
+            }
             // The value implements the object's trait, with what the impl proving it needs:
             // `impl<T: 'static> Gettable<T> for S<T>` makes `&S<&'a u8> as &dyn Gettable<_>`
             // need `'a: 'static`.
@@ -3869,6 +3902,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.type_outlives(trait_ref.self_ty(), region, at);
                     }
                     self.caller_bound(trait_ref, at);
+                    self.closure_bound(trait_ref, at);
                     self.prove(trait_ref, at);
                 }
                 _ => (),
@@ -3899,6 +3933,38 @@ impl<'db> Builder<'_, '_, 'db> {
             }
         }
         regions
+    }
+
+    /// `F: FnOnce(S, T)` of a closure of this body typed against an expected signature: rustc
+    /// gives the closure that signature, so its parameters' types are the bound's arguments
+    /// (`|z: &[i32]|` passed as `F` takes the `S` it is called with). A bound with `for<'a>`
+    /// or a closure typed without one has a higher-ranked signature in rustc, which this
+    /// closure's one signature cannot stand for.
+    fn closure_bound(
+        &mut self,
+        trait_ref: rustc_type_ir::TraitRef<hir_ty::next_solver::DbInterner<'db>>,
+        at: At,
+    ) {
+        use rustc_type_ir::inherent::{GenericArg as _, GenericArgs as _};
+        let TyKind::Closure(def, args) = trait_ref.self_ty().kind() else { return };
+        let loc = def.0.loc(self.ctx.db);
+        let lang = self.interner().lang_items();
+        if loc.owner != self.ctx.owner
+            || self.ctx.infer.closures_without_expectation.contains(&loc.expr)
+            || rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&trait_ref)
+            || ![lang.Fn, lang.FnMut, lang.FnOnce].contains(&Some(trait_ref.def_id.0))
+        {
+            return;
+        }
+        let sig = args.as_closure().sig();
+        if !sig.bound_vars().is_empty() {
+            return;
+        }
+        let &[inputs] = sig.skip_binder().inputs().as_slice() else { return };
+        let Some(expected) = trait_ref.args.as_slice().get(1).and_then(|it| it.as_type()) else {
+            return;
+        };
+        self.relate(inputs, expected, Variance::Invariant, at);
     }
 
     /// A trait bound on a type parameter, proven by the one where clause of this body that
