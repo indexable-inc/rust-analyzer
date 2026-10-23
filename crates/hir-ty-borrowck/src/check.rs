@@ -1206,7 +1206,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             let target = self.regions.universals[universal].0;
             let path =
                 regions::constraint_path(self.regions, self.region_count, loan.region, target);
-            if let Some(blamed) = regions::blame(&path) {
+            if let Some(blamed) = regions::blame_with(&path, self.regions.returns_static_opaque) {
                 match (capture, blamed.category) {
                     (Some(closure), Category::Return | Category::CallArgument)
                         if !blamed.from_closure =>
@@ -2563,6 +2563,7 @@ fn guard_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<MirSpan, st
 }
 
 fn capture_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
+    let variables: FxHashSet<LocalId> = body.binding_locals.values().copied().collect();
     let mut temps = FxHashMap::default();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
@@ -2574,6 +2575,7 @@ fn capture_temps(body: &MirBody<'_>) -> FxHashMap<LocalId, MirSpan> {
                 for operand in operands.iter() {
                     if let OperandKind::Move(place) = &operand.kind
                         && place.projection.as_slice().is_empty()
+                        && !variables.contains(&place.local)
                     {
                         temps.insert(place.local, statement.span);
                     }

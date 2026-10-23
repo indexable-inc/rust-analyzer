@@ -4520,9 +4520,16 @@ pub(super) fn constraint_path(
 
 /// The constraint an error about `path` points at, as rustc's `best_blame_constraint`.
 pub(super) fn blame(path: &[Outlives]) -> Option<Outlives> {
+    blame_with(path, false)
+}
+
+/// [`blame`], where what is returned is an `impl Trait` that captures no lifetime: rustc's
+/// `OpaqueType` constraint, less interesting than an assignment.
+pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
     // rustc's `best_blame_constraint` from a free region: the most interesting constraint,
     // and of equally interesting ones the closest to the region outlived.
     let interest = |it: &Outlives| match it.category {
+        Category::Return if opaque => 3,
         Category::Return => 0,
         Category::TypeAnnotation
         | Category::Cast
