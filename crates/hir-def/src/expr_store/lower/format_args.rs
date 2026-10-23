@@ -10,12 +10,14 @@ use syntax::{
 };
 
 use crate::{
+    builtin_type::{BuiltinInt, BuiltinUint},
     expr_store::{HygieneId, lower::ExprCollector, path::Path},
     hir::{
         Array, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, Unsafe,
         format_args::{
-            self, FormatAlignment, FormatArgs, FormatArgsPiece, FormatArgument, FormatArgumentKind,
-            FormatArgumentsCollector, FormatCount, FormatDebugHex, FormatSign, FormatTrait,
+            self, FormatAlignment, FormatArgPosition, FormatArgs, FormatArgsPiece, FormatArgument,
+            FormatArgumentKind, FormatArgumentsCollector, FormatCount, FormatDebugHex,
+            FormatOptions, FormatSign, FormatTrait,
         },
     },
     lang_item::LangItemTarget,
@@ -29,8 +31,10 @@ impl<'db> ExprCollector<'db> {
         syntax_ptr: AstPtr<ast::Expr>,
     ) -> ExprId {
         let mut args = FormatArgumentsCollector::default();
+        let mut written = Vec::new();
         f.args().for_each(|arg| {
             let expr = arg.expr();
+            written.push(expr.clone().is_some_and(is_written_literal));
             args.add(FormatArgument {
                 kind: match arg.name() {
                     Some(name) => FormatArgumentKind::Named(name.as_name()),
@@ -49,7 +53,7 @@ impl<'db> ExprCollector<'db> {
             _ => None,
         });
         let mut mappings = vec![];
-        let (fmt, hygiene) = match template.and_then(|template| {
+        let (mut fmt, hygiene) = match template.and_then(|template| {
             self.expand_macros_to_string(template.clone()).map(|it| (it, template))
         }) {
             Some(((s, is_direct_literal), template)) => {
@@ -94,6 +98,7 @@ impl<'db> ExprCollector<'db> {
                 HygieneId::ROOT,
             ),
         };
+        self.inline_literals(&mut fmt, &written);
 
         let idx = self.collect_format_args_impl(syntax_ptr, fmt);
 
@@ -170,7 +175,7 @@ impl<'db> ExprCollector<'db> {
                             Expr::Call { callee: from_str, args: Box::new([s]) },
                             syntax_ptr,
                         );
-                        return if !fmt.arguments.arguments.is_empty() {
+                        return if !fmt.arguments.arguments.is_empty() || !fmt.orphans.is_empty() {
                             // With an incomplete format string (e.g. only an opening `{`), it's possible for `arguments`
                             // to be non-empty when reaching this code path.
                             self.alloc_expr(
@@ -180,10 +185,14 @@ impl<'db> ExprCollector<'db> {
                                         .arguments
                                         .arguments
                                         .iter()
-                                        .map(|arg| Statement::Expr {
-                                            expr: arg.expr,
-                                            has_semi: true,
-                                        })
+                                        .map(|arg| arg.expr)
+                                        .chain(fmt.orphans.iter().copied().filter(|orphan| {
+                                            fmt.arguments
+                                                .arguments
+                                                .iter()
+                                                .all(|arg| arg.expr != *orphan)
+                                        }))
+                                        .map(|expr| Statement::Expr { expr, has_semi: true })
                                         .collect(),
                                     tail: Some(from_str),
                                     label: None,
@@ -420,6 +429,88 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
+    /// rustc's `inline_literals`: a string literal, or an integer literal its type can hold,
+    /// formatted with a plain `{}` becomes part of the template instead of an argument. That is
+    /// what makes `Arguments::as_str` of `format_args!("{}", "a")` `Some`, and the payload of
+    /// `panic!("boom {}", 7)` a `&str`. `written` says which arguments are literals as written:
+    /// one a macro call expands to stays an argument, since `line!()`, `column!()` and `file!()`
+    /// expand to placeholders the code generator puts the place in the source for, and a byte
+    /// `b'x'`, which rustc leaves alone, lowers to what `120u8` does.
+    fn inline_literals(&mut self, fmt: &mut FormatArgs, written: &[bool]) {
+        let mut remove = vec![false; fmt.arguments.arguments.len()];
+        for piece in fmt.template.iter_mut() {
+            let FormatArgsPiece::Placeholder(placeholder) = piece else { continue };
+            let Ok(index) = placeholder.argument.index else { continue };
+            if placeholder.format_trait != FormatTrait::Display
+                || placeholder.format_options != FormatOptions::default()
+                || !written.get(index).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(arg) = fmt.arguments.arguments.get(index) else { continue };
+            let Some(literal) = self.inlinable_literal(arg.expr) else { continue };
+            *piece = FormatArgsPiece::Literal(literal);
+            remove[index] = true;
+        }
+        if !remove.contains(&true) {
+            return;
+        }
+        for_all_argument_indexes(&mut fmt.template, |index| remove[*index] = false);
+        let arguments = std::mem::take(&mut fmt.arguments.arguments).into_vec();
+        let mut kept = Vec::with_capacity(arguments.len());
+        for (arg, &remove) in arguments.into_iter().zip(&remove) {
+            if remove {
+                fmt.orphans.push(arg.expr);
+            } else {
+                kept.push(arg);
+            }
+        }
+        fmt.arguments.arguments = kept.into_boxed_slice();
+        let moved: Vec<usize> = remove
+            .iter()
+            .scan(0, |next, &remove| {
+                let index = *next;
+                *next += usize::from(!remove);
+                Some(index)
+            })
+            .collect();
+        for_all_argument_indexes(&mut fmt.template, |index| *index = moved[*index]);
+    }
+
+    /// The text of a literal `inline_literals` puts in the template: through `&`, a string, or an
+    /// integer no larger than its type holds, an unsuffixed one taken as `i32` and `isize` and
+    /// `usize` as 64 bits wide (larger ones do not compile for a narrower target).
+    fn inlinable_literal(&self, mut expr: ExprId) -> Option<Symbol> {
+        while let Expr::Ref { expr: inner, rawness: Rawness::Ref, .. } = &self.store.exprs[expr] {
+            expr = *inner;
+        }
+        let fits = |n: u128, max: u128| (n <= max).then(|| Symbol::intern(&n.to_string()));
+        match &self.store.exprs[expr] {
+            Expr::Literal(Literal::String(text)) => Some(text.clone()),
+            Expr::Literal(Literal::Int(n, ty)) => {
+                let max = match ty {
+                    None | Some(BuiltinInt::I32) => i32::MAX as u128,
+                    Some(BuiltinInt::I8) => i8::MAX as u128,
+                    Some(BuiltinInt::I16) => i16::MAX as u128,
+                    Some(BuiltinInt::I64 | BuiltinInt::Isize) => i64::MAX as u128,
+                    Some(BuiltinInt::I128) => i128::MAX as u128,
+                };
+                fits(u128::try_from(*n).ok()?, max)
+            }
+            Expr::Literal(Literal::Uint(n, ty)) => {
+                let max = match ty {
+                    Some(BuiltinUint::U8) => u8::MAX as u128,
+                    Some(BuiltinUint::U16) => u16::MAX as u128,
+                    Some(BuiltinUint::U32) => u32::MAX as u128,
+                    Some(BuiltinUint::U64 | BuiltinUint::Usize) => u64::MAX as u128,
+                    Some(BuiltinUint::U128) | None => u128::MAX,
+                };
+                fits(*n, max)
+            }
+            _ => None,
+        }
+    }
+
     /// Get the value for a `width` or `precision` field.
     ///
     /// Returns the value and whether it is indirect (an indexed argument) or not.
@@ -496,6 +587,41 @@ impl<'db> ExprCollector<'db> {
         relative_name: Symbol,
     ) -> ExprId {
         self.alloc_expr_desugared(self.ty_rel_lang_path_expr(lang, relative_name))
+    }
+}
+
+/// Whether `expr`, through parentheses and `&`, is a literal written as one, and not a byte.
+fn is_written_literal(mut expr: ast::Expr) -> bool {
+    loop {
+        expr = match expr {
+            ast::Expr::ParenExpr(it) => match it.expr() {
+                Some(inner) => inner,
+                None => return false,
+            },
+            ast::Expr::RefExpr(it) if it.raw_token().is_none() => match it.expr() {
+                Some(inner) => inner,
+                None => return false,
+            },
+            ast::Expr::Literal(it) => return !matches!(it.kind(), ast::LiteralKind::Byte(_)),
+            _ => return false,
+        }
+    }
+}
+
+/// Calls `f` with every argument index of the template: of each placeholder, its width and its
+/// precision.
+fn for_all_argument_indexes(template: &mut [FormatArgsPiece], mut f: impl FnMut(&mut usize)) {
+    for piece in template {
+        let FormatArgsPiece::Placeholder(placeholder) = piece else { continue };
+        if let Ok(index) = &mut placeholder.argument.index {
+            f(index);
+        }
+        let options = &mut placeholder.format_options;
+        for count in [&mut options.width, &mut options.precision] {
+            if let Some(FormatCount::Argument(FormatArgPosition { index: Ok(index), .. })) = count {
+                f(index);
+            }
+        }
     }
 }
 

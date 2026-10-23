@@ -13,7 +13,7 @@ use hir_def::{
     hir::generics::{
         GenericParamDataRef, TypeOrConstParamData, TypeParamData, TypeParamProvenance,
     },
-    resolver::{ResolveValueResult, TypeNs, ValueNs},
+    resolver::{ResolveValueResult, Resolver, TypeNs, ValueNs},
     signatures::{TraitFlags, TraitSignature},
     type_ref::{TypeRef, TypeRefId},
 };
@@ -64,6 +64,8 @@ pub(crate) struct PathLoweringContext<'a, 'b, 'db> {
     current_segment_idx: usize,
     /// Contains the previous segment if `current_segment_idx == segments.len()`
     current_or_prev_segment: PathSegment<'a>,
+    /// Where a `macro` wrote the path, for the types it names where it is defined.
+    hygiene: HygieneId,
 }
 
 impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
@@ -82,7 +84,14 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             segments,
             current_segment_idx: 0,
             current_or_prev_segment: first_segment,
+            hygiene: HygieneId::ROOT,
         }
+    }
+
+    #[inline]
+    pub(crate) fn with_hygiene(mut self, hygiene: HygieneId) -> Self {
+        self.hygiene = hygiene;
+        self
     }
 
     #[track_caller]
@@ -334,8 +343,13 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 
     #[tracing::instrument(skip(self), ret)]
     pub(crate) fn resolve_path_in_type_ns(&mut self) -> Option<(TypeNs, Option<usize>)> {
+        let db = self.ctx.db;
         let (resolution, remaining_index, _, prefix_info, _) =
-            self.ctx.resolver.resolve_path_in_type_ns_with_prefix_info(self.ctx.db, self.path)?;
+            match self.ctx.resolver.resolve_path_in_type_ns_with_prefix_info(db, self.path) {
+                Some(it) => it,
+                None => Resolver::def_site(db, self.hygiene)?
+                    .resolve_path_in_type_ns_with_prefix_info(db, self.path)?,
+            };
 
         let segments = self.segments;
         if segments.is_empty() || matches!(self.path, Path::LangItem(..)) {

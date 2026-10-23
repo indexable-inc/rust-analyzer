@@ -99,7 +99,7 @@ impl<'db> Expander<'db> {
         db: &'db dyn SourceDatabase,
         macro_call: ast::MacroCall,
         krate: Crate,
-        resolver: impl Fn(&ModPath) -> Option<MacroId>,
+        resolver: impl Fn(&ModPath, SyntaxContext) -> Option<MacroId>,
         eager_callback: EagerCallBackFn<'_>,
     ) -> Result<ExpandResult<Option<(Mark<'db>, Option<Parse<T>>)>>, UnresolvedMacro> {
         // FIXME: within_limit should support this, instead of us having to extract the error
@@ -135,7 +135,7 @@ impl<'db> Expander<'db> {
                 krate,
                 this.macro_depth + 1,
                 this.recursion_limit,
-                |path| resolver(path).map(|it| it.definition(db)),
+                |path| resolver(path, call_site.ctx).map(|it| it.definition(db)),
                 eager_callback,
             ) {
                 Ok(call_id) => call_id,

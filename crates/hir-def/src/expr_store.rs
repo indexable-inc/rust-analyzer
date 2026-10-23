@@ -169,6 +169,8 @@ pub struct ExpressionStore {
     expr_only: Option<Box<ExpressionOnlyStore>>,
     pub types: Arena<TypeRef>,
     pub lifetimes: Arena<LifetimeRef>,
+    /// The hygiene of the plain type paths a `macro` wrote, by type in increasing order.
+    type_hygiene: Option<Box<[(TypeRefId, HygieneId)]>>,
 }
 
 #[derive(Debug, Eq, Default)]
@@ -388,6 +390,7 @@ pub struct ExpressionStoreBuilder {
     pub types: Arena<TypeRef>,
     block_scopes: Vec<BlockId>,
     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+    pub(crate) type_hygiene: Vec<(TypeRefId, HygieneId)>,
     block_editions: FxHashMap<ExprId, Edition>,
 
     /// The closures written with `#[rustc_inherit_overflow_checks]`.
@@ -476,6 +479,7 @@ impl ExpressionStoreBuilder {
             mut bindings,
             mut binding_owners,
             mut ident_hygiene,
+            type_hygiene,
             mut block_editions,
             mut overflow_inheriting,
             inference_roots: mut expr_roots,
@@ -559,7 +563,8 @@ impl ExpressionStoreBuilder {
             } else {
                 None
             };
-            ExpressionStore { expr_only, types, lifetimes }
+            let type_hygiene = (!type_hygiene.is_empty()).then(|| type_hygiene.into_boxed_slice());
+            ExpressionStore { expr_only, types, lifetimes, type_hygiene }
         };
 
         let source_map = {
@@ -595,8 +600,12 @@ impl ExpressionStoreBuilder {
 }
 
 impl ExpressionStore {
-    const EMPTY: &ExpressionStore =
-        &ExpressionStore { expr_only: None, types: Arena::new(), lifetimes: Arena::new() };
+    const EMPTY: &ExpressionStore = &ExpressionStore {
+        expr_only: None,
+        types: Arena::new(),
+        lifetimes: Arena::new(),
+        type_hygiene: None,
+    };
 
     #[inline]
     pub fn empty() -> &'static ExpressionStore {
@@ -1020,6 +1029,14 @@ impl ExpressionStore {
     /// The edition a block was written in, when a macro wrote it.
     pub fn block_edition(&self, block: ExprId) -> Option<Edition> {
         self.assert_expr_only().block_editions.get(&block).copied()
+    }
+
+    pub fn type_path_hygiene(&self, type_ref: TypeRefId) -> HygieneId {
+        let Some(hygiene) = &self.type_hygiene else { return HygieneId::ROOT };
+        match hygiene.binary_search_by_key(&type_ref, |&(id, _)| id) {
+            Ok(index) => hygiene[index].1,
+            Err(_) => HygieneId::ROOT,
+        }
     }
 
     pub fn expr_path_hygiene(&self, expr: ExprId) -> HygieneId {

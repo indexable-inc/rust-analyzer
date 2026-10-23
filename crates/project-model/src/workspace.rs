@@ -1866,6 +1866,12 @@ fn sysroot_to_crate_graph(
     if let (Some(&(_, std, _)), Some(arch)) = (std, arch) {
         crate_graph.set_env(std, "STD_ENV_ARCH", arch.as_str());
     }
+    // The library as built has its copy of `backtrace` know it is in std.
+    if let Some(&(_, std, _)) = std
+        && sysroot_as_built()
+    {
+        crate_graph.set_cfg(std, Symbol::intern("backtrace_in_libstd"));
+    }
     (public_deps, proc_macro)
 }
 
@@ -2059,8 +2065,18 @@ fn sysroot_metadata_config(
         })
         .collect();
 
+    // The toolchain's std is built with `backtrace` (and the default `panic-unwind`), whose
+    // symbolization is crates of their own.
+    let features = if sysroot_as_built() {
+        crate::CargoFeatures::Selected {
+            features: vec!["sysroot/backtrace".to_owned()],
+            no_default_features: false,
+        }
+    } else {
+        Default::default()
+    };
     CargoMetadataConfig {
-        features: Default::default(),
+        features,
         targets,
         // NOTE: Not passing extra_args / metadata_extra_args / config_path here is very
         // intentional. The sysroot config has nothing to do with the workspace's config, so it's

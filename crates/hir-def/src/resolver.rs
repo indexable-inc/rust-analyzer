@@ -180,6 +180,12 @@ impl<'db> Resolver<'db> {
         )
     }
 
+    /// The scope where the `macro` that wrote a name with `hygiene` is defined, for the
+    /// items it names there.
+    pub fn def_site(db: &'db dyn SourceDatabase, hygiene: HygieneId) -> Option<Resolver<'db>> {
+        Some(macro_def_site(db, hygiene)?.resolver(db))
+    }
+
     pub fn resolve_path_in_type_ns_with_prefix_info(
         &self,
         db: &dyn SourceDatabase,
@@ -1003,7 +1009,7 @@ fn handle_macro_def_scope(
 /// The module of the `macro` whose expansion produced a name. Items named in such a macro are
 /// the ones in scope where the macro is defined.
 // FIXME: rustc looks there first; this is only reached when the name is unknown at the call site.
-fn macro_def_site(db: &dyn SourceDatabase, hygiene_id: HygieneId) -> Option<ModuleId> {
+pub(crate) fn macro_def_site(db: &dyn SourceDatabase, hygiene_id: HygieneId) -> Option<ModuleId> {
     let (_, def) = hygiene_info(db, hygiene_id)?;
     crate::crate_def_map(db, def.krate).modules(db).find_map(|(_, data)| {
         data.scope(db).macros().find_map(|(_, it)| match it.def {

@@ -995,11 +995,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     #[inline]
     fn at_path(&mut self, path_id: PathId) -> PathLoweringContext<'_, 'a, 'db> {
+        let hygiene = self.store.type_path_hygiene(path_id.type_ref());
         PathLoweringContext::new(
             self,
             Self::on_path_diagnostic_callback(path_id.type_ref()),
             &self.store[path_id],
         )
+        .with_hygiene(hygiene)
     }
 
     pub(crate) fn lower_path(&mut self, path: &Path, path_id: PathId) -> (Ty<'db>, Option<TypeNs>) {

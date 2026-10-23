@@ -229,22 +229,20 @@ fn main() {
             let are = "are";
             let count = 10;
             {
-                let <ra@gennew>0 = (&"fancy", &(), &"!", &count, &are, );
+                let <ra@gennew>0 = (&(), &count, &are, );
                 let <ra@gennew>0 = [
                     builtin#lang(Argument::new_display)(
-                        <ra@gennew>0.3,
-                    ), builtin#lang(Argument::new_display)(
-                        <ra@gennew>0.0,
+                        <ra@gennew>0.1,
                     ), builtin#lang(Argument::new_debug)(
-                        <ra@gennew>0.4,
-                    ), builtin#lang(Argument::new_display)(
                         <ra@gennew>0.2,
                     ),
                 ];
                 ();
+                "fancy";
+                "!";
                 unsafe {
                     builtin#lang(Arguments::new)(
-                        "\x07\x1bhello \xc3 \x00\x00i\x02\x00\x01 \xc0\r friends, we \xc0\x01 \xc8\x01\x00\xc8\x03\x00\x00",
+                        "\x07\x1bhello \xc3 \x00\x00i\x02\x00\x13 fancy friends, we \xc0\x07 fancy!\x00",
                         &<ra@gennew>0,
                     )
                 }

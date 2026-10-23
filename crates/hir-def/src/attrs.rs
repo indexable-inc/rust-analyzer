@@ -250,6 +250,9 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     "macro_export" => attr_flags.insert(AttrFlags::IS_MACRO_EXPORT),
                     "must_use" => attr_flags.insert(AttrFlags::IS_MUST_USE),
                     "no_mangle" => attr_flags.insert(AttrFlags::NO_MANGLE),
+                    "rustc_std_internal_symbol" | "panic_handler" => {
+                        attr_flags.insert(AttrFlags::LINKED_BY_NAME)
+                    }
                     "used" => attr_flags.insert(AttrFlags::USED),
                     "track_caller" => attr_flags.insert(AttrFlags::TRACK_CALLER),
                     "inline" => attr_flags.insert(AttrFlags::IS_INLINE),
@@ -391,6 +394,9 @@ bitflags::bitflags! {
         const INLINE_NEVER = 1 << 61;
         /// `#[inline(always)]`: built into its callers where they are optimized.
         const INLINE_ALWAYS = 1 << 62;
+        /// `#[rustc_std_internal_symbol]` or `#[panic_handler]`: a function a declaration of
+        /// another crate links to by its name.
+        const LINKED_BY_NAME = 1 << 63;
     }
 }
 
@@ -804,10 +810,25 @@ impl AttrFlags {
         symbol_attr(db, owner, "link_section")
     }
 
+    /// The linkage `#[linkage]` asks of an item, as `extern_weak`.
+    #[salsa::tracked(returns(clone))]
+    pub fn linkage(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        symbol_attr(db, owner, "linkage")
+    }
+
     /// The symbol `#[export_name]` gives an item.
     #[salsa::tracked(returns(clone))]
     pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
         symbol_attr(db, owner, "export_name")
+    }
+
+    /// Whether `owner` has the attribute `#[name]`, once its `cfg_attr`s are expanded.
+    pub fn has_word(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> bool {
+        let found = collect_attrs(db, owner, |attr| match attr {
+            ast::Meta::PathMeta(attr) if attr.path().is1(name) => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        });
+        found.is_some()
     }
 
     #[inline]

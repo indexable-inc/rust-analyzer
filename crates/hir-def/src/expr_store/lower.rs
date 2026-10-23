@@ -14,7 +14,7 @@ use either::Either;
 use hir_expand::{
     HirFileId, InFile, MacroDefId,
     builtin::MODULE_PATH_PLACEHOLDER,
-    mod_path::ModPath,
+    mod_path::{ModPath, PathKind},
     name::{AsName, Name},
     span_map::SpanMap,
 };
@@ -23,7 +23,7 @@ use itertools::Itertools;
 use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use span::{AstIdMap, RealSpanMap};
+use span::{AstIdMap, RealSpanMap, SyntaxContext};
 use stdx::never;
 use syntax::{
     AstNode, AstPtr, SyntaxNodePtr,
@@ -59,6 +59,7 @@ use crate::{
     item_scope::BuiltinShadowMode,
     lang_item::{LangItemTarget, LangItems},
     nameres::{DefMap, LocalDefMap, MacroSubNs, block_def_map},
+    resolver::{HasResolver, macro_def_site},
     signatures::TypeAliasSignature,
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, Mutability, PathId, Rawness,
@@ -926,7 +927,15 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn alloc_type_ref(&mut self, type_ref: TypeRef, node: TypePtr) -> TypeRefId {
+        let plain = matches!(&type_ref, TypeRef::Path(path) if path.type_anchor().is_none()
+            && path.mod_path().is_some_and(|it| it.kind == PathKind::Plain));
         let id = self.store.types.alloc(type_ref);
+        if plain {
+            let hygiene = self.hygiene_id_for(node.text_range());
+            if !hygiene.is_root() {
+                self.store.type_hygiene.push((id, hygiene));
+            }
+        }
         let ptr = self.expander.in_file(node);
         self.store.types_map_back.insert(id, ptr);
         self.store.types_map.insert(ptr, id);
@@ -2069,9 +2078,11 @@ impl<'db> ExprCollector<'db> {
     fn collect_expr_path(&mut self, e: ast::PathExpr) -> Option<(Path, HygieneId)> {
         e.path().and_then(|path| {
             let path = self.lower_path(path, &mut Self::impl_trait_error_allocator)?;
-            // Need to enable `mod_path.len() < 1` for `self`.
+            // Need to enable `mod_path.len() < 1` for `self`. A longer plain path takes its
+            // hygiene too, for the items a `macro` names where it is defined.
             let may_be_variable = matches!(&path, Path::BarePath(mod_path) if mod_path.len() <= 1);
-            let hygiene = if may_be_variable {
+            let plain = path.mod_path().is_some_and(|it| it.kind == PathKind::Plain);
+            let hygiene = if may_be_variable || plain {
                 self.hygiene_id_for(e.syntax().text_range())
             } else {
                 HygieneId::ROOT
@@ -2709,7 +2720,7 @@ impl<'db> ExprCollector<'db> {
             // fast path, macro call is in a block module
             Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
             None => {
-                let resolver = |path: &ModPath| {
+                let resolver = |path: &ModPath, ctx: SyntaxContext| {
                     // The latest `macro_rules!` of that name before the call, which is not
                     // the last one of the block when a later statement defines it again.
                     let shadowing = path.as_ident().and_then(|name| {
@@ -2734,6 +2745,16 @@ impl<'db> ExprCollector<'db> {
                         )
                         .0
                         .take_macros()
+                        .or_else(|| {
+                            let module = macro_def_site(self.db, HygieneId::new(ctx))?;
+                            let resolver = module.resolver(self.db);
+                            let found = resolver.resolve_path_as_macro(
+                                self.db,
+                                path,
+                                Some(MacroSubNs::Bang),
+                            )?;
+                            Some(found.def)
+                        })
                 };
                 self.expander.enter_expand(
                     self.db,

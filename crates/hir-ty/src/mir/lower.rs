@@ -3132,13 +3132,23 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         }
     }
 
+    /// A literal statement among them is an argument `format_args!` put in its template,
+    /// kept for inference and nothing else.
     fn is_super_let_block(&self, statements: &[hir_def::hir::Statement]) -> bool {
-        !statements.is_empty()
+        let literal = |mut expr: ExprId| loop {
+            match &self.store[expr] {
+                Expr::Ref { expr: inner, .. } => expr = *inner,
+                Expr::Literal(_) => return true,
+                _ => return false,
+            }
+        };
+        statements.iter().any(|it| matches!(it, hir_def::hir::Statement::Let { .. }))
             && statements.iter().all(|statement| match statement {
                 hir_def::hir::Statement::Let { pat, initializer: Some(_), is_super, .. } => {
                     *is_super
                         || matches!(self.store[*pat], Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())
                 }
+                hir_def::hir::Statement::Expr { expr, .. } => literal(*expr),
                 _ => false,
             })
     }
