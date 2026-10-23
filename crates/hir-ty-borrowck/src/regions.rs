@@ -3464,7 +3464,8 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn unsize_pointee(&mut self, source: Ty<'db>, target: Ty<'db>, at: At) {
         match (source.kind(), target.kind()) {
-            (TyKind::Array(x, _), TyKind::Slice(y)) => self.relate(x, y, Variance::Covariant, at),
+            // rustc's `[T; N]: Unsize<[T]>` is of one `T`: the slice's elements are the array's.
+            (TyKind::Array(x, _), TyKind::Slice(y)) => self.relate(x, y, Variance::Invariant, at),
             (TyKind::Dynamic(..), TyKind::Dynamic(..)) => {
                 self.relate(source, target, Variance::Covariant, at)
             }
