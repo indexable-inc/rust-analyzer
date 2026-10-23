@@ -54,7 +54,9 @@ pub fn missing_unsafe(db: &dyn HirDatabase, def: DefWithBodyId) -> MissingUnsafe
             }
         }
         UnsafeDiagnostic::DeprecatedSafe2024 { node, inside_unsafe_block } => {
-            if inside_unsafe_block == InsideUnsafeBlock::No {
+            // rustc lints such a call in an unsafe fn only where `unsafe_op_in_unsafe_fn` is not
+            // allowed, a level this does not know.
+            if inside_unsafe_block == InsideUnsafeBlock::No && !is_unsafe {
                 res.deprecated_safe_calls.push(node)
             }
         }

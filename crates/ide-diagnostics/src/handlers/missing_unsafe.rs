@@ -671,6 +671,31 @@ fn main() {
     }
 
     #[test]
+    fn rustc_deprecated_safe_2024_in_unsafe_fn() {
+        check_diagnostics(
+            r#"
+//- /ed2021.rs crate:ed2021 edition:2021
+#[rustc_deprecated_safe_2024]
+unsafe fn deprecated_safe() -> u8 {
+    0
+}
+
+//- /dep.rs crate:dep deps:ed2021 edition:2021
+#![deny(deprecated_safe_2024)]
+
+fn safe() {
+    ed2021::deprecated_safe();
+ // ^^^^^^^^^^^^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+}
+
+unsafe fn not_safe() {
+    ed2021::deprecated_safe();
+}
+            "#,
+        )
+    }
+
+    #[test]
     fn orphan_unsafe_format_args() {
         // Checks that we don't place orphan arguments for formatting under an unsafe block.
         check_diagnostics(
