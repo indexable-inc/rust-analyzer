@@ -262,18 +262,50 @@ enum Command {
 
 impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
-        match (self , other) {
+        let __self_discr = $crate::intrinsics::discriminant_value(self );
+        let __arg1_discr = $crate::intrinsics::discriminant_value(other);
+        __self_discr==__arg1_discr && match (self , other) {
             (Command::Move {
                 x: x_self, y: y_self,
             }
             , Command::Move {
                 x: x_other, y: y_other,
             }
-            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), (Command::Jump, Command::Jump)=>true , _unused=>false
+            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), _unused=>true
         }
     }
 }
 impl <> $crate::cmp::Eq for Command< > where {}"#]],
+    );
+}
+
+#[test]
+fn test_partial_eq_expand_fieldless_enum() {
+    check(
+        r#"
+//- minicore: derive, eq
+#[derive(PartialEq)]
+enum Token {
+    Plus,
+    Minus,
+    Star,
+}
+"#,
+        expect![[r#"
+#[derive(PartialEq)]
+enum Token {
+    Plus,
+    Minus,
+    Star,
+}
+
+impl <> $crate::cmp::PartialEq for Token< > where {
+    fn eq(&self , other: &Self ) -> bool {
+        let __self_discr = $crate::intrinsics::discriminant_value(self );
+        let __arg1_discr = $crate::intrinsics::discriminant_value(other);
+        __self_discr==__arg1_discr
+    }
+}"#]],
     );
 }
 
@@ -300,14 +332,16 @@ enum Command {
 
 impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
-        match (self , other) {
+        let __self_discr = $crate::intrinsics::discriminant_value(self );
+        let __arg1_discr = $crate::intrinsics::discriminant_value(other);
+        __self_discr==__arg1_discr && match (self , other) {
             (Command::Move {
                 x: x_self, y: y_self,
             }
             , Command::Move {
                 x: x_other, y: y_other,
             }
-            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), (Command::Jump, Command::Jump)=>true , _unused=>false
+            )=>$crate::cmp::PartialEq::eq(&x_self, &x_other) && $crate::cmp::PartialEq::eq(&y_self, &y_other), (Command::Do(f0_self, ), Command::Do(f0_other, ))=>$crate::cmp::PartialEq::eq(&f0_self, &f0_other), _unused=>true
         }
     }
 }
@@ -363,7 +397,7 @@ impl <> $crate::cmp::PartialOrd for Command< > where {
                         }
                         c=>return c,
                     }
-                    , (Command::Jump, Command::Jump)=>$crate::option::Option::Some($crate::cmp::Ordering::Equal), _unused=>$crate::option::Option::Some($crate::cmp::Ordering::Equal)
+                    , _unused=>$crate::option::Option::Some($crate::cmp::Ordering::Equal)
                 }
             }
             c=>return c,
@@ -398,7 +432,7 @@ impl <> $crate::cmp::Ord for Command< > where {
                         }
                         c=>return c,
                     }
-                    , (Command::Jump, Command::Jump)=>$crate::cmp::Ordering::Equal, _unused=>$crate::cmp::Ordering::Equal
+                    , _unused=>$crate::cmp::Ordering::Equal
                 }
             }
             c=>return c,

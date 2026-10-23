@@ -843,6 +843,12 @@ fn and_and(span: Span) -> tt::TopSubtree {
     quote! {span => #and& }
 }
 
+/// As [`and_and`], for `==`.
+fn eq_eq(span: Span) -> tt::TopSubtree {
+    let eq = tt::Punct { char: '=', spacing: ::tt::Spacing::Joint, span };
+    quote! {span => #eq= }
+}
+
 fn default_expand(
     db: &dyn SourceDatabase,
     span: Span,
@@ -1068,34 +1074,42 @@ fn partial_eq_expand(
         let both = adt.both(span);
         let name = &adt.name;
 
+        // As rustc's: an enum of several variants compares the discriminants, and then the
+        // fields of the variants that have any. A match of each variant against itself is a
+        // comparison for each, which LLVM leaves as a chain.
+        let discriminants =
+            matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, name, span);
-        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span)).map(
-            |(pat1, pat2, names)| {
+        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
+        let arms = arms.filter(|(_, _, names)| !discriminants || !names.is_empty());
+        let arms: Vec<_> = arms.collect();
+        if discriminants {
+            let fielded = !arms.is_empty();
+            let arms = arms.into_iter().map(|(pat1, pat2, names)| {
                 let fat_arrow = fat_arrow(span);
-                let body = match &*names {
-                    [] => {
-                        quote!(span =>true)
-                    }
-                    [first, rest @ ..] => {
-                        let rest = rest.iter().map(|it| {
-                            let t1 = tt::Ident::new(&format!("{}_self", it.sym), it.span);
-                            let t2 = tt::Ident::new(&format!("{}_other", it.sym), it.span);
-                            let and_and = and_and(span);
-                            // By path, as rustc does: a type's own `eq` would be found first.
-                            quote!(span =>#and_and #krate::cmp::PartialEq::eq(&#t1, &#t2))
-                        });
-                        let first = {
-                            let t1 = tt::Ident::new(&format!("{}_self", first.sym), first.span);
-                            let t2 = tt::Ident::new(&format!("{}_other", first.sym), first.span);
-                            quote!(span =>#krate::cmp::PartialEq::eq(&#t1, &#t2))
-                        };
-                        quote!(span =>#first # #rest)
-                    }
-                };
+                let body = fields_eq(krate, &names, span);
                 quote! {span => ( #pat1 , #pat2 ) #fat_arrow #body , }
-            },
-        );
-
+            });
+            let fat_arrow = fat_arrow(span);
+            let and_and = and_and(span);
+            let fields = match fielded {
+                true => quote! {span => #and_and match #both { # #arms _unused #fat_arrow true } },
+                false => quote! {span =>},
+            };
+            let eq_eq = eq_eq(span);
+            return quote! {span =>
+                fn eq(&self, other: &Self) -> bool {
+                    let __self_discr = #krate::intrinsics::discriminant_value(self);
+                    let __arg1_discr = #krate::intrinsics::discriminant_value(other);
+                    __self_discr #eq_eq __arg1_discr #fields
+                }
+            };
+        }
+        let arms = arms.into_iter().map(|(pat1, pat2, names)| {
+            let fat_arrow = fat_arrow(span);
+            let body = fields_eq(krate, &names, span);
+            quote! {span => ( #pat1 , #pat2 ) #fat_arrow #body , }
+        });
         let fat_arrow = fat_arrow(span);
         quote! {span =>
             fn eq(&self, other: &Self) -> bool {
@@ -1106,6 +1120,24 @@ fn partial_eq_expand(
             }
         }
     })
+}
+
+/// Whether the fields `names` of `self`'s and `other`'s variant are equal, each with the next.
+fn fields_eq(krate: &tt::Ident, names: &[tt::Ident], span: Span) -> tt::TopSubtree {
+    let Some((first, rest)) = names.split_first() else { return quote!(span =>true) };
+    let eq = |it: &tt::Ident| {
+        let t1 = tt::Ident::new(&format!("{}_self", it.sym), it.span);
+        let t2 = tt::Ident::new(&format!("{}_other", it.sym), it.span);
+        // By path, as rustc does: a type's own `eq` would be found first.
+        quote!(span =>#krate::cmp::PartialEq::eq(&#t1, &#t2))
+    };
+    let first = eq(first);
+    let rest = rest.iter().map(|it| {
+        let and_and = and_and(span);
+        let eq = eq(it);
+        quote!(span =>#and_and #eq)
+    });
+    quote!(span =>#first # #rest)
 }
 
 fn self_and_other_patterns(
@@ -1159,7 +1191,10 @@ fn ord_expand(
             }
         }
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
-        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span)).map(
+        // The discriminants are compared first: a variant without fields is then equal.
+        let enumeration = matches!(&adt.shape, AdtShape::Enum { .. });
+        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
+        let arms = arms.filter(|(_, _, fields)| !enumeration || !fields.is_empty()).map(
             |(pat1, pat2, fields)| {
                 let mut body = quote!(span =>#krate::cmp::Ordering::Equal);
                 for f in fields.into_iter().rev() {
@@ -1221,7 +1256,10 @@ fn partial_ord_expand(
         let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
 
         let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
-        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span)).map(
+        // The discriminants are compared first: a variant without fields is then equal.
+        let enumeration = matches!(&adt.shape, AdtShape::Enum { .. });
+        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
+        let arms = arms.filter(|(_, _, fields)| !enumeration || !fields.is_empty()).map(
             |(pat1, pat2, fields)| {
                 let mut body =
                     quote!(span =>#krate::option::Option::Some(#krate::cmp::Ordering::Equal));
