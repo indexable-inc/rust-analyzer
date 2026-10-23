@@ -636,13 +636,17 @@ fn live_regions_of<'db>(
 }
 
 /// The one region the bounds of the alias `ty` say it outlives: `Some(None)` for `'static`,
-/// `None` when they name none or several.
+/// `None` when they name none or several, or when `ty` is under a binder of its own type,
+/// `fn(T::Gat<'a, '_>)`, whose bounds rustc does not match.
 fn alias_bound<'db>(
     ctx: &Ctx<'_, 'db>,
     regions: &Regions<'db>,
     ty: Ty<'db>,
     alias: rustc_type_ir::AliasTy<DbInterner<'db>>,
 ) -> Option<Option<Rv>> {
+    if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
+        return None;
+    }
     let interner = ctx.infcx.interner;
     let erase = |ty: Ty<'db>| {
         rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))

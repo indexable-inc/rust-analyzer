@@ -146,6 +146,39 @@ fn names_const_item(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::E
     )
 }
 
+/// Whether the `const` item `expr` names has as its value what a function returns, which rustc
+/// takes to need dropping when its type does (`const S: String = String::new()`).
+fn const_item_called(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
+    use hir_def::resolver::{HasResolver, ValueNs};
+    let Expr::Path(path) = &ctx.store[expr] else { return false };
+    let owner = body.owner;
+    let mut resolver = owner.resolver(ctx.db);
+    let _guard = resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
+    let hygiene = ctx.store.expr_path_hygiene(expr);
+    let Some(ValueNs::ConstId(konst)) =
+        resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene)
+    else {
+        return false;
+    };
+    let def = DefWithBodyId::ConstId(konst);
+    let value = hir_def::expr_store::Body::of(ctx.db, def);
+    let infer = hir_ty::InferenceResult::of(ctx.db, InferBodyId::DefWithBodyId(def));
+    let mut root = value.root_expr();
+    while let Expr::Block { statements, tail: Some(tail), .. } = &value.store[root]
+        && statements.is_empty()
+    {
+        root = *tail;
+    }
+    match &value.store[root] {
+        Expr::MethodCall { .. } => true,
+        Expr::Call { callee, .. } => matches!(
+            infer.expr_ty(*callee).kind(),
+            TyKind::FnDef(def, _) if matches!(def.0, hir_def::CallableDefId::FunctionId(_))
+        ),
+        _ => false,
+    }
+}
+
 /// The locals a `static` is read through.
 pub(super) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
     let mut found = FxHashSet::default();
@@ -290,7 +323,12 @@ fn const_promotable(
                 },
                 _ => false,
             };
-            callable && all(args.to_vec())
+            // Not with an argument that needs dropping, `ManuallyDrop::new(String::new())`.
+            let dropped = args.iter().any(|&it| {
+                hir_ty::drop::has_drop_glue(&ctx.infcx, ctx.infer.expr_ty(it), ctx.env)
+                    != hir_ty::drop::DropGlue::None
+            });
+            callable && !dropped && all(args.to_vec())
         }
         _ => false,
     }
@@ -311,21 +349,37 @@ impl Loans {
             body.owner,
             InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_))
         );
+        let (promoted, rejected): (Vec<_>, Vec<_>) =
+            body.promoted_locals.iter().partition(|&&(local, expr)| {
+                // rustc promotes no call, not even of a `const fn` in a `const` block.
+                item || (!is_call(ctx, expr)
+                    && (ctx.is_plain(body.locals[local].ty.as_ref())
+                        || is_unit_value(ctx, expr)
+                        || (names_const_item(ctx, body, expr)
+                            && hir_ty::drop::is_freeze(
+                                ctx.db,
+                                ctx.infcx.interner,
+                                body.locals[local].ty.as_ref(),
+                            )
+                            && !const_item_called(ctx, body, expr))))
+            });
+        // Nor what borrows one it does not promote, `&&TEST_DROP`.
+        let rejected: FxHashSet<hir_def::hir::ExprId> =
+            rejected.into_iter().map(|&(_, expr)| expr).collect();
+        let borrows_rejected = |expr: hir_def::hir::ExprId| {
+            let mut stack = vec![expr];
+            while let Some(expr) = stack.pop() {
+                if rejected.contains(&expr) {
+                    return true;
+                }
+                ctx.store.walk_child_exprs(expr, |it| stack.push(it));
+            }
+            false
+        };
         statics.extend(
-            body.promoted_locals
-                .iter()
-                .filter(|&&(local, expr)| {
-                    // rustc promotes no call, not even of a `const fn` in a `const` block.
-                    item || (!is_call(ctx, expr)
-                        && (ctx.is_plain(body.locals[local].ty.as_ref())
-                            || is_unit_value(ctx, expr)
-                            || (names_const_item(ctx, body, expr)
-                                && hir_ty::drop::is_freeze(
-                                    ctx.db,
-                                    ctx.infcx.interner,
-                                    body.locals[local].ty.as_ref(),
-                                ))))
-                })
+            promoted
+                .into_iter()
+                .filter(|&&(_, expr)| rejected.is_empty() || !borrows_rejected(expr))
                 .map(|&(local, _)| local),
         );
         if item {

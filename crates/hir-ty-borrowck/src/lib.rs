@@ -95,6 +95,21 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     if infer.has_type_mismatches() || infer.is_erroneous() {
         return result;
     }
+    // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
+    // borrow checked; a `const` is checked all the same.
+    if let DefWithBodyId::StaticId(it) = def
+        && let Some(ty) = db.value_ty(it.into())
+        && {
+            use hir_ty::next_solver::TyKind;
+            use rustc_type_ir::inherent::IntoKind;
+            matches!(
+                ty.instantiate_identity().skip_norm_wip().kind(),
+                TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..)
+            )
+        }
+    {
+        return result;
+    }
     let body = match db.mir_body(owner) {
         Ok(body) => body,
         Err(error) => {
@@ -143,15 +158,69 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     for (body, closure, inline_const) in bodies.into_iter().rev() {
         let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
         ctx.inline_const = inline_const.is_some();
+        if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
+            return result;
+        }
         let mut found = Vec::new();
         let needs = check::check(&ctx, body, &requirements, &mut found);
+        if ctx.tainted.get() {
+            return result;
+        }
         diagnostics.push(found);
         if let Some(nested) = closure.or(inline_const) {
             requirements.insert(nested, needs);
         }
     }
     result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
+    if std::env::var_os("RA_JIT_BORROWCK_DEBUG").is_some() {
+        for it in &result.diagnostics {
+            eprintln!("diagnostic {it:?}");
+        }
+    }
     result
+}
+
+/// rustc's E0493, from checking a const context before borrow checking it: a `const` or
+/// `static` item or a `const fn` drops a value of a type with drop glue, and rustc does not
+/// borrow check it. What is moved out of, in part too, is taken not to be dropped.
+fn drops_in_const(ctx: &Ctx<'_, '_>, def: DefWithBodyId, body: &MirBody<'_>) -> bool {
+    use hir_ty::mir::{OperandKind, TerminatorKind};
+    let const_context = match def {
+        DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_) => true,
+        DefWithBodyId::FunctionId(it) => {
+            hir_def::signatures::FunctionSignature::of(ctx.db, it).is_const()
+        }
+        _ => false,
+    };
+    if !const_context {
+        return false;
+    }
+    let mut moved = rustc_hash::FxHashSet::default();
+    let mut visit = |operand: &hir_ty::mir::Operand| {
+        if let OperandKind::Move(place) = &operand.kind {
+            moved.insert(place.local);
+        }
+    };
+    for (_, block) in body.basic_blocks.iter() {
+        for it in &block.statements {
+            it.kind.for_each_operand(&mut visit);
+        }
+        if let Some(terminator) = &block.terminator {
+            terminator.kind.for_each_operand(&mut visit);
+        }
+    }
+    body.basic_blocks.iter().any(|(_, block)| {
+        let Some(terminator) = &block.terminator else { return false };
+        let TerminatorKind::Drop { place, .. } = &terminator.kind else { return false };
+        place.projection.as_slice().is_empty()
+            && place.local != return_slot()
+            && !moved.contains(&place.local)
+            && hir_ty::drop::has_drop_glue(
+                &ctx.infcx,
+                body.locals[place.local].ty.as_ref(),
+                ctx.env,
+            ) == hir_ty::drop::DropGlue::HasDropGlue
+    })
 }
 
 /// The coroutines `body` makes, in the order it makes them.
@@ -227,6 +296,9 @@ pub(crate) struct Ctx<'a, 'db> {
     /// For each expression in a `match` arm's guard, the variables the arm's pattern binds:
     /// rustc binds them by reference in the guard, so it cannot move out of them.
     pub(crate) guard_bindings: FxHashMap<ExprId, Vec<BindingId>>,
+    /// A where clause of a call does not hold, rustc's E0277, which rust-analyzer does not
+    /// report: rustc does not borrow check a body whose type check fails.
+    pub(crate) tainted: std::cell::Cell<bool>,
 }
 
 fn guard_bindings(store: &ExpressionStore) -> FxHashMap<ExprId, Vec<BindingId>> {
@@ -319,6 +391,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             closure_expr: closure,
             inline_const: false,
             guard_bindings: guard_bindings(store),
+            tainted: std::cell::Cell::new(false),
         }
     }
 

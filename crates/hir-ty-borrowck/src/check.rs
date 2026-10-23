@@ -72,6 +72,9 @@ pub(super) fn check<'db>(
         if !regions.members.is_empty() {
             eprintln!("members {:?} choices {:?}", regions.members, regions.choices);
         }
+        for test in &regions.type_tests {
+            eprintln!("type test {:?}: '{} at {:?}", test.ty, test.lower, test.span);
+        }
         for constraint in &regions.outlives {
             eprintln!("{constraint:?}");
         }
@@ -574,6 +577,22 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     }
 
     fn report(&mut self, code: &'static str, span: MirSpan, message: String) {
+        use hir_def::hir::{ClosureKind, CoroutineSource, Expr};
+        // An `async` closure's future is lowered around its body with no syntax of its own;
+        // rustc points at the body.
+        let span = match span {
+            MirSpan::ExprId(expr)
+                if let Expr::Closure {
+                    body,
+                    closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
+                    ..
+                } = self.ctx.store[expr]
+                    && let Expr::Block { tail: Some(tail), .. } = self.ctx.store[body] =>
+            {
+                MirSpan::ExprId(tail)
+            }
+            _ => span,
+        };
         self.errors.push(Some(BorrowckDiagnostic { code, span, message, at_signature: false }));
     }
 
@@ -1321,6 +1340,17 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         })
     }
 
+    /// Whether the body is an `async` closure's, whose captured variables rustc says cannot
+    /// escape as a lifetime that may not live long enough.
+    fn async_closure(&self) -> bool {
+        self.body.param_locals.first().is_some_and(|&env| {
+            matches!(
+                self.regions.local_tys[env.into_raw().into_u32() as usize].kind(),
+                TyKind::Ref(_, inner, _) if matches!(inner.kind(), TyKind::CoroutineClosure(..))
+            )
+        })
+    }
+
     /// Whether the region `rv` is in the type of what a closure captures or of one of its
     /// parameters, which rustc's E0521 names as where the data comes from or goes; the
     /// closure's reference to itself is neither, nor is `'static`.
@@ -1338,6 +1368,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let captured = match env.kind() {
             TyKind::Closure(_, args) => Some(args.as_closure().tupled_upvars_ty()),
             TyKind::Coroutine(_, args) => Some(args.as_coroutine().tupled_upvars_ty()),
+            TyKind::CoroutineClosure(_, args) => {
+                Some(args.as_coroutine_closure().tupled_upvars_ty())
+            }
             _ => None,
         };
         let interner = self.ctx.infcx.interner;
@@ -1398,6 +1431,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 && blamed.category == Category::Return
                 && self.regions.closure_env == Some(longer)
                 && self.ctx.closure_kind == Some(rustc_type_ir::ClosureKind::FnMut)
+                && !self.async_closure()
             {
                 ("", "captured variable cannot escape `FnMut` closure body".to_owned())
             } else if escapes
@@ -1856,6 +1890,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             Access::Mutate => ("E0594", "assign to"),
             _ => ("E0596", "borrow"),
         };
+        // rustc's `access_place_error_reported`: a borrow of a variable that is this error is
+        // not also one that does not live long enough.
+        if place.projection.is_empty() {
+            self.dead_reported.insert((place.local, span));
+        }
         let name = self.quoted(place, "data");
         let reason = if root == usize::MAX {
             match access {
