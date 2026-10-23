@@ -481,6 +481,11 @@ impl DependencyBuilder {
 }
 
 impl BuiltDependency {
+    /// A dependency of a crate added after the graph was built, in the extern prelude.
+    pub fn new(name: CrateName, crate_id: Crate) -> Self {
+        Self { name, crate_id, prelude: true, sysroot: false }
+    }
+
     /// Whether this dependency is to be added to the depending crate's extern prelude.
     pub fn is_prelude(&self) -> bool {
         self.prelude
