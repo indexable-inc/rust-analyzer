@@ -261,6 +261,9 @@ pub struct TyLoweringContext<'db, 'a> {
     forbid_params_after_reason: ForbidParamsAfterReason,
     pub(crate) defined_anon_consts: ThinVec<AnonConstId<'db>>,
     infer_vars: Option<&'a mut dyn TyLoweringInferVarsCtx<'db>>,
+    /// Lifetimes left out (`&u8`, `'_`) that no signature binds are region variables, not
+    /// errors, as the borrow checker lowers a type written in a body.
+    elided_region_vars: bool,
     is_lowering_impl_trait_bounds: bool,
     bound_vars: Vec<(Vec<Name>, BoundVarKinds<'db>)>,
     elisions: Vec<Elision<'db>>,
@@ -304,6 +307,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             forbid_params_after_reason: ForbidParamsAfterReason::AnonConst,
             defined_anon_consts: ThinVec::new(),
             infer_vars: None,
+            elided_region_vars: false,
             is_lowering_impl_trait_bounds: false,
             bound_vars,
             elisions: Vec::new(),
@@ -366,6 +370,11 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     pub(crate) fn push_diagnostic(&mut self, diagnostic: TyLoweringDiagnostic) {
         self.diagnostics.push(diagnostic);
+    }
+
+    pub fn with_elided_region_vars(mut self) -> Self {
+        self.elided_region_vars = true;
+        self
     }
 
     fn push_infer_vars_not_allowed(&mut self, span: Span) {
@@ -754,7 +763,11 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 // FIXME: It should infer the eldided lifetimes instead of stubbing with error
                 let lifetime = match ref_.lifetime {
                     Some(lifetime) => self.lower_lifetime(lifetime),
-                    None => self.elided_lifetime().unwrap_or(self.types.regions.error),
+                    None => match self.elided_lifetime() {
+                        Some(region) => region,
+                        None if self.elided_region_vars => self.next_region_var(Span::Dummy),
+                        None => self.types.regions.error,
+                    },
                 };
                 let inner_ty = match &self.store[ref_.ty] {
                     // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
@@ -1532,10 +1545,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     pub(crate) fn lower_lifetime(&mut self, lifetime: LifetimeRefId) -> Region<'db> {
-        if let LifetimeRef::Placeholder = self.store[lifetime]
-            && let Some(region) = self.elided_lifetime()
-        {
-            return region;
+        if let LifetimeRef::Placeholder = self.store[lifetime] {
+            if let Some(region) = self.elided_lifetime() {
+                return region;
+            }
+            if self.elided_region_vars {
+                return self.next_region_var(Span::Dummy);
+            }
         }
         let region = self.named_region(lifetime);
         self.named_lifetime(region);

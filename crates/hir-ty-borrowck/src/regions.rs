@@ -39,6 +39,29 @@ use super::{
 /// A region variable.
 pub(super) type Rv = usize;
 
+/// Inference variables for lowering a written type in a body, `_` and lifetimes left out.
+struct InferVars<'a, 'db>(&'a hir_ty::next_solver::infer::InferCtxt<'db>);
+impl<'db> hir_ty::TyLoweringInferVarsCtx<'db> for InferVars<'_, 'db> {
+    fn next_ty_var(&mut self, span: hir_ty::Span) -> Ty<'db> {
+        self.0.next_ty_var(span)
+    }
+    fn next_const_var(&mut self, span: hir_ty::Span) -> hir_ty::next_solver::Const<'db> {
+        self.0.next_const_var(span)
+    }
+    fn next_region_var(&mut self, span: hir_ty::Span) -> Region<'db> {
+        self.0.next_region_var(span)
+    }
+}
+
+/// A `let` with a type written out, in the block it is a statement of.
+#[derive(Clone, Copy)]
+struct Annotation {
+    pat: hir_def::hir::PatId,
+    type_ref: hir_def::type_ref::TypeRefId,
+    initializer: Option<hir_def::hir::ExprId>,
+    block: hir_def::hir::ExprId,
+}
+
 /// Why one region outlives another, as rustc's `ConstraintCategory`; the most interesting
 /// first, which is the order errors pick the constraint to point at by.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -947,15 +970,28 @@ impl<'db> Builder<'_, '_, 'db> {
         // A variable with a type written out keeps the lifetimes the type names, as rustc
         // relates it to the annotation.
         let annotated = self.annotated_locals();
-        self.annotated = annotated.clone();
+        self.annotated = annotated.keys().copied().collect();
         for (local, data) in body.locals.iter() {
-            let slot = &mut local_tys[local.into_raw().into_u32() as usize];
-            if slot.is_some() {
+            let index = local.into_raw().into_u32() as usize;
+            if local_tys[index].is_some() {
                 continue;
             }
             let ty = data.ty.as_ref();
-            *slot =
-                Some(if annotated.contains(&local) { self.written(ty) } else { self.renumber(ty) });
+            local_tys[index] = Some(match annotated.get(&local) {
+                Some(&annotation) => self
+                    .annotation_ty(annotation)
+                    .filter(|it| {
+                        let interner = self.interner();
+                        let erase = |ty: Ty<'db>| {
+                            rustc_type_ir::fold_regions(interner, ty, |_, _| {
+                                Region::new_static(interner)
+                            })
+                        };
+                        erase(*it) == erase(ty)
+                    })
+                    .unwrap_or_else(|| self.written(ty)),
+                None => self.renumber(ty),
+            });
         }
         self.regions.local_tys = local_tys.into_iter().map(|it| it.unwrap()).collect();
     }
@@ -1141,23 +1177,24 @@ impl<'db> Builder<'_, '_, 'db> {
     /// What a `let` with a type written out requires, as rustc's user type annotations: that
     /// the type is well-formed, and for a `_` pattern that the value has the type.
     fn annotations(&mut self) {
-        let mut lets = Vec::new();
-        for (_, expr) in self.ctx.store.exprs() {
-            let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
-            for statement in statements.iter() {
-                if let Statement::Let { pat, type_ref: Some(_), initializer, .. } = statement {
-                    lets.push((*pat, *initializer));
-                }
-            }
-        }
+        let lets = self.lets();
         self.pattern_paths();
         self.path_arguments();
         self.closure_annotations();
-        for (pat, initializer) in lets {
-            let Some(ty) = self.ctx.infer.type_of_pat.get(pat).map(|it| it.as_ref()) else {
-                continue;
+        for annotation in lets {
+            let (pat, initializer) = (annotation.pat, annotation.initializer);
+            // A variable with a type written out has it, lifetimes and all.
+            let local = match self.ctx.store[pat] {
+                Pat::Bind { id, subpat: None } => self.body.binding_locals.get(id).copied(),
+                _ => None,
             };
-            let ty = self.written(ty);
+            let ty = match local {
+                Some(local) if self.annotated.contains(&local) => {
+                    Some(self.regions.local_tys[local.into_raw().into_u32() as usize])
+                }
+                _ => self.annotation_ty(annotation),
+            };
+            let Some(ty) = ty else { continue };
             let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
             self.well_formed(ty, at, 0);
             if !matches!(self.ctx.store[pat], Pat::Bind { subpat: None, .. }) {
@@ -1406,9 +1443,15 @@ impl<'db> Builder<'_, '_, 'db> {
             let Some(value) = value else { continue };
             let ty = self.written(ty);
             let at = At { category: Category::TypeAnnotation, span: MirSpan::PatId(pat) };
-            if let Pat::Path(_) = self.ctx.store[pat] {
-                // A constant's value is compared with `PartialEq<Self>`, both sides of a type
-                // they are subtypes of: `x: &'x str` matches a `&'static str`.
+            if let Pat::Path(_) = self.ctx.store[pat]
+                && let Some(constant) = self.pattern_constant(pat)
+            {
+                // rustc ascribes a constant's type to what it matches contravariantly:
+                // `x: &'x str` matches a `&'static str`, a `&'a str` only matches a
+                // `&'static str` if `'a: 'static`.
+                let constant = self.regions.local_tys[constant.into_raw().into_u32() as usize];
+                self.relate(constant, value, Variance::Covariant, at);
+            } else if let Pat::Path(_) = self.ctx.store[pat] {
                 let common = self.renumber(value);
                 self.relate(value, common, Variance::Covariant, at);
                 self.relate(ty, common, Variance::Covariant, at);
@@ -1416,6 +1459,22 @@ impl<'db> Builder<'_, '_, 'db> {
                 self.relate(value, ty, Variance::Covariant, at);
             }
         }
+    }
+
+    /// The local a constant pattern's value is put in to be compared.
+    fn pattern_constant(&self, pat: hir_def::hir::PatId) -> Option<LocalId> {
+        self.body.basic_blocks.iter().find_map(|(_, block)| {
+            block.statements.iter().find_map(|statement| match &statement.kind {
+                StatementKind::Assign(place, Rvalue::Use(operand))
+                    if statement.span == MirSpan::PatId(pat)
+                        && matches!(operand.kind, OperandKind::Constant { .. })
+                        && place.as_ref().projection.as_slice().is_empty() =>
+                {
+                    Some(place.as_ref().local)
+                }
+                _ => None,
+            })
+        })
     }
 
     /// The place the `let` of the pattern `pat` reads its value from: the fake read lowered at
@@ -1552,16 +1611,32 @@ impl<'db> Builder<'_, '_, 'db> {
         }
     }
 
-    fn annotated_locals(&self) -> FxHashSet<LocalId> {
-        let mut found = FxHashSet::default();
-        for (_, expr) in self.ctx.store.exprs() {
+    fn annotated_locals(&self) -> FxHashMap<LocalId, Annotation> {
+        let mut found = FxHashMap::default();
+        for annotation in self.lets() {
+            if let Pat::Bind { id, subpat: None } = self.ctx.store[annotation.pat]
+                && let Some(&local) = self.body.binding_locals.get(id)
+            {
+                found.insert(local, annotation);
+            }
+        }
+        found
+    }
+
+    /// The `let`s with a type written out.
+    fn lets(&self) -> Vec<Annotation> {
+        let mut found = Vec::new();
+        for (block, expr) in self.ctx.store.exprs() {
             let hir_def::hir::Expr::Block { statements, .. } = expr else { continue };
             for statement in statements.iter() {
-                if let Statement::Let { pat, type_ref: Some(_), .. } = statement
-                    && let Pat::Bind { id, subpat: None } = self.ctx.store[*pat]
-                    && let Some(&local) = self.body.binding_locals.get(id)
+                if let Statement::Let { pat, type_ref: Some(type_ref), initializer, .. } = statement
                 {
-                    found.insert(local);
+                    found.push(Annotation {
+                        pat: *pat,
+                        type_ref: *type_ref,
+                        initializer: *initializer,
+                        block,
+                    });
                 }
             }
         }
@@ -2438,11 +2513,13 @@ impl<'db> Builder<'_, '_, 'db> {
             keep_static,
             erase: true,
         });
+        let mut vars = FxHashMap::default();
         rustc_type_ir::fold_regions(self.interner(), value, |region, depth| match region.kind() {
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {
                 self.signature_region(region, depth).unwrap_or_else(|| self.fresh())
             }
             RegionKind::ReBound(..) => region,
+            RegionKind::ReVar(_) => *vars.entry(region).or_insert_with(|| self.fresh()),
             _ => self.fresh(),
         })
     }
@@ -2658,6 +2735,10 @@ impl<'db> Builder<'_, '_, 'db> {
                 hir_def::hir::Expr::Path(path) => Some(path),
                 _ => None,
             },
+            MirSpan::PatId(pat) => match &self.ctx.store[pat] {
+                Pat::Path(path) => Some(path),
+                _ => None,
+            },
             _ => None,
         };
         let args = match path {
@@ -2761,6 +2842,85 @@ impl<'db> Builder<'_, '_, 'db> {
         self.lowering(span, |ctx| ctx.lower_ty(type_ref))
     }
 
+    /// A `let`'s written type with a region variable for each lifetime it leaves out, so an
+    /// alias that uses its lifetime twice (`type P<'a> = (&'a u32, &'a u32)`) shares it, as
+    /// rustc's user type annotation does. Its `_`s are type variables.
+    fn lower_annotation(&self, type_ref: hir_def::type_ref::TypeRefId, span: MirSpan) -> Ty<'db> {
+        self.lowering_with(span, true, |ctx| ctx.lower_ty(type_ref))
+    }
+
+    /// The type of a `let` with a type written out, with the lifetimes it names: its written
+    /// type where that is the type inferred for it, else the inferred type.
+    fn annotation_ty(&mut self, annotation: Annotation) -> Option<Ty<'db>> {
+        let inferred = self.ctx.infer.type_of_pat.get(annotation.pat)?.as_ref();
+        let lowered = self.lower_annotation(annotation.type_ref, MirSpan::ExprId(annotation.block));
+        let ty = self.zip_annotation(lowered, inferred, &mut FxHashMap::default(), 0);
+        Some(self.written(ty.unwrap_or(inferred)))
+    }
+
+    /// The written type `lowered` with each `_` in it the type inferred there, the same
+    /// regions wherever the same `_` stands; `None` where the two differ otherwise.
+    fn zip_annotation(
+        &self,
+        lowered: Ty<'db>,
+        inferred: Ty<'db>,
+        holes: &mut FxHashMap<Ty<'db>, Ty<'db>>,
+        depth: usize,
+    ) -> Option<Ty<'db>> {
+        let interner = self.interner();
+        if depth > 16 {
+            return None;
+        }
+        let mut zip = |a: Ty<'db>, b: Ty<'db>| self.zip_annotation(a, b, holes, depth + 1);
+        Some(match (lowered.kind(), inferred.kind()) {
+            (TyKind::Infer(rustc_type_ir::InferTy::TyVar(_)), _) => {
+                *holes.entry(lowered).or_insert_with(|| self.renumber(inferred))
+            }
+            (TyKind::Ref(region, a, m), TyKind::Ref(_, b, n)) if m == n => {
+                Ty::new_ref(interner, region, zip(a, b)?, m)
+            }
+            (TyKind::RawPtr(a, m), TyKind::RawPtr(b, n)) if m == n => {
+                Ty::new(interner, TyKind::RawPtr(zip(a, b)?, m))
+            }
+            (TyKind::Slice(a), TyKind::Slice(b)) => Ty::new(interner, TyKind::Slice(zip(a, b)?)),
+            (TyKind::Array(a, len), TyKind::Array(b, inferred_len)) => {
+                let len =
+                    if matches!(len.kind(), ConstKind::Infer(_)) { inferred_len } else { len };
+                Ty::new(interner, TyKind::Array(zip(a, b)?, len))
+            }
+            (TyKind::Tuple(a), TyKind::Tuple(b)) if a.len() == b.len() => {
+                let tys: Option<Vec<_>> = a.iter().zip(b.iter()).map(|(a, b)| zip(a, b)).collect();
+                Ty::new_tup(interner, &tys?)
+            }
+            (TyKind::Adt(def, a), TyKind::Adt(inferred_def, b))
+                if def == inferred_def && a.len() == b.len() =>
+            {
+                let mut args = Vec::with_capacity(a.len());
+                for (a, b) in a.iter().zip(b.iter()) {
+                    args.push(match (a.kind(), b.kind()) {
+                        (GenericArgKind::Type(a), GenericArgKind::Type(b)) => zip(a, b)?.into(),
+                        (GenericArgKind::Const(a), GenericArgKind::Const(_))
+                            if matches!(a.kind(), ConstKind::Infer(_)) =>
+                        {
+                            b
+                        }
+                        _ => a,
+                    });
+                }
+                Ty::new(interner, TyKind::Adt(def, GenericArgs::new_from_iter(args)))
+            }
+            _ => {
+                let erase = |ty: Ty<'db>| {
+                    rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
+                };
+                if erase(lowered) != erase(inferred) {
+                    return None;
+                }
+                lowered
+            }
+        })
+    }
+
     /// The type a value path's qualifier spells out with generic arguments, `A<'a>` of
     /// `A::<'a>::C`, lowered as `lower_written` lowers.
     fn lower_written_qualifier(
@@ -2779,6 +2939,15 @@ impl<'db> Builder<'_, '_, 'db> {
         span: MirSpan,
         f: impl FnOnce(&mut hir_ty::TyLoweringContext<'db, '_>) -> T,
     ) -> T {
+        self.lowering_with(span, false, f)
+    }
+
+    fn lowering_with<T>(
+        &self,
+        span: MirSpan,
+        vars: bool,
+        f: impl FnOnce(&mut hir_ty::TyLoweringContext<'db, '_>) -> T,
+    ) -> T {
         let db = self.ctx.db;
         let store_owner = self.ctx.owner.expression_store_owner(db);
         let mut resolver = store_owner.resolver(db);
@@ -2787,6 +2956,7 @@ impl<'db> Builder<'_, '_, 'db> {
             _ => None,
         };
         let generics = std::cell::OnceCell::new();
+        let mut infer_vars = InferVars(&self.ctx.infcx);
         let mut ctx = hir_ty::TyLoweringContext::new(
             db,
             &resolver,
@@ -2796,7 +2966,11 @@ impl<'db> Builder<'_, '_, 'db> {
             &generics,
             hir_ty::LifetimeElisionKind::Infer,
             hir_ty::LifetimeLoweringMode::LateParam,
-        );
+        )
+        .with_infer_vars_behavior(vars.then_some(&mut infer_vars as _));
+        if vars {
+            ctx = ctx.with_elided_region_vars();
+        }
         f(&mut ctx)
     }
 
