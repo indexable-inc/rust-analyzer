@@ -64,6 +64,7 @@ pub fn is_freeze<'db>(db: &'db dyn HirDatabase, interner: DbInterner<'db>, ty: T
             is_freeze(db, interner, element)
         }
         TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(db, interner, field)),
+        TyKind::Closure(_, args) => is_freeze(db, interner, args.as_closure().tupled_upvars_ty()),
         TyKind::Adt(def, args) => {
             let variants: Vec<hir_def::VariantId> = match def.def_id() {
                 AdtId::StructId(id) => {

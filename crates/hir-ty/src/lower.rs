@@ -264,6 +264,11 @@ pub struct TyLoweringContext<'db, 'a> {
     /// Lifetimes left out (`&u8`, `'_`) that no signature binds are region variables, not
     /// errors, as the borrow checker lowers a type written in a body.
     elided_region_vars: bool,
+    /// Lowering an impl's self type or trait, where rustc makes an elided lifetime a fresh
+    /// parameter of the impl: the trait object behind such a reference has its lifetime, an
+    /// error as the reference's is, not `'static`, so `impl Params for &[&dyn ToSql]` holds
+    /// for `&[&name as &dyn ToSql]`.
+    impl_header: bool,
     is_lowering_impl_trait_bounds: bool,
     bound_vars: Vec<(Vec<Name>, BoundVarKinds<'db>)>,
     elisions: Vec<Elision<'db>>,
@@ -308,6 +313,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             defined_anon_consts: ThinVec::new(),
             infer_vars: None,
             elided_region_vars: false,
+            impl_header: false,
             is_lowering_impl_trait_bounds: false,
             bound_vars,
             elisions: Vec::new(),
@@ -771,7 +777,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 };
                 let inner_ty = match &self.store[ref_.ty] {
                     // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
-                    TypeRef::DynTrait(bounds) if !lifetime.is_error() => {
+                    TypeRef::DynTrait(bounds) if !lifetime.is_error() || self.impl_header => {
                         self.lower_dyn_trait(bounds, lifetime)
                     }
                     _ => self.lower_ty(ref_.ty),
@@ -1719,6 +1725,7 @@ pub(crate) fn impl_trait_with_diagnostics<'db>(
         LifetimeElisionKind::AnonymousCreateParameter { report_in_path: true },
         LifetimeLoweringMode::Bound,
     );
+    ctx.impl_header = true;
     let self_ty = db.impl_self_ty(impl_id).skip_binder();
     let target_trait = impl_data.target_trait?;
     let trait_ref = ctx.lower_trait_ref(target_trait, self_ty)?;
@@ -2051,6 +2058,7 @@ pub(crate) fn impl_self_ty_with_diagnostics<'db>(
         LifetimeElisionKind::AnonymousCreateParameter { report_in_path: true },
         LifetimeLoweringMode::Bound,
     );
+    ctx.impl_header = true;
     let ty = ctx.lower_ty(impl_data.self_ty);
     assert!(!ty.has_escaping_bound_vars());
     TyLoweringResult::from_ctx(StoredEarlyBinder::bind(ty.store()), ctx)

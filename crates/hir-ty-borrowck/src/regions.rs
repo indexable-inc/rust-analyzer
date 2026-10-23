@@ -2483,6 +2483,10 @@ impl<'db> Builder<'_, '_, 'db> {
             erase: false,
         };
         let typed = rustc_type_ir::TypeFoldable::fold_with(typed, &mut defaults);
+        let typed = match self.async_declared_output(function) {
+            Some(declared) => self.unnamed_hidden(typed, declared),
+            None => typed,
+        };
         let elided = self.elided_output;
         let declared = rustc_type_ir::fold_regions(self.interner(), typed, |region, depth| {
             match region.kind() {
@@ -2501,6 +2505,69 @@ impl<'db> Builder<'_, '_, 'db> {
         self.async_output_members(function, output, span);
     }
 
+    /// The `Output` of the `impl Future` an `async fn` returns, as its signature declares it.
+    fn async_declared_output(&self, function: hir_def::FunctionId) -> Option<Ty<'db>> {
+        use rustc_type_ir::Interner as _;
+        let interner = self.interner();
+        let sig = self
+            .ctx
+            .db
+            .callable_item_signature(CallableDefId::FunctionId(function))
+            .instantiate_identity()
+            .skip_norm_wip()
+            .skip_binder();
+        let TyKind::Alias(future) = sig.output().kind() else { return None };
+        interner
+            .item_bounds(future.kind.def_id())
+            .iter_instantiated(interner, future.args.as_slice())
+            .find_map(|clause| match clause.kind().skip_binder() {
+                ClauseKind::Projection(projection) => projection.term.as_type(),
+                _ => None,
+            })
+    }
+
+    /// `typed` with fresh regions where `declared` has an `impl Trait`: the lifetimes of a
+    /// hidden type are rustc's to choose by member constraints, not the ones type inference
+    /// unified, so `I { index: self, req }` of `-> Result<impl Iterator + 'b>` with `'a: 'b`
+    /// can be `I<'b>`.
+    fn unnamed_hidden(&self, typed: Ty<'db>, declared: Ty<'db>) -> Ty<'db> {
+        let interner = self.interner();
+        let zip = |typed: GenericArgs<'db>, declared: GenericArgs<'db>| {
+            GenericArgs::new_from_iter(typed.iter().zip(declared.iter()).map(|(it, other)| match (
+                it.ty(),
+                other.ty(),
+            ) {
+                (Some(it), Some(other)) => self.unnamed_hidden(it, other).into(),
+                _ => it,
+            }))
+        };
+        match (typed.kind(), declared.kind()) {
+            (kind, TyKind::Alias(alias))
+                if matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. })
+                    && !matches!(kind, TyKind::Alias(_)) =>
+            {
+                rustc_type_ir::fold_regions(interner, typed, |_, _| self.fresh())
+            }
+            (TyKind::Adt(def, args), TyKind::Adt(other, declared))
+                if def == other && args.len() == declared.len() =>
+            {
+                Ty::new(interner, TyKind::Adt(def, zip(args, declared)))
+            }
+            (TyKind::Tuple(tys), TyKind::Tuple(declared)) if tys.len() == declared.len() => {
+                let tys: Vec<Ty<'db>> = tys
+                    .iter()
+                    .zip(declared.iter())
+                    .map(|(it, other)| self.unnamed_hidden(it, other))
+                    .collect();
+                Ty::new_tup(interner, &tys)
+            }
+            (TyKind::Ref(region, ty, mutability), TyKind::Ref(_, other, _)) => {
+                Ty::new_ref(interner, region, self.unnamed_hidden(ty, other), mutability)
+            }
+            _ => typed,
+        }
+    }
+
     /// rustc's member constraints for an `impl Trait` an `async fn` declares it returns: the
     /// regions of the future's `output` are of its hidden type.
     fn async_output_members(
@@ -2511,22 +2578,7 @@ impl<'db> Builder<'_, '_, 'db> {
     ) {
         use rustc_type_ir::Interner as _;
         let interner = self.interner();
-        let sig = self
-            .ctx
-            .db
-            .callable_item_signature(CallableDefId::FunctionId(function))
-            .instantiate_identity()
-            .skip_norm_wip()
-            .skip_binder();
-        let TyKind::Alias(future) = sig.output().kind() else { return };
-        let inner = interner
-            .item_bounds(future.kind.def_id())
-            .iter_instantiated(interner, future.args.as_slice())
-            .find_map(|clause| match clause.kind().skip_binder() {
-                ClauseKind::Projection(projection) => projection.term.as_type(),
-                _ => None,
-            });
-        let Some(inner) = inner else { return };
+        let Some(inner) = self.async_declared_output(function) else { return };
         let TyKind::Alias(alias) = inner.kind() else { return };
         let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind else { return };
         let Some(captured) = opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())

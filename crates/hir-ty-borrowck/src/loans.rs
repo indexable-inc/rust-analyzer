@@ -337,12 +337,10 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
             && temp(local)
             && match defs.get(&local) {
                 Some(Some(Rvalue::Use(it))) => operand(it),
+                // A closure that captures nothing too, `unwrap_or(&|_| true)`.
                 Some(Some(Rvalue::Aggregate(kind, operands))) => {
-                    !matches!(
-                        kind,
-                        hir_ty::mir::AggregateKind::Union(..)
-                            | hir_ty::mir::AggregateKind::Closure(_)
-                    ) && operands.iter().all(operand)
+                    !matches!(kind, hir_ty::mir::AggregateKind::Union(..))
+                        && operands.iter().all(operand)
                 }
                 _ => false,
             }

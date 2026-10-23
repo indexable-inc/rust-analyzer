@@ -63,6 +63,18 @@ pub fn mode() -> Mode {
     *MODE
 }
 
+/// `RA_JIT_BORROWCK_DEBUG=1` prints the regions, constraints and loans of every body checked,
+/// `RA_JIT_BORROWCK_DEBUG=name` those of the functions called `name` and their closures.
+pub(crate) fn debugging(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> bool {
+    let Ok(wanted) = std::env::var("RA_JIT_BORROWCK_DEBUG") else { return false };
+    match owner {
+        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) if wanted != "1" => {
+            hir_def::signatures::FunctionSignature::of(db, it).name.as_str() == wanted
+        }
+        _ => wanted == "1",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 pub struct BorrowckDiagnostic {
     /// rustc's error code, as `E0382`, or `unused_mut` for the lint the borrow checker gives.
@@ -175,7 +187,7 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
         }
     }
     result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
-    if std::env::var_os("RA_JIT_BORROWCK_DEBUG").is_some() {
+    if debugging(db, owner) {
         for it in &result.diagnostics {
             eprintln!("diagnostic {it:?}");
         }
