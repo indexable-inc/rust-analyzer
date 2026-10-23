@@ -2842,6 +2842,22 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
             }
             (TyKind::Alias(x), TyKind::Alias(y)) if x.kind == y.kind => {
+                // Two projections are what they normalize to, as rustc relates them
+                // normalized: `<S as Q>::Item<'w, 's>` and `<S as Q>::Item<'w, 'static>` are
+                // both `&'w S` when the impl's `Item<'w, 's>` is.
+                if matches!(x.kind, rustc_type_ir::AliasTyKind::Projection { .. }) {
+                    let normalized_a = self.normalize(a).filter(|&it| it != a);
+                    let normalized_b = self.normalize(b).filter(|&it| it != b);
+                    if normalized_a.is_some() || normalized_b.is_some() {
+                        let (a, b) = (normalized_a.unwrap_or(a), normalized_b.unwrap_or(b));
+                        if !matches!(a.kind(), TyKind::Infer(_))
+                            && !matches!(b.kind(), TyKind::Infer(_))
+                        {
+                            self.relate(a, b, variance, at);
+                        }
+                        return;
+                    }
+                }
                 let variances = match x.kind {
                     rustc_type_ir::AliasTyKind::Opaque { .. } => {
                         opaque_captures(self.ctx.db, x.kind.def_id(), x.args.len()).map(|it| {

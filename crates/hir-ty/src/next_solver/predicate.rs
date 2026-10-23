@@ -459,6 +459,10 @@ impl<'db> ParamEnv<'db> {
         ParamEnv { clauses: Clauses::empty() }
     }
 
+    pub fn new(clauses: Clauses<'db>) -> Self {
+        ParamEnv { clauses }
+    }
+
     pub fn clauses(self) -> Clauses<'db> {
         self.clauses
     }

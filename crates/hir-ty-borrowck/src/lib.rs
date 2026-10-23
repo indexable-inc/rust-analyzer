@@ -360,8 +360,8 @@ impl<'a, 'db> Ctx<'a, 'db> {
         mode: Mode,
     ) -> Self {
         let krate = owner.krate(db);
-        let env = db.trait_environment(owner.generic_def(db));
         let interner = DbInterner::new_with(db, krate).with_regions();
+        let env = normalized_env(interner, db.trait_environment(owner.generic_def(db)));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         let bindings =
             body.binding_locals.iter().map(|(binding, &local)| (local, binding)).collect();
@@ -493,6 +493,35 @@ impl<'a, 'db> Ctx<'a, 'db> {
     pub(crate) fn upvar_of_local(&self, local: LocalId) -> Option<usize> {
         self.upvars.iter().position(|it| it.local == local)
     }
+}
+
+/// `env` with the projections in its where clauses that name no parameter normalized, as
+/// rustc normalizes a param env before it uses it. Unnormalized, a where clause
+/// `<Option<&'static C> as Q>::ReadOnly: Q` is a candidate for every `X: Q`, and normalizing it
+/// asks those where clauses again: the solver gives up and leaves `<X as Q>::Item` rigid.
+fn normalized_env<'db>(interner: DbInterner<'db>, env: ParamEnv<'db>) -> ParamEnv<'db> {
+    use hir_ty::next_solver::{
+        Clauses, infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
+    };
+    use rustc_type_ir::TypeVisitableExt as _;
+    let global = |clause: &hir_ty::next_solver::Clause<'db>| {
+        clause.has_aliases() && !clause.has_param() && !clause.has_infer()
+    };
+    if !env.clauses().iter().any(|it| global(&it)) {
+        return env;
+    }
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let clauses = env.clauses().iter().map(|clause| {
+        if !global(&clause) {
+            return clause;
+        }
+        let ocx = ObligationCtxt::new(&infcx);
+        match ocx.deeply_normalize(&ObligationCause::dummy(), ParamEnv::empty(), clause) {
+            Ok(normalized) if !normalized.has_infer() => normalized,
+            _ => clause,
+        }
+    });
+    ParamEnv::new(Clauses::new_from_iter(clauses.collect::<Vec<_>>()))
 }
 
 fn closure_kind_of(
