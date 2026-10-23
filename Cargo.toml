@@ -40,6 +40,10 @@ debug = 2
 # rustc's layout code, from the tag of the stable in `harness/toolchain`: ra-jit's
 # vendor/rustc_abi, which its own workspace patches in by path.
 ra-ap-rustc_abi = { git = "https://github.com/indexable-inc/rustc_abi", branch = "main" }
+# The trait solver crates with fixes of rustc's solver backported: ra-jit's vendor/, which
+# a copy of this workspace has next to it too.
+ra-ap-rustc_type_ir = { path = "../rustc_type_ir" }
+ra-ap-rustc_next_trait_solver = { path = "../rustc_next_trait_solver" }
 # rowan 0.17.0 with a flat kind of tree behind its cursor (lib/rowan/Cargo.toml).
 rowan = { path = "lib/rowan" }
 

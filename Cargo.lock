@@ -2208,8 +2208,6 @@ dependencies = [
 [[package]]
 name = "ra-ap-rustc_next_trait_solver"
 version = "0.166.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7a9663a8d7c369e934aac2b74a638537ad7eb4be75b4530d765384dc071c936"
 dependencies = [
  "derive-where",
  "ra-ap-rustc_index",
@@ -2244,8 +2242,6 @@ dependencies = [
 [[package]]
 name = "ra-ap-rustc_type_ir"
 version = "0.166.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d6efb6008f665a9485e0afecf9f4950a6c4bedd8ddd330a9df8986a6c0160b"
 dependencies = [
  "arrayvec",
  "bitflags",
