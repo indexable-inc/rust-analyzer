@@ -278,7 +278,6 @@ pub(crate) struct Ctx<'a, 'db> {
     pub(crate) owner: InferBodyId<'db>,
     pub(crate) infcx: InferCtxt<'db>,
     pub(crate) env: ParamEnv<'db>,
-    #[allow(dead_code)]
     pub(crate) krate: Crate,
     pub(crate) store: &'a ExpressionStore,
     #[allow(dead_code)]

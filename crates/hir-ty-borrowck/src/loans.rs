@@ -295,7 +295,15 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
         for statement in &block.statements {
             match &statement.kind {
                 StatementKind::Assign(place, rvalue) => {
-                    define(&mut defs, place.local, place.projection.is_empty().then_some(rvalue))
+                    define(&mut defs, place.local, place.projection.is_empty().then_some(rvalue));
+                    // A mutable borrow of a part of the temporary is a use rustc's
+                    // `TempState` takes for a mutation, `&mut t.0` of `let ref a @ (ref mut
+                    // b, _) = (1, 2)`, so `a` borrows the temporary itself.
+                    if let Rvalue::Ref(BorrowKind::Mut { .. }, borrowed) = rvalue
+                        && !borrowed.projection.as_slice().is_empty()
+                    {
+                        define(&mut defs, borrowed.local, None);
+                    }
                 }
                 StatementKind::Deinit(place) => define(&mut defs, place.local, None),
                 _ => (),

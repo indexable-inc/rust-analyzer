@@ -1340,7 +1340,23 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                                 }
                             }
                             _ if expr == body.root_expr() => return block(),
-                            _ => return None,
+                            // What else a macro lowers to, as the call of `Arguments::new` of
+                            // `format_args!`, is at the nearest expression the source has,
+                            // where rustc points at the macro call.
+                            _ => {
+                                let mut child = expr;
+                                loop {
+                                    let (parent, _) = body.exprs().find(|&(it, _)| {
+                                        let mut found = false;
+                                        body.walk_child_exprs(it, |it| found |= it == child);
+                                        found
+                                    })?;
+                                    if let Ok(it) = source_map.expr_syntax(parent) {
+                                        break it;
+                                    }
+                                    child = parent;
+                                }
+                            }
                         },
                     }
                 }

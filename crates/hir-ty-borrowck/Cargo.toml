@@ -24,7 +24,9 @@ ra-ap-rustc_type_ir.workspace = true
 # local deps
 base-db.workspace = true
 hir-def.workspace = true
+hir-expand.workspace = true
 hir-ty.workspace = true
+syntax.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

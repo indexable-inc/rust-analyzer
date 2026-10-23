@@ -1,9 +1,15 @@
 //! How the messages name a place, as rustc's `describe_place`: `x`, `x.field`, `*x`, `x[_]`.
 
-use hir_def::VariantId;
+use hir_def::{VariantId, expr_store::Body, hir::BindingId};
+use hir_expand::{MacroCallId, MacroCallKind};
 use rustc_type_ir::inherent::IntoKind;
+use syntax::{
+    AstNode,
+    ast::{self, HasName},
+};
 
 use hir_ty::{
+    InferBodyId,
     mir::{LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem},
     next_solver::TyKind,
 };
@@ -34,6 +40,9 @@ impl<'db> Ctx<'_, 'db> {
                 start = used;
                 self.store[self.upvars[upvar].binding].name.as_str().to_owned()
             }
+            None if self.bindings.get(&local).is_some_and(|&it| self.from_external_macro(it)) => {
+                return None;
+            }
             None => self.local_name(local)?,
         };
         let mut ty = self.place_ty(body, local, &projection[..start]);
@@ -58,6 +67,28 @@ impl<'db> Ctx<'_, 'db> {
             ty = self.project(ty, elem);
         }
         Some(name)
+    }
+
+    /// Whether a macro of another crate, or an attribute or derive, wrote the name of
+    /// `binding`, as `pinned` of `pin!`: rustc's `in_external_macro`, whose variables its
+    /// messages call temporaries.
+    fn from_external_macro(&self, binding: BindingId) -> bool {
+        let InferBodyId::DefWithBodyId(def) = self.owner else { return false };
+        let (_, source_map) = Body::with_source_map(self.db, def);
+        let Some(&pat) = source_map.patterns_for_binding(binding).first() else { return false };
+        let Ok(source) = source_map.pat_syntax(pat) else { return false };
+        let Some(call) = source.file_id.macro_file() else { return false };
+        let node = source.value.to_node(&source.file_id.parse_or_expand(self.db));
+        let Some(name) = node.right().and_then(|it| match it {
+            ast::Pat::IdentPat(it) => it.name(),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let span = call.expansion_span_map(self.db).span_at(name.syntax().text_range().start());
+        let Some(expansion) = span.ctx.outer_expn(self.db) else { return false };
+        let loc = MacroCallId::from(expansion).loc(self.db);
+        loc.def.krate != self.krate || !matches!(loc.kind, MacroCallKind::FnLike { .. })
     }
 
     fn field_name(&self, ty: PlaceTy<'db>, field: u32) -> String {

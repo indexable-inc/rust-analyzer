@@ -56,16 +56,19 @@ impl<'db> InferenceContext<'db> {
         match &self.store[tgt_expr] {
             Expr::Missing => (),
             Expr::InlineAsm(e) => {
+                // An output is a place written, as rustc's `check_expr_asm_operand` checks it
+                // with `Needs::MutPlace`: `out(reg) v[0]` indexes with `IndexMut`.
                 e.operands.iter().for_each(|(_, op)| match op {
-                    AsmOperand::In { expr, .. }
-                    | AsmOperand::Out { expr: Some(expr), .. }
-                    | AsmOperand::InOut { expr, .. } => {
+                    AsmOperand::In { expr, .. } => {
                         self.infer_mut_expr_without_adjust(*expr, Mutability::Not)
+                    }
+                    AsmOperand::Out { expr: Some(expr), .. } | AsmOperand::InOut { expr, .. } => {
+                        self.infer_mut_expr_without_adjust(*expr, Mutability::Mut)
                     }
                     AsmOperand::SplitInOut { in_expr, out_expr, .. } => {
                         self.infer_mut_expr_without_adjust(*in_expr, Mutability::Not);
                         if let Some(out_expr) = out_expr {
-                            self.infer_mut_expr_without_adjust(*out_expr, Mutability::Not);
+                            self.infer_mut_expr_without_adjust(*out_expr, Mutability::Mut);
                         }
                     }
                     AsmOperand::Out { expr: None, .. }

@@ -134,6 +134,8 @@ struct MirLowerCtx<'a, 'db> {
     /// Expressions whose temporary lives as long as the `let` they initialize, with the index of
     /// the scope that `let` is in.
     extended_temporaries: FxHashMap<ExprId, usize>,
+    /// Blocks whose `super let`s a `let` extends, with the index of the scope that `let` is in.
+    extended_blocks: FxHashMap<ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
     /// How many `const { .. }` blocks deep the expression being lowered is.
@@ -336,6 +338,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             discr_temp: None,
             drop_scopes: vec![DropScope::default()],
             extended_temporaries: FxHashMap::default(),
+            extended_blocks: FxHashMap::default(),
             super_let: None,
             inline_consts: 0,
             ends_temporaries: FxHashSet::default(),
@@ -2768,7 +2771,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     /// The unwind drop tree's way out from where lowering is: every scope's drops.
     fn unwind_here(&mut self) -> Option<BasicBlockId> {
-        let in_scope = self.in_scope();
+        // rustc keeps the operands of an expression being lowered in that expression's own
+        // scope, inside the temporaries that live to the end of the statement: in
+        // `boom().extend(&String::from(..))` a panic in the deref drops `boom()` first.
+        let operands = &self.operand_locals;
+        let in_scope: Vec<LocalId> = self
+            .drop_scopes
+            .iter()
+            .flat_map(|it| {
+                let (pending, rest): (Vec<LocalId>, Vec<LocalId>) =
+                    it.in_order(operands).iter().partition(|it| operands.contains(it));
+                rest.into_iter().chain(pending)
+            })
+            .collect();
         self.unwind_through(&in_scope, None)
     }
 
@@ -3071,43 +3086,50 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     /// Records which temporaries of a `let` initializer live to the end of the enclosing block
-    /// rather than to the end of the statement.
-    fn extend_temporaries(&mut self, initializer: ExprId, pat: PatId) {
+    /// rather than to the end of the statement: to the scope `scope`, the one the `let` is in.
+    fn extend_temporaries(&mut self, initializer: ExprId, pat: PatId, scope: usize) {
         let mut by_ref = false;
         self.store.walk_bindings_in_pat(pat, |b| {
             by_ref |=
                 matches!(self.store[b].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut);
         });
         if by_ref {
-            self.extend_operand(initializer);
+            self.extend_operand(initializer, scope);
         }
-        self.extend_in(initializer);
+        self.extend_in(initializer, scope);
     }
 
-    fn extend_in(&mut self, expr: ExprId) {
+    fn extend_in(&mut self, expr: ExprId, scope: usize) {
         match &self.store[expr] {
             &Expr::Ref { expr, .. } => {
-                self.extend_operand(expr);
-                self.extend_in(expr);
+                self.extend_operand(expr, scope);
+                self.extend_in(expr, scope);
             }
-            &Expr::Cast { expr, .. } => self.extend_in(expr),
+            &Expr::Cast { expr, .. } => self.extend_in(expr, scope),
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
-                exprs.iter().for_each(|&it| self.extend_in(it))
+                exprs.iter().for_each(|&it| self.extend_in(it, scope))
             }
-            Expr::RecordLit { fields, .. } => fields.iter().for_each(|it| self.extend_in(it.expr)),
+            Expr::RecordLit { fields, .. } => {
+                fields.iter().for_each(|it| self.extend_in(it.expr, scope))
+            }
             // A tuple struct's or variant's constructor named as such, `Some(&temp())` or
             // `Self(&temp())`, not through a variable (`let some = Some; some(&temp())`).
             Expr::Call { callee, args } if self.names_constructor(*callee) => {
-                args.iter().for_each(|&it| self.extend_in(it))
+                args.iter().for_each(|&it| self.extend_in(it, scope))
             }
-            &Expr::Block { tail: Some(tail), .. } => self.extend_in(tail),
-            &Expr::If { then_branch, else_branch, .. } => {
-                self.extend_in(then_branch);
-                if let Some(else_branch) = else_branch {
-                    self.extend_in(else_branch);
+            &Expr::Block { tail, .. } => {
+                self.extended_blocks.insert(expr, scope);
+                if let Some(tail) = tail {
+                    self.extend_in(tail, scope);
                 }
             }
-            Expr::Match { arms, .. } => arms.iter().for_each(|it| self.extend_in(it.expr)),
+            &Expr::If { then_branch, else_branch, .. } => {
+                self.extend_in(then_branch, scope);
+                if let Some(else_branch) = else_branch {
+                    self.extend_in(else_branch, scope);
+                }
+            }
+            Expr::Match { arms, .. } => arms.iter().for_each(|it| self.extend_in(it.expr, scope)),
             _ => (),
         }
     }
@@ -3121,8 +3143,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 )
     }
 
-    fn extend_operand(&mut self, mut expr: ExprId) {
-        let scope = self.drop_scopes.len() - 1;
+    fn extend_operand(&mut self, mut expr: ExprId, scope: usize) {
         loop {
             self.extended_temporaries.insert(expr, scope);
             expr = match &self.store[expr] {
@@ -3178,15 +3199,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         if self.is_super_let_block(statements)
             && let Some(tail) = tail
         {
-            // `format_args!` expands to a block of `super let`s: what they bind, and every
-            // temporary of their initializers, lives as long as the block's own value does.
+            // `format_args!` and `pin!` expand to a block of `super let`s: what they bind lives
+            // as long as the block's own value does. A `let` that extends the block extends
+            // the temporaries of their initializers too; otherwise those are dropped as they
+            // would be anywhere, a block's tail's at the end of the block from 2024 on
+            // (rust-lang/rust#145784).
+            let extended = self.extended_blocks.remove(&block);
             for statement in statements {
                 let hir_def::hir::Statement::Let { pat, initializer: Some(initializer), .. } =
                     statement
                 else {
                     continue;
                 };
-                self.extend_temporaries(*initializer, *pat);
+                if let Some(scope) = extended {
+                    self.extend_temporaries(*initializer, *pat, scope);
+                }
                 self.declare_bindings(*pat);
                 let Some((init_place, c)) =
                     self.lower_expr_as_place(current, *initializer, true)?
@@ -3195,7 +3222,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 };
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, *initializer);
-                (current, _) = self.pattern_match(c, None, init_place, *pat)?;
+                self.super_let = Some(extended.unwrap_or(self.drop_scopes.len() - 1));
+                let matched = self.pattern_match(c, None, init_place, *pat);
+                self.super_let = None;
+                (current, _) = matched?;
                 self.resolver.reset_to_guard(resolver_guard);
             }
             return self.lower_expr_to_place(tail, place, current);
@@ -3226,7 +3256,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         )
                     {
                         let binding = *id;
-                        self.extend_temporaries(*expr_id, *pat);
+                        self.extend_temporaries(*expr_id, *pat, self.drop_scopes.len() - 1);
                         let local = self.binding_local(binding)?;
                         // rustc's storage_live_binding: the storage starts here, and the drop of
                         // the value is scheduled only once it holds one, after the initializer
@@ -3261,7 +3291,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     if let Some(expr_id) = initializer {
                         let else_block;
                         let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
-                        self.extend_temporaries(*expr_id, *pat);
+                        self.extend_temporaries(*expr_id, *pat, self.drop_scopes.len() - 1);
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
                         let Some((init_place, c)) =
