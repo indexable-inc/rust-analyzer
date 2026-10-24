@@ -350,6 +350,7 @@ impl ExprCollector<'_> {
                 options,
                 kind,
                 comment_only,
+                clobber_abi: !clobber_abis.is_empty(),
             }),
             syntax_ptr,
         );

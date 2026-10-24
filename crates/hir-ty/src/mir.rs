@@ -1096,6 +1096,8 @@ pub struct InlineAsm {
     pub taken: Option<StoredPlace>,
     /// The block is the whole of a `#[naked]` function: its code and nothing else.
     pub naked: bool,
+    /// The block may overwrite every register a call may (`clobber_abi`).
+    pub clobber_abi: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1106,6 +1108,8 @@ pub enum AsmOperand {
         reg: hir_def::hir::InlineAsmRegOrRegClass,
         input: Option<Operand>,
         output: Option<StoredPlace>,
+        /// Whether the block may change the register, which it may with no `output` too.
+        written: bool,
     },
     Const(Operand),
     /// A `label` block, which the template jumps to.

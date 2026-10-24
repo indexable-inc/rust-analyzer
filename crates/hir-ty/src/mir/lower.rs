@@ -611,6 +611,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let mut labels = Vec::new();
                 let mut operands = Vec::with_capacity(asm.operands.len());
                 for (_, operand) in &asm.operands {
+                    let written = !matches!(operand, AsmOperand::In { .. });
                     let (reg, input, output) = match operand {
                         AsmOperand::In { reg, expr } => (reg, Some(*expr), None),
                         AsmOperand::Out { reg, expr, late: _ } => (reg, None, *expr),
@@ -692,7 +693,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         }
                         None => None,
                     };
-                    operands.push(super::AsmOperand::Reg { reg: reg.clone(), input, output });
+                    operands.push(super::AsmOperand::Reg {
+                        reg: reg.clone(),
+                        input,
+                        output,
+                        written,
+                    });
                 }
                 let taken: Option<Place<'db>> = if labels.is_empty() {
                     None
@@ -708,6 +714,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         options: asm.options,
                         taken: taken.map(|it| it.store()),
                         naked,
+                        clobber_abi: asm.clobber_abi,
                     }))
                     .with_span(expr_id.into()),
                 );

@@ -488,6 +488,8 @@ pub struct InlineAsm {
     /// The template is nothing but assembler comments, so the block emits no instructions.
     /// Crates use this as an optimization barrier.
     pub comment_only: bool,
+    /// The block has a `clobber_abi`: it may overwrite every register a call may.
+    pub clobber_abi: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
