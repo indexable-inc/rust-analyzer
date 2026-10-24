@@ -38,7 +38,7 @@ impl<'db> Ctx<'_, 'db> {
         let mut name = match self.upvar_of_projection(body, local, projection) {
             Some((upvar, used)) => {
                 start = used;
-                self.store[self.upvars[upvar].binding].name.as_str().to_owned()
+                self.capture_name(upvar)
             }
             None if self.bindings.get(&local).is_some_and(|&it| self.from_external_macro(it)) => {
                 return None;
@@ -91,6 +91,42 @@ impl<'db> Ctx<'_, 'db> {
         loc.def.krate != self.krate || !matches!(loc.kind, MacroCallKind::FnLike { .. })
     }
 
+    /// What a closure calls its capture `upvar`: the place it captured, as rustc's
+    /// `place_to_string_for_capture`, `z.0.0.0` or `*bx.0`.
+    fn capture_name(&self, upvar: usize) -> String {
+        use hir_ty::closure_analysis::ProjectionKind;
+        let place = &self.upvars[upvar].place.place;
+        let mut name = self.store[self.upvars[upvar].binding].name.as_str().to_owned();
+        for (index, projection) in place.projections.iter().enumerate() {
+            match projection.kind {
+                ProjectionKind::Deref => name = format!("*{name}"),
+                ProjectionKind::Field { field_idx, variant_idx } => {
+                    let variant = match place.ty_before_projection(index).kind() {
+                        TyKind::Adt(def, _) => super::regions::adt_variants(self.db, def.def_id())
+                            .get(variant_idx as usize)
+                            .copied(),
+                        _ => None,
+                    };
+                    let field = match variant {
+                        Some(variant) => self.variant_field_name(variant, field_idx),
+                        None => field_idx.to_string(),
+                    };
+                    name = format!("{name}.{field}");
+                }
+                _ => (),
+            }
+        }
+        name
+    }
+
+    fn variant_field_name(&self, variant: VariantId, field: u32) -> String {
+        let fields = variant.fields(self.db);
+        match fields.fields().iter().nth(field as usize) {
+            Some((_, data)) => data.name.as_str().to_owned(),
+            None => field.to_string(),
+        }
+    }
+
     fn field_name(&self, ty: PlaceTy<'db>, field: u32) -> String {
         let variant = match (ty.variant_id, ty.ty.kind()) {
             (Some(variant), _) => variant,
@@ -102,11 +138,7 @@ impl<'db> Ctx<'_, 'db> {
             }
             _ => return field.to_string(),
         };
-        let fields = variant.fields(self.db);
-        match fields.fields().iter().nth(field as usize) {
-            Some((_, data)) => data.name.as_str().to_owned(),
-            None => field.to_string(),
-        }
+        self.variant_field_name(variant, field)
     }
 
     /// In a closure, the capture `local` with the first projections of a place stands for,

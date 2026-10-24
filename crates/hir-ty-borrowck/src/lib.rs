@@ -345,7 +345,6 @@ pub(crate) struct Upvar {
     pub(crate) mutable: bool,
     /// The captured place is behind a reference.
     pub(crate) behind_deref: bool,
-    #[allow(dead_code)]
     pub(crate) place: CapturedPlace,
 }
 
@@ -381,8 +380,11 @@ impl<'a, 'db> Ctx<'a, 'db> {
                         local,
                         by_ref: capture.is_by_ref(),
                         mutable: capture.mutability == rustc_ast_ir::Mutability::Mut,
-                        behind_deref: capture.place.projections.iter().any(|it| {
-                            matches!(it.kind, hir_ty::closure_analysis::ProjectionKind::Deref)
+                        behind_deref: capture.place.deref_tys().any(|ty| {
+                            !matches!(
+                                rustc_type_ir::inherent::IntoKind::kind(ty),
+                                hir_ty::next_solver::TyKind::Adt(def, _) if def.is_box()
+                            )
                         }),
                         place: capture.clone(),
                     });

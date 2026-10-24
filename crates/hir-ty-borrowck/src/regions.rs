@@ -443,6 +443,30 @@ fn names_captured_lifetime<'db>(db: &dyn hir_ty::db::HirDatabase, ty: Ty<'db>) -
     find.found
 }
 
+/// Whether `ty` is an `impl Trait` whose bounds say nothing of its hidden type's lifetimes, as
+/// `impl Cap<'a> + Cap<'b>`: no `+ 'a`, and no associated type that names one. Nested in a
+/// returned one's `Item = ..`, it adds nothing the returned one's member constraints need.
+fn unbounded_opaque<'db>(
+    db: &dyn hir_ty::db::HirDatabase,
+    interner: hir_ty::next_solver::DbInterner<'db>,
+    ty: Ty<'db>,
+) -> bool {
+    let TyKind::Alias(alias) = ty.kind() else { return false };
+    if !matches!(alias.kind, rustc_type_ir::AliasTyKind::Opaque { .. }) {
+        return false;
+    }
+    rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+        .iter_instantiated(interner, alias.args.as_slice())
+        .all(|clause| match clause.kind().skip_binder() {
+            ClauseKind::TypeOutlives(_) | ClauseKind::RegionOutlives(_) => false,
+            ClauseKind::Projection(projection) => match projection.term.as_type() {
+                Some(ty) => !names_captured_lifetime(db, ty) || unbounded_opaque(db, interner, ty),
+                None => !rustc_type_ir::TypeVisitableExt::has_free_regions(&projection.term),
+            },
+            _ => true,
+        })
+}
+
 /// The regions of a hidden type that rustc's `CollectMemberConstraintsVisitor` gives member
 /// constraints: not those of a closure's parent arguments, nor an `impl Trait`'s arguments
 /// it does not capture.
@@ -1200,7 +1224,10 @@ impl<'db> Builder<'_, '_, 'db> {
                         }
                         ClauseKind::Projection(projection)
                             if match projection.term.as_type() {
-                                Some(ty) => names_captured_lifetime(self.ctx.db, ty),
+                                Some(ty) => {
+                                    names_captured_lifetime(self.ctx.db, ty)
+                                        && !unbounded_opaque(self.ctx.db, self.interner(), ty)
+                                }
                                 None => rustc_type_ir::TypeVisitableExt::has_free_regions(
                                     &projection.term,
                                 ),
@@ -5362,7 +5389,10 @@ fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
         || path.generic_args().is_some_and(|args| args.iter().any(Option::is_some))
 }
 
-fn adt_variants(db: &dyn hir_ty::db::HirDatabase, adt: AdtId) -> Vec<hir_def::VariantId> {
+pub(super) fn adt_variants(
+    db: &dyn hir_ty::db::HirDatabase,
+    adt: AdtId,
+) -> Vec<hir_def::VariantId> {
     match adt {
         AdtId::StructId(it) => vec![it.into()],
         AdtId::UnionId(it) => vec![it.into()],

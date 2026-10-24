@@ -153,6 +153,7 @@ pub(super) fn check<'db>(
         used_mut_upvars: Vec::new(),
     };
     let guard_borrows = guard_borrows(ctx, body);
+    let index_borrows = index_borrows(ctx, body);
     let tested_at = tested_at(ctx);
     let test_span = |span: MirSpan| match span {
         MirSpan::PatId(pat) => tested_at.get(&pat).map_or(span, |&it| MirSpan::ExprId(it)),
@@ -186,6 +187,16 @@ pub(super) fn check<'db>(
                     _ => checker.guard_conflict(guard, dest, true, span),
                 }
             }
+            if let Some(protected) = index_borrows.get(&it.span)
+                && let StatementKind::Assign(dest, rvalue) = &it.kind
+            {
+                match rvalue {
+                    Rvalue::Ref(BorrowKind::Mut { .. }, borrowed) => {
+                        checker.index_conflict(protected, borrowed, false, span)
+                    }
+                    _ => checker.index_conflict(protected, dest, true, span),
+                }
+            }
             checker.statement(location, &it.kind, span);
             apply(body, &moves, location, &mut checker.uninit, &mut checker.ever);
             loans.after(ctx, body, location, &mut checker.in_scope);
@@ -202,6 +213,11 @@ pub(super) fn check<'db>(
                 && let TerminatorKind::Call { destination, .. } = &terminator.kind
             {
                 checker.guard_conflict(guard, destination, true, span);
+            }
+            if let Some(protected) = index_borrows.get(&terminator.span)
+                && let TerminatorKind::Call { destination, .. } = &terminator.kind
+            {
+                checker.index_conflict(protected, destination, true, span);
             }
             checker.terminator(location, &terminator.kind, span);
         }
@@ -619,6 +635,28 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     ),
                 ),
             }
+        }
+    }
+
+    fn index_conflict(
+        &mut self,
+        protected: &[(LocalId, Vec<PlaceElem>)],
+        place: &StoredPlace,
+        assign: bool,
+        span: MirSpan,
+    ) {
+        let projection = place.projection.as_slice();
+        let local = place.local;
+        if !protected.iter().any(|(it, fake)| *it == local && fake.starts_with(projection)) {
+            return;
+        }
+        let what = self.quoted(PlaceRef { local, projection }, "value");
+        let message = match assign {
+            true => format!("cannot assign {what} in indexing expression"),
+            false => format!("cannot mutably borrow {what} in indexing expression"),
+        };
+        if !self.errors.iter().flatten().any(|it| it.span == span && it.message == message) {
+            self.report("E0510", span, message);
         }
     }
 
@@ -2897,6 +2935,123 @@ fn guard_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<MirSpan, st
                 }
                 ctx.store.walk_child_exprs(expr, |it| stack.push(it));
             }
+        }
+    }
+    out
+}
+
+/// The places rustc fake-borrows shallowly while an index is evaluated, by each expression in
+/// that index: in `x[1][i]` with `x: &[&[i32]]`, the bounds check of the slice `x[1]` indexes
+/// must hold until `i` is evaluated, so the references it is behind, `x`, are left alone
+/// (rustc's `add_fake_borrows_of_base`).
+fn index_borrows<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &MirBody<'db>,
+) -> FxHashMap<MirSpan, Vec<(LocalId, Vec<PlaceElem>)>> {
+    use hir_def::hir::Expr;
+    fn operand(it: &Operand) -> Option<&StoredPlace> {
+        match &it.kind {
+            OperandKind::Copy(place) | OperandKind::Move(place) => Some(place),
+            _ => None,
+        }
+    }
+    let mut evaluated_in = FxHashMap::default();
+    let mut places: Vec<&StoredPlace> = Vec::new();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            match &statement.kind {
+                StatementKind::StorageLive(local) => {
+                    if let MirSpan::ExprId(expr) = statement.span {
+                        evaluated_in.insert(*local, expr);
+                    }
+                }
+                StatementKind::Assign(dest, rvalue) => {
+                    places.push(dest);
+                    match rvalue {
+                        Rvalue::Use(it)
+                        | Rvalue::Repeat(it, _)
+                        | Rvalue::Cast(_, it, _)
+                        | Rvalue::UnaryOp(_, it) => places.extend(operand(it)),
+                        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => {
+                            places.extend(operand(a));
+                            places.extend(operand(b));
+                        }
+                        Rvalue::Ref(_, place)
+                        | Rvalue::Len(place)
+                        | Rvalue::Discriminant(place)
+                        | Rvalue::CopyForDeref(place) => places.push(place),
+                        Rvalue::Aggregate(_, operands) => {
+                            places.extend(operands.iter().filter_map(operand))
+                        }
+                        _ => (),
+                    }
+                }
+                _ => (),
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind
+        {
+            places.push(destination);
+            places.extend(operand(func));
+            places.extend(args.iter().filter_map(operand));
+        }
+    }
+    let is_slice = |local, projection: &[PlaceElem]| {
+        matches!(ctx.place_ty(body, local, projection).ty.kind(), TyKind::Slice(_))
+    };
+    let mut protected: FxHashMap<ExprId, Vec<(LocalId, Vec<PlaceElem>)>> = FxHashMap::default();
+    let mut seen = FxHashSet::default();
+    for place in places {
+        let projection = place.projection.as_slice();
+        let indexes: Vec<(usize, LocalId)> = projection
+            .iter()
+            .enumerate()
+            .filter_map(|(at, elem)| match elem {
+                ProjectionElem::Index(local) => Some((at, *local)),
+                _ => None,
+            })
+            .collect();
+        if indexes.len() < 2 || !seen.insert((place.local, projection)) {
+            continue;
+        }
+        for (n, &(at, _)) in indexes[..indexes.len() - 1].iter().enumerate() {
+            if !is_slice(place.local, &projection[..at]) {
+                continue;
+            }
+            let mut fake = Vec::new();
+            for len in (0..at).rev() {
+                match &projection[len] {
+                    ProjectionElem::Deref => fake.push((place.local, projection[..len].to_vec())),
+                    ProjectionElem::Index(_) if is_slice(place.local, &projection[..len]) => break,
+                    _ => (),
+                }
+            }
+            for &(_, local) in &indexes[n + 1..] {
+                if let Some(&expr) = evaluated_in.get(&local)
+                    && let Expr::Index { index, .. } = ctx.store[expr]
+                {
+                    let set = protected.entry(index).or_default();
+                    for it in &fake {
+                        if !set.contains(it) {
+                            set.push(it.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out: FxHashMap<MirSpan, Vec<(LocalId, Vec<PlaceElem>)>> = FxHashMap::default();
+    for (index, fake) in protected {
+        let mut stack = vec![index];
+        while let Some(expr) = stack.pop() {
+            let set = out.entry(MirSpan::ExprId(expr)).or_default();
+            for it in &fake {
+                if !set.contains(it) {
+                    set.push(it.clone());
+                }
+            }
+            ctx.store.walk_child_exprs(expr, |it| stack.push(it));
         }
     }
     out
