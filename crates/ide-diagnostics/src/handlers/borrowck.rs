@@ -113,6 +113,23 @@ fn user(mut s: S) {
     }
 
     #[test]
+    fn constant_of_a_signature_is_borrow_checked() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+pub struct X<const N: usize = {
+    let n: usize;
+    n
+  //^ error: used binding `n` isn't initialized
+}>;
+pub fn f() -> [u8; { let n = 1; n }] {
+    [0]
+}
+"#,
+        );
+    }
+
+    #[test]
     fn higher_ranked_bound_holds_for_any_lifetime() {
         check_diagnostics(
             r#"

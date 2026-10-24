@@ -1202,6 +1202,37 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             source_map,
             TypeOwnerId::from_anon_const(def, self.db),
         );
+        self.collect_anon_const_borrowck(source_map, def);
+    }
+
+    fn collect_anon_const_borrowck(
+        &mut self,
+        source_map: &ExpressionStoreSourceMap,
+        def: AnonConstId<'db>,
+    ) {
+        use hir_ide::mir::MirSpan;
+        let result = hir_ty_borrowck::borrowck_anon_const(self.db, def);
+        for diagnostic in &result.diagnostics {
+            let source = match diagnostic.span {
+                MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr),
+                MirSpan::PatId(pat) => source_map.pat_syntax(pat),
+                MirSpan::BindingId(binding) => match source_map.patterns_for_binding(binding) {
+                    [pat, ..] => source_map.pat_syntax(*pat),
+                    [] => continue,
+                },
+                _ => source_map.expr_syntax(def.loc(self.db).expr),
+            };
+            let Ok(source) = source else { continue };
+            self.acc.push(
+                BorrowckError {
+                    node: source.map(|it| it.syntax_node_ptr()),
+                    at_end: matches!(diagnostic.span, MirSpan::ExprEnd(_)),
+                    code: diagnostic.code,
+                    message: diagnostic.message.clone(),
+                }
+                .into(),
+            );
+        }
     }
 
     fn collect_enum(&mut self, def: EnumId) {
