@@ -19,7 +19,6 @@ use std::{
 };
 
 use dashmap::{DashMap, SharedValue};
-use hashbrown::raw::RawTable;
 use rustc_hash::FxBuildHasher;
 use triomphe::{HeaderSlice, HeaderWithLength, ThinArc};
 
@@ -27,13 +26,6 @@ type InternMap<T> = DashMap<
     ThinArc<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>,
     (),
     FxBuildHasher,
->;
-type Guard<T> = dashmap::RwLockWriteGuard<
-    'static,
-    RawTable<(
-        ThinArc<<T as SliceInternable>::Header, <T as SliceInternable>::SliceType>,
-        SharedValue<()>,
-    )>,
 >;
 type Pointee<T> = HeaderSlice<
     HeaderWithLength<<T as SliceInternable>::Header>,
@@ -53,7 +45,27 @@ impl<T: SliceInternable> InternedSlice<T> {
         const { assert!(T::USE_GC) };
 
         let storage = T::storage().get();
-        let (mut shard, hash) = Self::select(storage, &header, slice);
+        let hash = Self::hash(storage, &header, slice);
+        let shard = &storage.shards()[storage.determine_shard(hash as usize)];
+        // Nearly every slice interned already is, and is asked for from many threads at once:
+        // looking under a lock other readers share finds it without waiting on them.
+        {
+            let read = shard.read();
+            let found = read
+                .find(hash, |(other, _)| other.header.header == header && other.slice == *slice);
+            if let Some(bucket) = found {
+                // SAFETY: The bucket is read while its shard is locked; a collection, which frees
+                // it, runs only when no reference to one is alive. The pointer is a `ThinArc`'s.
+                return unsafe {
+                    InternedSliceRef {
+                        // INVARIANT: We create it from a `ThinArc`.
+                        ptr: NonNull::new_unchecked(ThinArc::as_ptr(&bucket.as_ref().0).cast_mut()),
+                        _marker: PhantomData,
+                    }
+                };
+            }
+        }
+        let mut shard = shard.write();
         // Atomically,
         // - check if `obj` is already in the map
         //   - if so, clone its `Arc` and return it
@@ -84,18 +96,6 @@ impl<T: SliceInternable> InternedSlice<T> {
                 _marker: PhantomData,
             }
         }
-    }
-
-    #[inline]
-    fn select(
-        storage: &'static InternMap<T>,
-        header: &T::Header,
-        slice: &[T::SliceType],
-    ) -> (Guard<T>, u64) {
-        let hash = Self::hash(storage, header, slice);
-        let shard_idx = storage.determine_shard(hash as usize);
-        let shard = &storage.shards()[shard_idx];
-        (shard.write(), hash)
     }
 
     #[inline]

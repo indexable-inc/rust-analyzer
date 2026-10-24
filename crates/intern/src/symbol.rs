@@ -136,7 +136,15 @@ static MAP: OnceLock<Map> = OnceLock::new();
 impl Symbol {
     pub fn intern(s: &str) -> Self {
         let storage = MAP.get_or_init(symbols::prefill);
-        let (mut shard, hash) = Self::select_shard(storage, s);
+        let hash = Self::hash(storage, s);
+        let shard = &storage.shards()[storage.determine_shard(hash as usize)];
+        // Nearly every name interned already is, and is asked for from many threads at once:
+        // looking under a lock other readers share finds it without waiting on them.
+        if let Some(bucket) = shard.read().find(hash, |(other, _)| other.as_str() == s) {
+            // SAFETY: The bucket is read while its shard is locked.
+            return unsafe { bucket.as_ref().0.clone() };
+        }
+        let mut shard = shard.write();
         // Atomically,
         // - check if `obj` is already in the map
         //   - if so, copy out its entry, conditionally bumping the backing Arc and return it

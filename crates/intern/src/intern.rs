@@ -38,6 +38,7 @@ use triomphe::{Arc, ArcBorrow};
 
 type InternMap<T> = DashMap<Arc<T>, (), FxBuildHasher>;
 type Guard<T> = dashmap::RwLockWriteGuard<'static, RawTable<(Arc<T>, SharedValue<()>)>>;
+type Bucket<T> = hashbrown::raw::Bucket<(Arc<T>, SharedValue<()>)>;
 
 pub struct Interned<T: Internable> {
     arc: Arc<T>,
@@ -49,7 +50,12 @@ impl<T: Internable> Interned<T> {
         const { assert!(!T::USE_GC) };
 
         let storage = T::storage().get();
-        let (mut shard, hash) = Self::select(storage, &obj);
+        let hash = Self::hash(storage, &obj);
+        // SAFETY: The bucket is read while its shard is locked.
+        if let Some(arc) = Self::found(storage, hash, &obj, |it| unsafe { it.as_ref().0.clone() }) {
+            return Self { arc };
+        }
+        let mut shard = Self::select(storage, hash);
         // Atomically,
         // - check if `obj` is already in the map
         //   - if so, clone its `Arc` and return it
@@ -76,7 +82,14 @@ impl<T: Internable> Interned<T> {
         const { assert!(T::USE_GC) };
 
         let storage = T::storage().get();
-        let (mut shard, hash) = Self::select(storage, &obj);
+        let hash = Self::hash(storage, &obj);
+        // SAFETY: The bucket is read while its shard is locked; a collection, which frees it,
+        // runs only when no `InternedRef` is alive.
+        let found = |it: Bucket<T>| unsafe { InternedRef { arc: Arc::borrow_arc(&it.as_ref().0) } };
+        if let Some(found) = Self::found(storage, hash, &obj, found) {
+            return found;
+        }
+        let mut shard = Self::select(storage, hash);
         // Atomically,
         // - check if `obj` is already in the map
         //   - if so, clone its `Arc` and return it
@@ -98,12 +111,22 @@ impl<T: Internable> Interned<T> {
         unsafe { InternedRef { arc: Arc::borrow_arc(&bucket.as_ref().0) } }
     }
 
+    /// What `then` makes of the bucket `obj` is in, looked for under a lock that other readers
+    /// share: nearly every value interned already is, and is asked for from many threads at once.
     #[inline]
-    fn select(storage: &'static InternMap<T>, obj: &T) -> (Guard<T>, u64) {
-        let hash = Self::hash(storage, obj);
-        let shard_idx = storage.determine_shard(hash as usize);
-        let shard = &storage.shards()[shard_idx];
-        (shard.write(), hash)
+    fn found<R>(
+        storage: &'static InternMap<T>,
+        hash: u64,
+        obj: &T,
+        then: impl FnOnce(Bucket<T>) -> R,
+    ) -> Option<R> {
+        let shard = storage.shards()[storage.determine_shard(hash as usize)].read();
+        shard.find(hash, |(other, _)| **other == *obj).map(then)
+    }
+
+    #[inline]
+    fn select(storage: &'static InternMap<T>, hash: u64) -> Guard<T> {
+        storage.shards()[storage.determine_shard(hash as usize)].write()
     }
 
     #[inline]
@@ -142,7 +165,8 @@ impl<T: Internable> Interned<T> {
     #[cold]
     fn drop_slow(&mut self) {
         let storage = T::storage().get();
-        let (mut shard, hash) = Self::select(storage, &self.arc);
+        let hash = Self::hash(storage, &self.arc);
+        let mut shard = Self::select(storage, hash);
 
         if Arc::count(&self.arc) != 2 {
             // Another thread has interned another copy
@@ -370,3 +394,34 @@ macro_rules! _impl_internable {
     )+ };
 }
 pub use crate::_impl_internable as impl_internable;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Name(u32);
+    impl_internable!(Name);
+
+    /// A value found under the shard's read lock is the one object of it while threads intern
+    /// and drop it at once: a drop that races the lookup does not take it out of the map.
+    #[test]
+    fn interned_from_many_threads() {
+        let held: Vec<_> = (0..64).map(|i| Interned::new(Name(i))).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for round in 0..20_000u32 {
+                        let found = Interned::new(Name(round % 64));
+                        assert!(found == held[(round % 64) as usize]);
+                        let churned = Interned::new(Name(1000 + round % 7));
+                        let again = Interned::new(Name(1000 + round % 7));
+                        assert!(churned == again);
+                    }
+                });
+            }
+        });
+        let after: Vec<_> = (0..64).map(|i| Interned::new(Name(i))).collect();
+        assert!(after == held);
+    }
+}
