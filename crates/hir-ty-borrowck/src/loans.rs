@@ -128,6 +128,13 @@ fn is_unit_value(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
             TyKind::Adt(def, _) if hir_ty::drop::destructor(ctx.db, def.def_id()).is_none())
 }
 
+/// Whether `expr` is the empty array `[]`, which holds no value to drop or to mutate through a
+/// shared reference: rustc promotes `&[]` and `&mut []` of any element type, `[T]` or
+/// `[Cell<u8>]`, as it asks that of the elements and there are none.
+fn is_empty_array(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
+    matches!(&ctx.store[expr], Expr::Array(Array::ElementList { elements }) if elements.is_empty())
+}
+
 /// Whether `expr` names a `const` item outside any impl or trait: rustc asks whether its value,
 /// not its type, needs dropping, which only a value that does (a `String` that is not empty)
 /// fails; such a value is taken to be promotable when its type has no interior mutability.
@@ -497,6 +504,7 @@ impl Loans {
                 item || (!is_call(ctx, expr)
                     && (ctx.is_plain(body.locals[local].ty.as_ref())
                         || is_unit_value(ctx, expr)
+                        || is_empty_array(ctx, expr)
                         || (names_const_item(ctx, body, expr)
                             && hir_ty::drop::is_freeze(
                                 ctx.db,

@@ -537,7 +537,11 @@ pub mod ptr {
         unsafe { drop_in_place(to_drop) }
     }
     pub const unsafe fn read<T>(src: *const T) -> T {
-        unsafe { *src }
+        // As core reads: `*src` moves out of a raw pointer, which rustc refuses (E0507) for a
+        // `T` that is not `Copy`, and so does the borrow checker.
+        #[rustc_intrinsic]
+        const unsafe fn read_via_copy<T>(ptr: *const T) -> T;
+        unsafe { read_via_copy(src) }
     }
     pub const unsafe fn write<T>(dst: *mut T, src: T) {
         unsafe {
