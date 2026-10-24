@@ -266,7 +266,9 @@ pub(super) fn opaque_captures(
         return None;
     };
     let params: Vec<_> = hir_ty::generics::generics(db, function.into()).iter(true).collect();
-    if params.len() != len {
+    // After the function's, a lifetime for each its parameters leave out.
+    let elided = hir_ty::elided_lifetimes(db, function).len() as usize;
+    if params.len() + elided != len {
         return None;
     }
     let is_lifetime = |id: &GenericParamId| matches!(id, GenericParamId::LifetimeParamId(_));
@@ -324,7 +326,7 @@ pub(super) fn opaque_captures(
                 RegionKind::ReEarlyParam(it) => {
                     named.insert(it.index as usize);
                 }
-                // `+ '_`, the lifetime elision's, which no argument is.
+                // `+ '_` where the lifetime elision finds no lifetime of the parameters.
                 RegionKind::ReStatic | RegionKind::ReBound(..) | RegionKind::ReError(_) => (),
                 _ => unknown = true,
             }
@@ -332,25 +334,52 @@ pub(super) fn opaque_captures(
         });
     }
     if let Some(listed) = listed {
+        // `use<'_>` lists the lifetime the lifetime elision gives a return type.
+        let output = listed
+            .iter()
+            .any(|arg| {
+                matches!(arg, UseArgRef::Lifetime(it)
+                    if matches!(signature.store[*it], LifetimeRef::Placeholder))
+            })
+            .then(|| hir_ty::elided_lifetimes(db, function).output)
+            .flatten();
+        let names =
+            |lifetime: &LifetimeRef, param, data: &hir_def::hir::generics::LifetimeParamData| {
+                match lifetime {
+                    LifetimeRef::Named(name) => *name == data.name,
+                    LifetimeRef::Param(it) => *it == param,
+                    _ => false,
+                }
+            };
         let captured = params
             .iter()
             .map(|(id, data)| {
                 let (
-                    GenericParamId::LifetimeParamId(param),
+                    &GenericParamId::LifetimeParamId(param),
                     GenericParamDataRef::LifetimeParamData(data),
                 ) = (id, data)
                 else {
                     return true;
                 };
-                listed.iter().any(|arg| match arg {
-                    UseArgRef::Lifetime(it) => match &signature.store[*it] {
-                        LifetimeRef::Named(name) => *name == data.name,
-                        LifetimeRef::Param(it) => it == param,
-                        _ => false,
-                    },
-                    UseArgRef::Name(_) => false,
-                })
+                let written = match output {
+                    Some(hir_ty::ElidedOutput::Written(it)) => names(
+                        &signature.store[hir_def::type_ref::LifetimeRefId::from_raw(
+                            la_arena::RawIdx::from_u32(it),
+                        )],
+                        param,
+                        data,
+                    ),
+                    _ => false,
+                };
+                written
+                    || listed.iter().any(|arg| match arg {
+                        UseArgRef::Lifetime(it) => names(&signature.store[*it], param, data),
+                        UseArgRef::Name(_) => false,
+                    })
             })
+            .chain(
+                (0..elided as u32).map(|index| output == Some(hir_ty::ElidedOutput::Elided(index))),
+            )
             .collect::<Vec<_>>();
         // A lifetime the bounds name and `use<..>` leaves out is an error before borrow
         // checking.
@@ -375,8 +404,10 @@ pub(super) fn opaque_captures(
     Some(
         params
             .iter()
+            .map(|(id, _)| !is_lifetime(id))
+            .chain(std::iter::repeat_n(false, elided))
             .enumerate()
-            .map(|(index, (id, _))| !is_lifetime(id) || named.contains(&index))
+            .map(|(index, not_lifetime)| not_lifetime || named.contains(&index))
             .collect(),
     )
 }
@@ -896,6 +927,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         function.resolver(self.ctx.db)
                     };
                     let aligned = written.params.len() == inputs.len();
+                    let mut errors = vec![Vec::new(); inputs.len()];
                     for (index, input) in inputs.iter_mut().enumerate() {
                         let single = aligned
                             && written.params.get(index).is_some_and(|&param| {
@@ -903,9 +935,10 @@ impl<'db> Builder<'_, '_, 'db> {
                                     == Some(1)
                             });
                         let mut only = None;
+                        let errors = &mut errors[index];
                         *input =
                             rustc_type_ir::fold_regions(self.interner(), *input, |region, _| {
-                                match region.kind() {
+                                let region = match region.kind() {
                                     RegionKind::ReError(_) if single => {
                                         *only.get_or_insert_with(|| {
                                             self.new_universal(UniversalKind::AnonParam)
@@ -914,9 +947,19 @@ impl<'db> Builder<'_, '_, 'db> {
                                     RegionKind::ReError(_) => {
                                         self.new_universal(UniversalKind::AnonParam)
                                     }
-                                    _ => region,
-                                }
+                                    _ => return region,
+                                };
+                                errors.push(region);
+                                region
                             });
+                    }
+                    // What an `impl Trait` it returns has for the lifetimes its parameters
+                    // leave out.
+                    if aligned {
+                        let regions =
+                            hir_ty::elided_lifetimes(self.ctx.db, function).regions(&errors);
+                        output =
+                            hir_ty::with_elided_regions(self.ctx.db, output, function, &regions);
                     }
                     let mut defaults = ObjectDefaults {
                         db: self.ctx.db,
@@ -4345,7 +4388,12 @@ impl<'db> Builder<'_, '_, 'db> {
                             }
                             _ => (false, true, false, false),
                         };
+                        let function = match def {
+                            CallableDefId::FunctionId(it) => Some(it),
+                            _ => None,
+                        };
                         let (inputs, output) = self.elide(
+                            function,
                             sig.inputs().iter().copied().collect(),
                             sig.output(),
                             self_param,
@@ -4501,8 +4549,12 @@ impl<'db> Builder<'_, '_, 'db> {
     /// lifetime of the inputs. The default lifetime of a trait object is not one of them.
     /// `static_self`: `self` is of an impl for `dyn Trait`, whose lifetime the impl's header
     /// defaults to `'static` (`impl dyn Trait { fn f(&self) }`), not the reference's.
+    /// An `impl Trait` `function` returns has, for each lifetime its parameters leave out, that
+    /// lifetime's region.
+    #[allow(clippy::too_many_arguments)]
     fn elide(
         &self,
+        function: Option<hir_def::FunctionId>,
         inputs: Vec<Ty<'db>>,
         output: Ty<'db>,
         self_param: bool,
@@ -4512,13 +4564,18 @@ impl<'db> Builder<'_, '_, 'db> {
     ) -> (Vec<Ty<'db>>, Ty<'db>) {
         let interner = self.interner();
         let mut defaults = ObjectDefaults { db: self.ctx.db, interner, keep_static, erase: false };
+        let mut errors = vec![Vec::new(); inputs.len()];
         let inputs: Vec<Ty<'db>> = inputs
             .into_iter()
             .enumerate()
             .map(|(index, ty)| {
                 let ty =
                     rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
-                        RegionKind::ReError(_) => self.fresh(),
+                        RegionKind::ReError(_) => {
+                            let region = self.fresh();
+                            errors[index].push(region);
+                            region
+                        }
                         _ => region,
                     });
                 if static_self && index == 0 {
@@ -4548,6 +4605,13 @@ impl<'db> Builder<'_, '_, 'db> {
                 _ => None,
             }
         });
+        let output = match function {
+            Some(function) => {
+                let regions = hir_ty::elided_lifetimes(self.ctx.db, function).regions(&errors);
+                hir_ty::with_elided_regions(self.ctx.db, output, function, &regions)
+            }
+            None => output,
+        };
         // A return of `Self` elides nothing: its anonymous lifetimes are the impl's,
         // `impl Foo<'_>`, which rust-analyzer leaves as errors too.
         let output =

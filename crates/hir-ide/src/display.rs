@@ -2322,6 +2322,10 @@ impl<'db> HirDisplay<'db> for Region<'db> {
         match self.kind() {
             RegionKind::ReEarlyParam(param) => {
                 let generics = GenericParams::of(f.db, param.id.parent);
+                // That of an `impl Trait` for a lifetime its function's parameters leave out.
+                if param.id.local_id.into_raw().into_u32() as usize >= generics.len_lifetimes() {
+                    return write!(f, "'_");
+                }
                 let param_data = &generics[param.id.local_id];
                 f.start_location_link_generic(param.id.into());
                 write!(f, "{}", param_data.name.display(f.db, f.edition()))?;

@@ -94,9 +94,10 @@ pub use infer::{
     cast::CastError, could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
 };
 pub use lower::{
-    FieldType, GenericDefaults, GenericDefaultsRef, GenericPredicates, LifetimeElisionKind,
-    LifetimeLoweringMode, LoweringMode, TyDefId, TyLoweringContext, TyLoweringInferVarsCtx,
-    TyLoweringResult, ValueTyDefId, diagnostics::*,
+    ElidedLifetimes, ElidedOutput, FieldType, GenericDefaults, GenericDefaultsRef,
+    GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, TyDefId,
+    TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult, ValueTyDefId, diagnostics::*,
+    elided_lifetimes, with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use target_feature::TargetFeatures;

@@ -55,3 +55,60 @@ pub(crate) fn borrowck_skipped(
         d.node,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::check_diagnostics;
+
+    #[test]
+    fn impl_trait_captures_elided_lifetime_2024() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy
+//- /main.rs edition:2024
+struct S(i32);
+impl S {
+    fn get(&self) -> impl Sized { &self.0 }
+    fn kept(&self) -> impl Sized + use<> {}
+    fn set(&mut self) {}
+}
+fn consume<T>(_: T) {}
+fn user(mut s: S) {
+    let it = s.get();
+    s.set();
+  //^^^^^^^ error: cannot borrow `s` as mutable because it is also borrowed as immutable
+    consume(it);
+    let kept = s.kept();
+    s.set();
+    consume(kept);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn impl_trait_captures_elided_lifetime_2021() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, copy
+//- /main.rs edition:2021
+struct S(i32);
+impl S {
+    fn get(&self) -> impl Sized + '_ { &self.0 }
+    fn copied(&self) -> impl Sized { self.0 }
+    fn set(&mut self) {}
+}
+fn consume<T>(_: T) {}
+fn user(mut s: S) {
+    let it = s.get();
+    s.set();
+  //^^^^^^^ error: cannot borrow `s` as mutable because it is also borrowed as immutable
+    consume(it);
+    let copied = s.copied();
+    s.set();
+    consume(copied);
+}
+"#,
+        );
+    }
+}

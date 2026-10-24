@@ -165,14 +165,27 @@ impl<'db> Filler<'db> {
         if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
             return ty;
         }
+        // The arguments for the lifetimes the method's parameters leave out follow its own.
+        let elided = crate::lower::elided_lifetimes(db, func).len() as usize;
+        let Some(own) = alias.args.len().checked_sub(elided) else { return ty };
+        let (own, elided_args) = alias.args.as_slice().split_at(own);
         let (either::Either::Left(implemented), args) =
-            db.lookup_impl_method(self.trait_env, func, alias.args)
+            db.lookup_impl_method(self.trait_env, func, GenericArgs::new_from_slice(own))
         else {
             return ty;
         };
         if implemented == func {
             return ty;
         }
+        let interner = self.infcx.interner;
+        let args = match crate::lower::elided_lifetimes(db, implemented).len() as usize {
+            len if len == elided => {
+                GenericArgs::new_from_iter(args.iter().chain(elided_args.iter().copied()))
+            }
+            len => GenericArgs::new_from_iter(
+                args.iter().chain(std::iter::repeat_n(Region::error(interner).into(), len)),
+            ),
+        };
         let opaque =
             InternedOpaqueTyId::new(db, crate::ImplTraitId::ReturnTypeImplTrait(implemented, idx));
         Ty::new_alias(

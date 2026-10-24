@@ -247,10 +247,12 @@ impl<'db> Check<'_, 'db> {
         // each a lifetime parameter of its own.
         let interner = self.interner();
         let mut anonymous = 0;
+        let mut errors = vec![Vec::new(); sig.inputs().len()];
         let inputs: Vec<Ty<'db>> = sig
             .inputs()
             .iter()
-            .map(|&ty| {
+            .zip(&mut errors)
+            .map(|(&ty, errors)| {
                 rustc_type_ir::fold_regions(interner, ty, |region, _| {
                     if !region.is_error() {
                         return region;
@@ -258,7 +260,9 @@ impl<'db> Check<'_, 'db> {
                     anonymous += 1;
                     let var = BoundVar::from_u32(u32::MAX / 2 + anonymous);
                     let bound_region = BoundRegion { var, kind: BoundRegionKind::Anon };
-                    Region::new_late_param(interner, function.into(), bound_region)
+                    let region = Region::new_late_param(interner, function.into(), bound_region);
+                    errors.push(region);
+                    region
                 })
             })
             .collect();
@@ -270,7 +274,9 @@ impl<'db> Check<'_, 'db> {
             let Some(header) = self.header(impl_) else { return };
             assumed.extend(header);
         }
-        let output = sig.output();
+        // An `impl Trait` it returns has those lifetimes too.
+        let regions = hir_ty::elided_lifetimes(db, function).regions(&errors);
+        let output = hir_ty::with_elided_regions(db, sig.output(), function, &regions);
         if output.references_error() {
             return;
         }

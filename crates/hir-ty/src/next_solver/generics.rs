@@ -1,7 +1,7 @@
 //! Things related to generics in the next-trait-solver.
 
 use hir_def::{
-    GenericDefId, GenericParamId, TypeParamId,
+    FunctionId, GenericDefId, GenericParamId, TypeParamId,
     hir::generics::{GenericParamDataRef, LifetimeParamData},
 };
 
@@ -14,7 +14,17 @@ pub(crate) fn generics<'db>(interner: DbInterner<'db>, def: SolverDefId<'db>) ->
     let (def, consider_late_bound) = match (def.try_into(), def) {
         (Ok(def), _) => (def, false),
         (_, SolverDefId::InternedOpaqueTyId(id)) => match id.loc(db) {
-            crate::ImplTraitId::ReturnTypeImplTrait(function_id, _) => (function_id.into(), true),
+            crate::ImplTraitId::ReturnTypeImplTrait(function_id, _) => {
+                let mut generics = Generics::from_generic_def(db, function_id.into(), true);
+                let declared = hir_def::hir::generics::GenericParams::of(db, function_id.into())
+                    .len_lifetimes() as u32;
+                generics.elided = Some((
+                    function_id,
+                    declared,
+                    crate::lower::elided_lifetimes(db, function_id).len(),
+                ));
+                return generics;
+            }
             crate::ImplTraitId::TypeAliasImplTrait(type_alias_id, _) => {
                 (type_alias_id.into(), true)
             }
@@ -41,6 +51,7 @@ pub(crate) fn generics<'db>(interner: DbInterner<'db>, def: SolverDefId<'db>) ->
                     generics: crate::generics::Generics::empty(generic_def),
                     additional_param: None,
                     consider_late_bound: false,
+                    elided: None,
                 }
             };
         }
@@ -56,6 +67,10 @@ pub struct Generics<'db> {
     /// This is used for builtin derives, specifically `CoercePointee`.
     additional_param: Option<GenericParamId>,
     consider_late_bound: bool,
+    /// Of the `impl Trait` a function returns, how many lifetimes the function's parameters
+    /// leave out, which it has as parameters after the function's own, and how many lifetimes
+    /// the function declares, past which their ids are.
+    elided: Option<(FunctionId, u32, u32)>,
 }
 
 impl<'db> Generics<'db> {
@@ -68,6 +83,7 @@ impl<'db> Generics<'db> {
             generics: crate::generics::generics(db, def),
             additional_param: None,
             consider_late_bound,
+            elided: None,
         }
     }
 
@@ -81,12 +97,23 @@ impl<'db> Generics<'db> {
             generics: crate::generics::generics(db, def),
             additional_param: Some(additional_param.into()),
             consider_late_bound,
+            elided: None,
         }
     }
 
+    /// A lifetime parameter for a lifetime a function's parameters leave out has no data.
     pub(super) fn iter(
         &self,
     ) -> impl Iterator<Item = (GenericParamId, Option<&LifetimeParamData>)> {
+        let elided = self.elided.into_iter().flat_map(|(function, declared, len)| {
+            (declared..declared + len).map(move |index| {
+                let param = hir_def::LifetimeParamId {
+                    parent: function.into(),
+                    local_id: la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(index)),
+                };
+                (param.into(), None)
+            })
+        });
         self.generics
             .iter(self.consider_late_bound)
             .map(|(id, data)| {
@@ -97,11 +124,14 @@ impl<'db> Generics<'db> {
                 }
             })
             .chain(self.additional_param.map(|param| (param, None)))
+            .chain(elided)
     }
 }
 
 impl<'db> rustc_type_ir::inherent::GenericsOf<DbInterner<'db>> for Generics<'db> {
     fn count(&self) -> usize {
-        self.generics.len(self.consider_late_bound) + usize::from(self.additional_param.is_some())
+        self.generics.len(self.consider_late_bound)
+            + usize::from(self.additional_param.is_some())
+            + self.elided.map_or(0, |(_, _, len)| len as usize)
     }
 }
