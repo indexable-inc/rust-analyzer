@@ -76,6 +76,8 @@ pub struct Files {
     source_roots: Arc<DashMap<SourceRootId, SourceRootInput, BuildHasherDefault<FxHasher>>>,
     file_source_roots: Arc<DashMap<vfs::FileId, FileSourceRootInput, BuildHasherDefault<FxHasher>>>,
     included: Arc<DashMap<AbsPathBuf, IncludedFile, BuildHasherDefault<FxHasher>>>,
+    /// Which crate's `include_bytes!` or `include_str!` read which of those.
+    included_by: Arc<DashMap<(Crate, AbsPathBuf), (), BuildHasherDefault<FxHasher>>>,
     /// Files an `include!` or a module declaration named that are not in the VFS, with the
     /// source root of the file that names them.
     included_sources: Arc<DashMap<AbsPathBuf, SourceRootId, BuildHasherDefault<FxHasher>>>,
@@ -175,12 +177,32 @@ impl Files {
     pub fn included_file(
         &self,
         db: &dyn SourceDatabase,
+        krate: Crate,
         path: &AbsPath,
         durability: Durability,
     ) -> IncludedFile {
+        if !self.included_by.contains_key(&(krate, path.to_path_buf())) {
+            self.included_by.insert((krate, path.to_path_buf()), ());
+        }
         *self.included.entry(path.to_path_buf()).or_insert_with(|| {
             IncludedFile::builder(self.read_included(path)).durability(durability).new(db)
         })
+    }
+
+    /// The files outside the VFS that `krate` has read, with the bytes it read of each:
+    /// `None` for one that could not be read.
+    pub fn included_by(
+        &self,
+        db: &dyn SourceDatabase,
+        krate: Crate,
+    ) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        let paths = self.included_by.iter().filter(|it| it.key().0 == krate);
+        let paths: Vec<AbsPathBuf> = paths.map(|it| it.key().1.clone()).collect();
+        let read = |path: AbsPathBuf| {
+            let file = self.included.get(&path).map(|it| *it)?;
+            Some((path, file.bytes(db).clone()))
+        };
+        paths.into_iter().filter_map(read).collect()
     }
 
     fn read_included(&self, path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
@@ -431,8 +453,9 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
         source_root.source_root(self).resolve_path(path)
     }
 
-    /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS.
-    fn included_file(&self, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
+    /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS,
+    /// as `krate` reads it.
+    fn included_file(&self, _krate: Crate, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
         None
     }
 

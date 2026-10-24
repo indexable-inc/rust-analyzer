@@ -957,7 +957,7 @@ fn included_bytes<'db>(
     {
         return Some(db.file_text(file).text(db).as_bytes());
     }
-    db.included_file(path)?.bytes(db).as_deref()
+    db.included_file(call_id.loc(db).krate, path)?.bytes(db).as_deref()
 }
 
 fn include_str_expand(

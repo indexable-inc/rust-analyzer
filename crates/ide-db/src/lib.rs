@@ -126,6 +126,15 @@ impl RootDatabase {
         self.files.included_files()
     }
 
+    /// The files outside the VFS that `include_bytes!` and `include_str!` in `krate` have read,
+    /// with the bytes read of each.
+    pub fn included_by(
+        &self,
+        krate: base_db::Crate,
+    ) -> Vec<(vfs::AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
+        self.files.included_by(self, krate)
+    }
+
     /// The files an `include!` named that the VFS has not, each with the source root of the
     /// file that includes it.
     pub fn included_sources(&self) -> Vec<(vfs::AbsPathBuf, SourceRootId)> {
@@ -215,13 +224,17 @@ impl SourceDatabase for RootDatabase {
         files.set_source_root_with_durability(self, source_root_id, source_root, durability);
     }
 
-    fn included_file(&self, path: base_db::AnchoredPath<'_>) -> Option<base_db::IncludedFile> {
+    fn included_file(
+        &self,
+        krate: base_db::Crate,
+        path: base_db::AnchoredPath<'_>,
+    ) -> Option<base_db::IncludedFile> {
         let root = self.file_source_root(path.anchor).source_root_id(self);
         let root = self.source_root(root).source_root(self);
         let anchor = root.path_for_file(&path.anchor)?.as_path()?;
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
         let path = anchor.parent()?.absolutize(path.path);
-        Some(self.files.included_file(self, &path, durability))
+        Some(self.files.included_file(self, krate, &path, durability))
     }
 
     fn env_is_read(&self, krate: base_db::Crate, key: &str) {
