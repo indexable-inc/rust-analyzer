@@ -653,7 +653,8 @@ impl<'db> Evaluator<'db> {
                     let arg3 = from_bytes!(f64, arg3.get(self)?);
                     arg1.mul_add(arg2, arg3)
                 }
-                _ => not_supported!("unknown f64 intrinsic {name}"),
+                _ if needs_override => not_supported!("unknown f64 intrinsic {name}"),
+                _ => return Ok(false),
             };
             return destination.write_from_bytes(self, &result.to_le_bytes()).map(|()| true);
         }
@@ -725,7 +726,8 @@ impl<'db> Evaluator<'db> {
                     let arg3 = from_bytes!(f32, arg3.get(self)?);
                     arg1.mul_add(arg2, arg3)
                 }
-                _ => not_supported!("unknown f32 intrinsic {name}"),
+                _ if needs_override => not_supported!("unknown f32 intrinsic {name}"),
+                _ => return Ok(false),
             };
             return destination.write_from_bytes(self, &result.to_le_bytes()).map(|()| true);
         }
