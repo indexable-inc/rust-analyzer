@@ -261,13 +261,20 @@ fn type_info_names() {
 }
 
 #[test]
-fn type_info_out_of_bounds_and_escaping_ids() {
+fn type_info_out_of_bounds() {
     check_fail(
         &format!("{TYPE_INFO}\n    const GOAL: usize = type_id_fields(type_id::<Shape>(), 2);"),
         |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::UndefinedBehavior(_))),
     );
-    check_fail(&format!("{TYPE_INFO}\n    const GOAL: TypeId = type_id::<u8>();"), |e| {
-        matches!(e, ConstEvalError::MirEvalError(MirEvalError::NotSupported(_)))
+}
+
+#[test]
+fn type_id_in_constant() {
+    use rustc_type_ir::{TyKind, UintTy, inherent::IntoKind};
+    check_answer(&format!("{TYPE_INFO}\n    const GOAL: TypeId = type_id::<u8>();"), |b, mm| {
+        let id = u128::from_le_bytes(b.try_into().unwrap());
+        let ty = mm.type_id_ty(id).expect("the constant says what type its id is of");
+        assert!(matches!(ty.kind(), TyKind::Uint(UintTy::U8)), "{ty:?}");
     });
 }
 

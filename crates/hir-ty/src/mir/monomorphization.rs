@@ -127,7 +127,7 @@ impl<'db> Filler<'db> {
         let normalize = |ty| {
             ObligationCtxt::new(&self.infcx)
                 .structurally_normalize_ty(&ObligationCause::dummy(), self.trait_env.param_env, ty)
-                .map_err(|_| MirLowerError::NotSupported("can't normalize alias".to_owned()))
+                .map_err(|_| MirLowerError::NotSupported(format!("can't normalize alias {ty:?}")))
         };
         if !alias.has_escaping_bound_vars() {
             return normalize(alias);
@@ -157,45 +157,7 @@ impl<'db> Filler<'db> {
         let TyKind::Alias(alias) = ty.kind() else { return ty };
         let AliasTyKind::Opaque { def_id } = alias.kind else { return ty };
         let SolverDefId::InternedOpaqueTyId(opaque) = def_id.into() else { return ty };
-        let db = self.infcx.interner.db;
-        let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else {
-            return ty;
-        };
-        // A lifetime nothing settled is an error one, and no code depends on it.
-        if alias.args.has_type_flags(TypeFlags::HAS_PARAM) || references_non_lt_error(&alias.args) {
-            return ty;
-        }
-        // The arguments for the lifetimes the method's parameters leave out follow its own.
-        let elided = crate::lower::elided_lifetimes(db, func).len() as usize;
-        let Some(own) = alias.args.len().checked_sub(elided) else { return ty };
-        let (own, elided_args) = alias.args.as_slice().split_at(own);
-        let (either::Either::Left(implemented), args) =
-            db.lookup_impl_method(self.trait_env, func, GenericArgs::new_from_slice(own))
-        else {
-            return ty;
-        };
-        if implemented == func {
-            return ty;
-        }
-        let interner = self.infcx.interner;
-        let args = match crate::lower::elided_lifetimes(db, implemented).len() as usize {
-            len if len == elided => {
-                GenericArgs::new_from_iter(args.iter().chain(elided_args.iter().copied()))
-            }
-            len => GenericArgs::new_from_iter(
-                args.iter().chain(std::iter::repeat_n(Region::error(interner).into(), len)),
-            ),
-        };
-        let opaque =
-            InternedOpaqueTyId::new(db, crate::ImplTraitId::ReturnTypeImplTrait(implemented, idx));
-        Ty::new_alias(
-            self.infcx.interner,
-            AliasTy::new_from_args(
-                self.infcx.interner,
-                AliasTyKind::Opaque { def_id: opaque.into() },
-                args,
-            ),
-        )
+        opaque_of_impl(self.infcx.interner.db, self.trait_env, opaque, alias.args).unwrap_or(ty)
     }
 
     /// The hidden type of the `impl Trait` a function returns, when another `impl Trait` is
@@ -413,6 +375,56 @@ pub fn monomorphized<'db>(
     let mut body = body.clone();
     filler.fill_body(&mut body)?;
     Ok(body)
+}
+
+/// The opaque type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
+/// is with `args`, once they name the impl: `None` for one of another function, or while they
+/// don't.
+pub(crate) fn opaque_of_impl<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    opaque: InternedOpaqueTyId<'db>,
+    args: GenericArgs<'db>,
+) -> Option<Ty<'db>> {
+    let crate::ImplTraitId::ReturnTypeImplTrait(func, idx) = opaque.loc(db) else { return None };
+    if !matches!(hir_def::Lookup::lookup(&func, db).container, hir_def::ItemContainerId::TraitId(_))
+    {
+        return None;
+    }
+    // A lifetime nothing settled is an error one, and no code depends on it.
+    let unsettled = TypeFlags::HAS_PARAM | TypeFlags::HAS_TY_INFER | TypeFlags::HAS_CT_INFER;
+    if args.has_type_flags(unsettled) || references_non_lt_error(&args) {
+        return None;
+    }
+    let interner = DbInterner::new_with(db, env.krate);
+    // The arguments for the lifetimes the method's parameters leave out follow its own.
+    let elided = crate::lower::elided_lifetimes(db, func).len() as usize;
+    let own = args.len().checked_sub(elided)?;
+    let (own, elided_args) = args.as_slice().split_at(own);
+    // Which impl it is does not depend on lifetimes, and those of a solver's own are not ours.
+    let own = rustc_type_ir::fold_regions(interner, GenericArgs::new_from_slice(own), |_, _| {
+        Region::new_erased(interner)
+    });
+    let (either::Either::Left(implemented), args) = db.lookup_impl_method(env, func, own) else {
+        return None;
+    };
+    if implemented == func {
+        return None;
+    }
+    let args = match crate::lower::elided_lifetimes(db, implemented).len() as usize {
+        len if len == elided => {
+            GenericArgs::new_from_iter(args.iter().chain(elided_args.iter().copied()))
+        }
+        len => GenericArgs::new_from_iter(
+            args.iter().chain(std::iter::repeat_n(Region::error(interner).into(), len)),
+        ),
+    };
+    let opaque =
+        InternedOpaqueTyId::new(db, crate::ImplTraitId::ReturnTypeImplTrait(implemented, idx));
+    Some(Ty::new_alias(
+        interner,
+        AliasTy::new_from_args(interner, AliasTyKind::Opaque { def_id: opaque.into() }, args),
+    ))
 }
 
 /// `ty` of a monomorphized body with its aliases normalized, as the body's own types are.

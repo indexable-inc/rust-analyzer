@@ -55,6 +55,7 @@ pub use lower::{
     mir_body_query, promoted_mir_body_query,
 };
 pub use monomorphization::monomorphized;
+pub(crate) use monomorphization::opaque_of_impl;
 pub use monomorphization::{
     monomorphized_mir_body_for_closure_query, monomorphized_mir_body_for_coroutine_by_move_query,
     monomorphized_mir_body_for_coroutine_query, monomorphized_mir_body_query,

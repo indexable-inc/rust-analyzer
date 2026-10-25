@@ -531,20 +531,25 @@ impl<'db> Evaluator<'db> {
     /// Runs a body without arguments and takes its result out of the evaluator's memory.
     fn evaluate(&mut self, body: &'db MirBody<'db>, ty: Ty<'db>) -> Result<'db, Allocation<'db>> {
         let interval = self.interpret_mir(body, None.into_iter())?;
-        // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
-        // so only a constant that cannot carry one is answered: one of a type with no `TypeId`
-        // in it or behind its references. A `TypeId` is pointers to const eval, which cannot
-        // read them as integers, so no other value is computed from an id's bytes: comparing
-        // two (`IS_UNIT` in core) and reflection's counts, sizes and names are answered.
-        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut FxHashSet::default()) {
-            not_supported!("a constant computed from a `TypeId`");
-        }
         let bytes = interval.get(self)?;
         let mut memory_map =
             self.create_memory_map(bytes, ty, &Locals { ptr: ArenaMap::new(), body })?;
+        // The ids made here are not rustc's hashes and mean nothing outside this evaluation,
+        // so a constant that may hold one says what each is of. A `TypeId` is pointers to
+        // const eval, which cannot read them as integers, so no other value is computed from
+        // an id's bytes: comparing two (`IS_UNIT` in core) and reflection's counts, sizes and
+        // names are answered.
+        if !self.type_ids.is_empty() && !self.holds_no_type_id(ty, &mut FxHashSet::default()) {
+            let of = |it: &TypeIdOf<'db>| match *it {
+                TypeIdOf::Ty(ty) => Some(ty),
+                TypeIdOf::Field { .. } => None,
+            };
+            memory_map.type_ids = self.type_ids.iter().map(of).collect();
+        }
         let bytes = Box::from(bytes);
         let memory_map = if memory_map.memory.is_empty()
             && memory_map.statics.is_empty()
+            && memory_map.type_ids.is_empty()
             && self.vtable_map.is_empty()
         {
             MemoryMap::Empty
@@ -2284,6 +2289,10 @@ impl<'db> Evaluator<'db> {
         size: usize,
     ) -> Result<'db, ()> {
         let AllocationData { ty, memory: ref v, ref memory_map } = *allocation;
+        // Its ids are of the evaluation that made it, and mean another type here.
+        if memory_map.has_type_ids() {
+            not_supported!("a constant computed from a `TypeId`, read by another evaluation");
+        }
         let patch_map = memory_map.transform_addresses(|b, align| {
             let addr = self.heap_allocate(b.len(), align)?;
             self.write_memory(addr, b)?;
@@ -2691,6 +2700,12 @@ impl<'db> Evaluator<'db> {
                             | TyKind::Uint(_)
                             | TyKind::Float(_)
                     ) => {}
+                // Its pointers are an id, of nothing in memory.
+                TyKind::Adt(adt, _)
+                    if this
+                        .lang_items()
+                        .TypeId
+                        .is_some_and(|it| adt.def_id() == AdtId::StructId(it)) => {}
                 TyKind::Pat(base, _) => rec(this, bytes, base, locals, mm, stack_depth_limit - 1)?,
                 TyKind::RawPtr(..) => {
                     let Some(addr) = bytes.get(..this.ptr_size()) else { return Ok(()) };

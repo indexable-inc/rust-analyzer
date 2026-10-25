@@ -137,6 +137,10 @@ pub struct ComplexMemoryMap<'db> {
     /// What the address of a piece of `memory` was a multiple of where it was made, for
     /// those where that is known.
     aligns: IndexMap<usize, usize, FxBuildHasher>,
+    /// The types of the `TypeId`s the constant may hold, by the ids the evaluation gave them:
+    /// those are not rustc's hashes, which whoever emits the constant puts in their place.
+    /// `None` for the id of a field reflection made.
+    type_ids: Vec<Option<Ty<'db>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +211,17 @@ impl<'db> MemoryMap<'db> {
             MemoryMap::Empty | MemoryMap::Simple(_) => Err(MirEvalError::InvalidVTableId(id)),
             MemoryMap::Complex(cm) => cm.vtable.ty(id),
         }
+    }
+
+    /// The type of the `TypeId` whose bytes, as an integer, are `id`.
+    pub fn type_id_ty(&self, id: u128) -> Option<Ty<'db>> {
+        let MemoryMap::Complex(map) = self else { return None };
+        *map.type_ids.get(usize::try_from(id.checked_sub(1)?).ok()?)?
+    }
+
+    /// Whether the constant may hold a `TypeId`, which only [`Self::type_id_ty`] reads.
+    pub fn has_type_ids(&self) -> bool {
+        matches!(self, MemoryMap::Complex(map) if !map.type_ids.is_empty())
     }
 
     fn simple(v: Box<[u8]>) -> Self {

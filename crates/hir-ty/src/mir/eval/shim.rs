@@ -8,10 +8,7 @@ use hir_def::{
     signatures::{FunctionSignature, StructSignature, UnionSignature},
 };
 use rustc_abi::ExternAbi;
-use rustc_type_ir::{
-    TypeVisitableExt,
-    inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _},
-};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
@@ -1823,16 +1820,19 @@ impl<'db> Evaluator<'db> {
     }
 
     /// `ty` as a `TypeId` is of it: its aliases normalized and its lifetimes erased, which
-    /// a `TypeId` does not tell apart. Those of a binder in it are refused, for two spellings
-    /// of one such type to have one id.
+    /// a `TypeId` does not tell apart. Those of a binder in it are numbered in their order,
+    /// for two spellings of one such type to have one id.
     fn type_id_ty(&self, ty: Ty<'db>) -> Result<'db, Ty<'db>> {
+        use rustc_type_ir::TypeFoldable;
         let ty = crate::mir::monomorphization::normalized_ty(self.db, ty, self.param_env)
             .map_err(|e| MirEvalError::NotSupported(format!("a `TypeId` of {ty:?}: {e:?}")))?;
-        if ty.has_bound_regions() {
-            not_supported!("`type_id` of a type with lifetimes of its own");
-        }
-        let erased = Region::new_erased(self.interner());
-        Ok(rustc_type_ir::fold_regions(self.interner(), ty, |_, _| erased))
+        let interner = self.interner();
+        let erased = Region::new_erased(interner);
+        let ty = rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
+            rustc_type_ir::RegionKind::ReBound(..) => region,
+            _ => erased,
+        });
+        Ok(ty.fold_with(&mut Anonymized(interner)))
     }
 
     /// How many variants reflection says `ty` has: an enum's, and one for anything else.
@@ -1935,5 +1935,25 @@ impl<'db> Evaluator<'db> {
         let fields = value.map(|it| IntervalOrOwned::Owned(it.as_ref().to_vec()));
         let bytes = self.construct_with_layout(size, &layout, tag, fields.into_iter())?;
         destination.write_from_bytes(self, &bytes)
+    }
+}
+
+/// Numbers the variables of every binder in what it folds in their order, with no names.
+struct Anonymized<'db>(crate::next_solver::DbInterner<'db>);
+
+impl<'db> rustc_type_ir::TypeFolder<crate::next_solver::DbInterner<'db>> for Anonymized<'db> {
+    fn cx(&self) -> crate::next_solver::DbInterner<'db> {
+        self.0
+    }
+
+    fn fold_binder<T>(
+        &mut self,
+        binder: rustc_type_ir::Binder<crate::next_solver::DbInterner<'db>, T>,
+    ) -> rustc_type_ir::Binder<crate::next_solver::DbInterner<'db>, T>
+    where
+        T: rustc_type_ir::TypeFoldable<crate::next_solver::DbInterner<'db>>,
+    {
+        use rustc_type_ir::{Interner, TypeSuperFoldable};
+        self.0.anonymize_bound_vars(binder.super_fold_with(self))
     }
 }

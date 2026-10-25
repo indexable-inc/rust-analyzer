@@ -2116,6 +2116,16 @@ impl<'db> Interner for DbInterner<'db> {
         None
     }
 
+    fn opaque_of_impl(
+        self,
+        param_env: Self::ParamEnv,
+        def_id: Self::OpaqueTyId,
+        args: Self::GenericArgs,
+    ) -> Option<Self::Ty> {
+        let env = crate::ParamEnvAndCrate { param_env, krate: self.krate? };
+        crate::mir::opaque_of_impl(self.db, env, def_id.0, args)
+    }
+
     fn type_of_opaque_hir_typeck(
         self,
         opaque: Self::LocalOpaqueTyId,
