@@ -1298,10 +1298,15 @@ fn cargo_to_crate_graph(
     let mut pkg_to_lib_crate = FxHashMap::default();
     let mut pkg_crates = FxHashMap::default();
     let workspace_proc_macro_cwd = Arc::new(cargo.workspace_root().to_path_buf());
+    // As cargo builds them, the unit tests of a library are a crate of their own, its root
+    // file with `cfg(test)` and its dev-dependencies, which nothing depends on; every other
+    // crate links the library built without them. Each such crate, by the library's.
+    let unit_tests_apart = set_test && sysroot_as_built() && !cargo.is_sysroot();
+    let mut unit_tests: FxHashSet<CrateBuilderId> = FxHashSet::default();
 
     // Next, create crates for each package, target pair
     for pkg in cargo.packages() {
-        let cfg_options = {
+        let options = |set_test: bool| {
             let mut cfg_options = cfg_options.clone();
 
             if cargo[pkg].is_local {
@@ -1326,6 +1331,7 @@ fn cargo_to_crate_graph(
             override_cfg.apply(&mut cfg_options, &cargo[pkg].name);
             cfg_options
         };
+        let cfg_options = options(set_test);
 
         let mut lib_tgt = None;
         for &tgt in cargo[pkg].targets.iter() {
@@ -1345,64 +1351,81 @@ fn cargo_to_crate_graph(
             let Some(file_id) = load(root) else { continue };
 
             let build_data = build_scripts.get_output(pkg);
-            let crate_id = add_target_crate_root(
-                crate_graph,
-                proc_macros,
-                cargo,
-                pkg_data,
-                build_data.zip(Some(build_scripts.error().is_some())),
-                {
+            let add = |crate_graph: &mut CrateGraphBuilder,
+                       proc_macros: &mut ProcMacroPaths,
+                       cfg_options: CfgOptions| {
+                let crate_id = add_target_crate_root(
+                    crate_graph,
+                    proc_macros,
+                    cargo,
+                    pkg_data,
+                    build_data.zip(Some(build_scripts.error().is_some())),
+                    cfg_options,
+                    file_id,
+                    name,
+                    kind,
+                    if pkg_data.is_local {
+                        if cargo.is_sysroot() {
+                            CrateOrigin::Lang(LangCrateOrigin::from(&*pkg_data.name))
+                        } else {
+                            CrateOrigin::Local {
+                                repo: pkg_data.repository.clone(),
+                                name: Some(Symbol::intern(&pkg_data.name)),
+                            }
+                        }
+                    } else if cargo.is_sysroot() {
+                        CrateOrigin::Lang(LangCrateOrigin::Dependency)
+                    } else {
+                        CrateOrigin::Library {
+                            repo: pkg_data.repository.clone(),
+                            name: Symbol::intern(&pkg_data.name),
+                        }
+                    },
+                    crate_ws_data.clone(),
+                    if pkg_data.is_member {
+                        workspace_proc_macro_cwd.clone()
+                    } else {
+                        Arc::new(pkg_data.manifest.parent().to_path_buf())
+                    },
+                    &cargo_path,
+                );
+                // Even crates that don't set proc-macro = true are allowed to depend on proc_macro
+                // (just none of the APIs work when called outside of a proc macro).
+                if let Some(proc_macro) = libproc_macro {
+                    add_proc_macro_dep(
+                        crate_graph,
+                        crate_id,
+                        proc_macro,
+                        matches!(kind, TargetKind::Lib { is_proc_macro: true }),
+                    );
+                }
+                crate_id
+            };
+            // A proc macro is loaded by the server, not linked, so its cfg is no other crate's.
+            let apart = unit_tests_apart
+                && pkg_data.is_local
+                && matches!(kind, TargetKind::Lib { is_proc_macro: false });
+            let crate_id = match apart {
+                true => add(crate_graph, proc_macros, options(false)),
+                false => {
                     // Cargo builds a test target, and nothing else of the package, as a test.
                     let mut cfg_options = cfg_options.clone();
                     if sysroot_as_built() && matches!(kind, TargetKind::Test) {
                         cfg_options.insert_atom(sym::test);
                     }
-                    cfg_options
-                },
-                file_id,
-                name,
-                kind,
-                if pkg_data.is_local {
-                    if cargo.is_sysroot() {
-                        CrateOrigin::Lang(LangCrateOrigin::from(&*pkg_data.name))
-                    } else {
-                        CrateOrigin::Local {
-                            repo: pkg_data.repository.clone(),
-                            name: Some(Symbol::intern(&pkg_data.name)),
-                        }
-                    }
-                } else if cargo.is_sysroot() {
-                    CrateOrigin::Lang(LangCrateOrigin::Dependency)
-                } else {
-                    CrateOrigin::Library {
-                        repo: pkg_data.repository.clone(),
-                        name: Symbol::intern(&pkg_data.name),
-                    }
-                },
-                crate_ws_data.clone(),
-                if pkg_data.is_member {
-                    workspace_proc_macro_cwd.clone()
-                } else {
-                    Arc::new(pkg_data.manifest.parent().to_path_buf())
-                },
-                &cargo_path,
-            );
+                    add(crate_graph, proc_macros, cfg_options)
+                }
+            };
             if let TargetKind::Lib { .. } = kind {
                 lib_tgt = Some((crate_id, name.clone()));
                 pkg_to_lib_crate.insert(pkg, crate_id);
             }
-            // Even crates that don't set proc-macro = true are allowed to depend on proc_macro
-            // (just none of the APIs work when called outside of a proc macro).
-            if let Some(proc_macro) = libproc_macro {
-                add_proc_macro_dep(
-                    crate_graph,
-                    crate_id,
-                    proc_macro,
-                    matches!(kind, TargetKind::Lib { is_proc_macro: true }),
-                );
-            }
-
             pkg_crates.entry(pkg).or_insert_with(Vec::new).push((crate_id, kind));
+            if apart && pkg_data.is_member {
+                let tests = add(crate_graph, proc_macros, cfg_options.clone());
+                unit_tests.insert(tests);
+                pkg_crates.entry(pkg).or_insert_with(Vec::new).push((tests, kind));
+            }
         }
 
         // Set deps to the core, std and to the lib target of the current package
@@ -1414,6 +1437,7 @@ fn cargo_to_crate_graph(
             if let Some((to, name)) = lib_tgt.clone()
                 && to != from
                 && kind != TargetKind::BuildScript
+                && !unit_tests.contains(&from)
             {
                 // (build script can not depend on its library target)
 
@@ -1439,6 +1463,15 @@ fn cargo_to_crate_graph(
             for &(from, kind) in targets {
                 // Build scripts may only depend on build dependencies.
                 if (dep.kind == DepKind::Build) != (kind == TargetKind::BuildScript) {
+                    continue;
+                }
+                // Those are its unit tests' alone.
+                if dep.kind == DepKind::Dev
+                    && unit_tests_apart
+                    && cargo[pkg].is_local
+                    && matches!(kind, TargetKind::Lib { is_proc_macro: false })
+                    && !unit_tests.contains(&from)
+                {
                     continue;
                 }
 
