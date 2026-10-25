@@ -618,6 +618,7 @@ pub(super) fn build<'db>(
         synthesized: synthesized(ctx),
         placeholders: FxHashMap::default(),
         forall_universe: None,
+        elided: Default::default(),
     };
     builder.universal_regions();
     builder.env_aliases();
@@ -687,6 +688,10 @@ struct Builder<'c, 'a, 'db> {
     /// The universe of the placeholders a `for<'a>` predicate being proven is instantiated
     /// with, which a type outlives only by outliving `'static`.
     forall_universe: Option<rustc_type_ir::UniverseIndex>,
+    /// The region variables given the error regions rust-analyzer leaves for elided lifetimes,
+    /// each a late-bound lifetime of its own in rustc: the fn pointer two fn items or closures
+    /// coerce to, `if r { up } else { down }`, is `for<'a> fn(&'a T)` there.
+    elided: std::cell::RefCell<FxHashSet<rustc_type_ir::RegionVid>>,
 }
 
 fn synthesized(ctx: &Ctx<'_, '_>) -> FxHashSet<hir_def::hir::ExprId> {
@@ -746,14 +751,23 @@ impl<'db> Builder<'_, '_, 'db> {
         self.ctx.infcx.next_region_var(hir_ty::Span::Dummy)
     }
 
+    /// A variable for the error region rust-analyzer leaves for an elided lifetime.
+    fn fresh_elided(&self) -> Region<'db> {
+        let var = self.fresh();
+        if let RegionKind::ReVar(vid) = var.kind() {
+            self.elided.borrow_mut().insert(vid);
+        }
+        var
+    }
+
     fn renumber<T: rustc_type_ir::TypeFoldable<hir_ty::next_solver::DbInterner<'db>>>(
         &self,
         value: T,
     ) -> T {
-        let infcx = &self.ctx.infcx;
         rustc_type_ir::fold_regions(self.interner(), value, |region, _| match region.kind() {
             RegionKind::ReBound(..) => region,
-            _ => infcx.next_region_var(hir_ty::Span::Dummy),
+            RegionKind::ReError(_) => self.fresh_elided(),
+            _ => self.fresh(),
         })
     }
 
@@ -1141,6 +1155,15 @@ impl<'db> Builder<'_, '_, 'db> {
                             .insert(self.regions.universals.len() - 1, self.const_positions);
                         self.const_positions += 1;
                         region
+                    }
+                    // What a fn pointer in the hidden type elides is its own, as in the one
+                    // `match k { a => mode, b => name }` coerces fn items to. An argument of
+                    // the hidden type itself is not, and is 'static as the rest.
+                    _ if opaque
+                        && depth != rustc_type_ir::INNERMOST
+                        && matches!(region.kind(), RegionKind::ReError(_)) =>
+                    {
+                        self.fresh_elided()
                     }
                     _ if hidden_static => self.static_region(),
                     _ if opaque => self.fresh(),
@@ -2710,7 +2733,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let elided = self.elided_output;
         let declared = rustc_type_ir::fold_regions(self.interner(), typed, |region, depth| {
             match region.kind() {
-                RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh()),
+                RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh_elided()),
                 RegionKind::ReVar(_) => self.fresh(),
                 _ => self.signature_region(region, depth).unwrap_or_else(|| self.fresh()),
             }
@@ -3901,7 +3924,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             );
                             let sig = rustc_type_ir::fold_regions(self.interner(), sig, |r, _| {
                                 match r.kind() {
-                                    RegionKind::ReError(_) => self.fresh(),
+                                    RegionKind::ReError(_) => self.fresh_elided(),
                                     _ => r,
                                 }
                             });
@@ -4593,7 +4616,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 let ty =
                     rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
                         RegionKind::ReError(_) => {
-                            let region = self.fresh();
+                            let region = self.fresh_elided();
                             errors[index].push(region);
                             region
                         }
@@ -4638,7 +4661,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let output =
             rustc_type_ir::fold_regions(interner, output, |region, _| match region.kind() {
                 RegionKind::ReError(_) if returns_self => self.fresh(),
-                RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh()),
+                RegionKind::ReError(_) => elided.unwrap_or_else(|| self.fresh_elided()),
                 _ => region,
             });
         (inputs, rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults))
@@ -5159,13 +5182,20 @@ impl<'db> Builder<'_, '_, 'db> {
         // A placeholder equated with an error region stands for a lifetime rust-analyzer
         // elided in a signature, whose trait objects it gives `'static` rather than that
         // lifetime (`fn(&mut dyn Write)` for `for<'b> FnMut(&'b mut dyn Write)`), so nothing
-        // else said of it holds.
+        // else said of it holds. Nor does it of one equated with the variable given such a
+        // region.
+        let elided = self.elided.borrow();
         let unknown: FxHashSet<Region<'db>> = pairs
             .iter()
             .flat_map(|&(a, b)| [(a, b), (b, a)])
-            .filter(|(it, other)| it.is_placeholder() && other.is_error())
+            .filter(|(it, other)| {
+                it.is_placeholder()
+                    && (other.is_error()
+                        || matches!(other.kind(), RegionKind::ReVar(vid) if elided.contains(&vid)))
+            })
             .map(|(it, _)| it)
             .collect();
+        drop(elided);
         // `a <= b`: `b` outlives `a`.
         for (shorter, longer) in pairs {
             if unknown.contains(&shorter) || unknown.contains(&longer) {

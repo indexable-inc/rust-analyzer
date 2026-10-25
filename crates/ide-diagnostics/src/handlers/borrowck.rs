@@ -154,6 +154,34 @@ fn main() {
     }
 
     #[test]
+    fn one_fn_pointer_of_items_or_closures_holds_for_any_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn, copy
+fn up(_: &u32, _: &u32) -> bool { true }
+fn down(_: &u32, _: &u32) -> bool { false }
+fn sort(_: impl FnMut(&u32, &u32) -> bool) {}
+fn pick(reverse: bool) {
+    sort(if reverse { up } else { down });
+    sort(match reverse {
+        true => |_: &u32, _: &u32| true,
+        false => |_: &u32, _: &u32| false,
+    });
+}
+struct Line<'a>(&'a u32);
+fn mode<'a>(_: &mut Line<'a>) {}
+fn name<'a>(_: &mut Line<'a>) {}
+fn element<'a>(first: bool) -> impl Fn(&mut Line<'a>) {
+    match first {
+        true => mode,
+        false => name,
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
     fn destructuring_assignment_moves_what_it_takes() {
         check_diagnostics(
             r#"
