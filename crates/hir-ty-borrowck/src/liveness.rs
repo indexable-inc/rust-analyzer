@@ -397,13 +397,12 @@ fn maybe_initialized_at_drops(
         }
     }
     let locals = body.locals.len();
+    // Every path of a local is below the local's own, so a local is initialized in part where
+    // one of its paths is.
     let initialized = |state: &BitSet| {
         let mut out = BitSet::new(locals);
-        for (local, _) in body.locals.iter() {
-            let path = moves.local_path(local);
-            if moves.find_in_descendants(path, &|it| state.contains(it)).is_some() {
-                out.insert(local.into_raw().into_u32() as usize);
-            }
+        for path in state.iter() {
+            out.insert(moves.paths[path].local.into_raw().into_u32() as usize);
         }
         out
     };
