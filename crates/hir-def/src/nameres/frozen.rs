@@ -331,6 +331,30 @@ fn vfs_path(real: bool, text: String) -> VfsPath {
     if real { VfsPath::new_real_path(text) } else { VfsPath::new_virtual_path(text) }
 }
 
+/// What stands for the `OUT_DIR` of a crate of the closure in the bytes: in the name of a file
+/// below it, in place of the crate's root directory, and, followed by the crate's index and a
+/// NUL, in a literal, as `include!(concat!(env!("OUT_DIR"), ..))` leaves one in its argument,
+/// of the crate being written or of a dependency whose macro calls it names. A build script
+/// writes below the target directory of the checkout that ran it, so the bytes of a crate are
+/// the same in every checkout. No path or literal holds a NUL.
+const OUT: &str = "\0OUT_DIR";
+
+fn out_dir(db: &dyn SourceDatabase, krate: Crate) -> Option<String> {
+    let out = krate.env(db).get("OUT_DIR")?;
+    let out = out.trim_end_matches('/');
+    (!out.is_empty()).then(|| out.to_owned())
+}
+
+/// The `OUT_DIR` of each crate of `closure` that has one, by its index there.
+fn out_dirs(db: &dyn SourceDatabase, closure: &[Crate]) -> Vec<(u32, String)> {
+    let dirs = closure.iter().enumerate();
+    dirs.filter_map(|(index, &krate)| Some((index as u32, out_dir(db, krate)?))).collect()
+}
+
+fn holds(bytes: &[u8], part: &[u8]) -> bool {
+    !part.is_empty() && bytes.windows(part.len()).any(|it| it == part)
+}
+
 /// `to` from the directory `from`, with `..` where it is not under it.
 fn relative(from: &str, to: &str) -> String {
     let from: Vec<_> = from.split('/').filter(|it| !it.is_empty()).collect();
@@ -429,6 +453,7 @@ pub struct Enc<'a> {
     /// modules in `searched`.
     block_owners: FxHashMap<BlockId, DefWithBodyId>,
     searched: FxHashSet<ModuleId>,
+    out_dirs: Vec<(u32, String)>,
 }
 
 /// Whether `loc` is an `include!` that reads a file: not the call of its argument, which has
@@ -469,6 +494,7 @@ impl<'a> Enc<'a> {
     pub fn new(db: &'a dyn SourceDatabase, krate: Crate) -> Self {
         let closure = closure(db, krate);
         let crates = closure.iter().enumerate().map(|(i, &it)| (it, i as u32)).collect();
+        let out_dirs = out_dirs(db, &closure);
         Enc {
             db,
             out: Vec::new(),
@@ -488,11 +514,19 @@ impl<'a> Enc<'a> {
             indexed: FxHashSet::default(),
             block_owners: FxHashMap::default(),
             searched: FxHashSet::default(),
+            out_dirs,
         }
     }
 
     /// The bytes written, after the files they name, which [`Dec::new_checked`] reads first.
     pub fn finish(mut self) -> R<Vec<u8>> {
+        // The target directories the closure's build scripts wrote below, which nothing the
+        // bytes say may name: they are of one checkout.
+        let mut places: Vec<String> = (self.out_dirs.iter())
+            .map(|(_, out)| out.find("/build/").map_or(out.clone(), |at| out[..at + 1].to_owned()))
+            .collect();
+        places.sort_unstable();
+        places.dedup();
         let body = std::mem::take(&mut self.out);
         self.usize(self.file_order.len())?;
         for file in std::mem::take(&mut self.file_order) {
@@ -501,15 +535,40 @@ impl<'a> Enc<'a> {
             self.str(&path)?;
             // A file outside the directory of its crate's root may be one a build script
             // wrote, which the key does not cover: its text is.
-            let outside = path.starts_with("../");
+            let outside = path.starts_with("../") || path.starts_with(OUT);
             self.bool(outside);
             if outside {
                 let text = self.db.file_text(file).text(self.db);
                 self.out.extend_from_slice(&hash128(text.as_bytes()).to_le_bytes());
             }
+            if !path.starts_with(OUT) {
+                let full = joined(&self.dirs[&owner], &path);
+                if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {
+                    return Err(format!("a file below {place}, a place of one checkout: {full}"));
+                }
+            }
         }
         self.out.extend_from_slice(&body);
+        if let Some(place) = places.iter().find(|it| holds(&self.out, it.as_bytes())) {
+            return Err(format!("the bytes name {place}, a place of one checkout"));
+        }
         Ok(self.out)
+    }
+
+    /// A literal's text with each `OUT_DIR` of the closure as [`OUT`], the crate's index and a
+    /// NUL.
+    fn unplaced(&self, text: &Symbol) -> R<Symbol> {
+        let written = text.as_str();
+        if written.contains('\0') {
+            return Err("a literal holding a NUL".to_owned());
+        }
+        let mut unplaced = written.to_owned();
+        for (index, out) in &self.out_dirs {
+            if unplaced.contains(out.as_str()) {
+                unplaced = unplaced.replace(out.as_str(), &format!("{OUT} {index}\0"));
+            }
+        }
+        Ok(if unplaced == written { text.clone() } else { Symbol::intern(&unplaced) })
     }
 }
 
@@ -607,7 +666,12 @@ impl Enc<'_> {
             .owners
             .get(&source_root)
             .ok_or_else(|| format!("a file of no crate of the closure: {path}"))?;
-        let name = (owner, relative(&self.dirs[&owner], &path));
+        // Named from the crate whose build script wrote it, whichever crate's root is beside it.
+        let below_out = self.out_dirs.iter().find_map(|(index, out)| {
+            let rest = path.strip_prefix(out.as_str())?;
+            rest.starts_with('/').then(|| (*index, format!("{OUT}{rest}")))
+        });
+        let name = below_out.unwrap_or_else(|| (owner, relative(&self.dirs[&owner], &path)));
         self.file_names.insert(file, name.clone());
         Ok(name)
     }
@@ -881,6 +945,7 @@ impl Enc<'_> {
                     suffix_len,
                 })) => {
                     self.u8(1);
+                    let text_and_suffix = self.unplaced(&text_and_suffix)?;
                     self.symbol(&text_and_suffix)?;
                     let (kind, hashes) = match kind {
                         LitKind::Byte => (0, 0),
@@ -1843,6 +1908,25 @@ impl<'a> Dec<'a> {
         Ok(dec)
     }
 
+    /// A literal's text with each `OUT_DIR` [`Enc::unplaced`] took out as this database has it.
+    fn placed(&self, text: Symbol) -> R<Symbol> {
+        if !text.as_str().contains('\0') {
+            return Ok(text);
+        }
+        let (mut placed, mut rest) = (String::new(), text.as_str());
+        while let Some(at) = rest.find(OUT) {
+            placed.push_str(&rest[..at]);
+            let mark = rest[at + OUT.len()..].strip_prefix(' ').and_then(|it| it.split_once('\0'));
+            let (index, after) = mark.ok_or("a literal with half a mark of an OUT_DIR")?;
+            let krate = index.parse::<usize>().ok().and_then(|it| self.closure.get(it).copied());
+            let krate = krate.ok_or("a literal with the OUT_DIR of no crate of the closure")?;
+            placed.push_str(&out_dir(self.db, krate).ok_or("an OUT_DIR the crate lacks")?);
+            rest = after;
+        }
+        placed.push_str(rest);
+        Ok(Symbol::intern(&placed))
+    }
+
     /// Whether the bytes were read to their end.
     pub fn finish(&self) -> R {
         match self.bytes.len() - self.at {
@@ -1950,13 +2034,19 @@ impl Dec<'_> {
                 self.paths.insert(owner, root_dir(self.db, krate)?);
             }
             let (dir, real, source_root) = &self.paths[&owner];
-            let full = joined(dir, &path);
+            let krate = self.closure[owner as usize];
+            let full = match path.strip_prefix(OUT) {
+                Some(rest) => {
+                    format!("{}{rest}", out_dir(self.db, krate).ok_or("a crate with no OUT_DIR")?)
+                }
+                None => joined(dir, &path),
+            };
             let source_root = self.db.source_root(*source_root).source_root(self.db);
             let found = source_root.file_for_path(&vfs_path(*real, full.clone())).copied();
             let Some(found) = found else {
-                let krate = self.closure[owner as usize];
                 let anchor = krate.data(self.db).root_file_id;
-                self.db.include_source(base_db::AnchoredPath { anchor, path: &path });
+                let path = if path.starts_with(OUT) { &full } else { &path };
+                self.db.include_source(base_db::AnchoredPath { anchor, path });
                 not_loaded.get_or_insert_with(|| format!("{full} is not loaded"));
                 continue;
             };
@@ -2165,6 +2255,7 @@ impl Dec<'_> {
                 }
                 1 => {
                     let text_and_suffix = self.symbol()?;
+                    let text_and_suffix = self.placed(text_and_suffix)?;
                     let kind = self.u8()?;
                     let hashes = self.u8()?;
                     let kind = match kind {
@@ -2977,6 +3068,50 @@ macro_rules! unroll { () => { pub fn made() {} } }
         let missing = TestDB::with_files(INCLUDED.split("//- /lib/out").next().unwrap());
         let why = unreadable(&missing, crate_named(&missing, "lib"), &bytes);
         assert!(why.as_ref().is_some_and(|it| it.ends_with("is not loaded")), "{why:?}");
+    }
+
+    #[test]
+    fn a_file_a_build_script_wrote_is_named_from_out_dir() {
+        // As two checkouts build one registry crate: its build script writes the same file
+        // below the target directory of each, and the crate includes it from there.
+        // A crate that depends on it names its macro calls, so the dependency's OUT_DIR too.
+        const WROTE: &str = r#"
+//- /main.rs crate:main deps:lib
+lib::unroll!();
+pub use lib::inside::f;
+//- /registry/lib/src/lib.rs crate:lib env:OUT_DIR=/first/target/out
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+include!("../../../first/target/out/made.rs");
+//- /first/target/out/made.rs
+#[macro_export]
+macro_rules! unroll { () => { pub fn made() {} } }
+pub mod inside { pub fn f() {} }
+"#;
+        let first = TestDB::with_files(WROTE);
+        let other = TestDB::with_files(&WROTE.replace("first", "other"));
+        let bytes: Vec<_> = ["lib", "main"]
+            .into_iter()
+            .map(|name| (name, encode(&first, crate_named(&first, name)).unwrap()))
+            .collect();
+        for (name, written) in &bytes {
+            let krate = crate_named(&other, name);
+            assert_eq!(encode(&other, krate).as_ref(), Ok(written), "{name}");
+            assert_eq!(unreadable(&other, krate, written), None, "{name}");
+        }
+        let mut served = TestDB::with_files(&WROTE.replace("first", "other"));
+        let maps = (bytes.iter())
+            .map(|(name, bytes)| {
+                let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
+                (crate_named(&served, name), frozen)
+            })
+            .collect();
+        set(&mut served, maps);
+        for name in ["lib", "main"] {
+            let dump =
+                |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
+            assert_eq!(dump(&served), dump(&other), "{name}");
+        }
     }
 
     #[test]
