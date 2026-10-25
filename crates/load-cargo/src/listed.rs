@@ -11,6 +11,26 @@ const LIST: &[u8] = b"RA_JIT_PROC_MACROS";
 
 static SERVER: OnceLock<AbsPathBuf> = OnceLock::new();
 
+/// For the sysroot of a workspace and libraries rustc compiled, the library that lists its
+/// macros a caller has of each, where it has one.
+pub type Own = dyn Fn(Option<&AbsPath>, &[AbsPathBuf]) -> Vec<Option<AbsPathBuf>> + Send + Sync;
+
+static OWN: OnceLock<Box<Own>> = OnceLock::new();
+
+/// Has each library a load names that does not list its macros expanded with the one `own`
+/// has of it, by the server [`serve_listed_with`] named. The first call is the one kept.
+pub fn own_libraries_with(own: Box<Own>) {
+    _ = OWN.set(own);
+}
+
+/// The library listing its macros that stands for each of `libraries`, where there is one.
+pub(crate) fn own(sysroot: Option<&AbsPath>, libraries: &[AbsPathBuf]) -> Vec<Option<AbsPathBuf>> {
+    match (OWN.get(), server()) {
+        (Some(own), Some(_)) if !libraries.is_empty() => own(sysroot, libraries),
+        _ => vec![None; libraries.len()],
+    }
+}
+
 /// Has the libraries with a list of their macros loaded from here on expanded by the server
 /// at `server`. The first call is the one kept.
 pub fn serve_listed_with(server: AbsPathBuf) {

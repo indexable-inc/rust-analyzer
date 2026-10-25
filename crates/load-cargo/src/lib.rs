@@ -10,7 +10,7 @@ extern crate rustc_driver as _;
 
 mod listed;
 mod wrap;
-pub use listed::{is_listed, serve_listed_with};
+pub use listed::{Own, is_listed, own_libraries_with, serve_listed_with};
 pub use wrap::{Wrap, asked, wrap_expanders};
 
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
@@ -199,6 +199,27 @@ impl Loaded {
             let ids = crate_graph.extend(other, &mut paths);
             members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
+        }
+        // A library rustc compiled is expanded with the one the caller has of it, if any.
+        let unlisted: Vec<AbsPathBuf> = match listed::server() {
+            Some(_) => proc_macros
+                .values()
+                .filter_map(|it| it.as_ref().ok())
+                .map(|(_, path)| path.clone())
+                .filter(|path| !is_listed(path))
+                .collect::<FxHashSet<_>>()
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
+        };
+        let own: FxHashMap<AbsPathBuf, AbsPathBuf> = {
+            let found = listed::own(ws.sysroot.root(), &unlisted);
+            unlisted.into_iter().zip(found).filter_map(|(it, own)| Some((it, own?))).collect()
+        };
+        for (_, path) in proc_macros.values_mut().filter_map(|it| it.as_mut().ok()) {
+            if let Some(own) = own.get(path) {
+                *path = own.clone();
+            }
         }
         let listed: FxHashSet<AbsPathBuf> = match listed::server() {
             Some(_) => proc_macros
