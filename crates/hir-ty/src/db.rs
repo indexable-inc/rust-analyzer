@@ -553,6 +553,11 @@ impl<'db> ClosureKey<'db> {
         ClosureKey { owner: loc.owner, nth, kind: loc.kind }
     }
 
+    /// Where the closure is among the closures of its body.
+    pub fn nth(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> u32 {
+        Self::new(db, loc).nth
+    }
+
     fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
         let closures = closure_exprs(db, self.owner.expression_store_owner(db), ());
         // A key from before an edit that took closures out of the body names none of them.
