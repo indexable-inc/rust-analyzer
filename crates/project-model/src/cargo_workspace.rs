@@ -1,6 +1,6 @@
 //! See [`CargoWorkspace`].
 
-use std::{borrow::Cow, ops, str::from_utf8};
+use std::{borrow::Cow, fmt, ops, str::from_utf8};
 
 use anyhow::Context;
 use base_db::{Env, TargetKind};
@@ -155,6 +155,43 @@ pub struct CargoConfig {
     /// The directory a build put the executables of the workspace in, which the tests of a
     /// package are told as `CARGO_BIN_EXE_<name>`.
     pub executables: Option<AbsPathBuf>,
+    /// Where the workspace and its `cargo metadata` come from instead of cargo. Cargo is
+    /// asked when it says no.
+    pub own_metadata: Option<OwnMetadata>,
+}
+
+/// The root manifest of the workspace a manifest is in, and `cargo metadata` of it for the
+/// target with the triple and the `cfg` given, cargo run with the variables given.
+type Root = dyn Fn(&ManifestPath) -> anyhow::Result<ManifestPath> + Send + Sync;
+type Metadata = dyn Fn(
+        &ManifestPath,
+        Option<&str>,
+        &[cfg::CfgAtom],
+        &FxHashMap<String, Option<String>>,
+    ) -> anyhow::Result<cargo_metadata::Metadata>
+    + Send
+    + Sync;
+
+/// What reads a workspace in place of `cargo locate-project` and `cargo metadata`.
+#[derive(Clone)]
+pub struct OwnMetadata {
+    pub root: std::sync::Arc<Root>,
+    pub metadata: std::sync::Arc<Metadata>,
+}
+
+impl PartialEq for OwnMetadata {
+    fn eq(&self, other: &OwnMetadata) -> bool {
+        std::sync::Arc::ptr_eq(&self.root, &other.root)
+            && std::sync::Arc::ptr_eq(&self.metadata, &other.metadata)
+    }
+}
+
+impl Eq for OwnMetadata {}
+
+impl fmt::Debug for OwnMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnMetadata")
+    }
 }
 
 pub type Package = Idx<PackageData>;

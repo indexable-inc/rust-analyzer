@@ -247,27 +247,37 @@ impl ProjectWorkspace {
         };
 
         // Resolve the Cargo.toml to the workspace root as we base the `target` dir off of it.
+        let own_root = config.own_metadata.as_ref().map(|own| (own.root)(cargo_toml));
+        let own_root = own_root.and_then(|it| {
+            it.inspect_err(|e| {
+                eprintln!("blaze could not find the workspace itself, so cargo does: {e:#}")
+            })
+            .ok()
+        });
         let mut cmd = sysroot.tool(Tool::Cargo, workspace_dir, extra_env);
         cmd.args(["locate-project", "--workspace", "--manifest-path", cargo_toml.as_str()]);
-        let cargo_toml = &match utf8_stdout(&mut cmd) {
-            Ok(output) => {
-                #[derive(serde_derive::Deserialize)]
-                struct Root {
-                    root: Utf8PathBuf,
-                }
-                match serde_json::from_str::<Root>(&output) {
-                    Ok(object) => ManifestPath::try_from(AbsPathBuf::assert(object.root))
-                        .expect("manifest path should be absolute"),
-                    Err(e) => {
-                        tracing::error!(%e, %cargo_toml, "failed fetching cargo workspace root");
-                        cargo_toml.clone()
+        let cargo_toml = &match own_root {
+            Some(root) => root,
+            None => match utf8_stdout(&mut cmd) {
+                Ok(output) => {
+                    #[derive(serde_derive::Deserialize)]
+                    struct Root {
+                        root: Utf8PathBuf,
+                    }
+                    match serde_json::from_str::<Root>(&output) {
+                        Ok(object) => ManifestPath::try_from(AbsPathBuf::assert(object.root))
+                            .expect("manifest path should be absolute"),
+                        Err(e) => {
+                            tracing::error!(%e, %cargo_toml, "failed fetching cargo workspace root");
+                            cargo_toml.clone()
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::error!(%e, %cargo_toml, "failed fetching cargo workspace root");
-                cargo_toml.clone()
-            }
+                Err(e) => {
+                    tracing::error!(%e, %cargo_toml, "failed fetching cargo workspace root");
+                    cargo_toml.clone()
+                }
+            },
         };
         let workspace_dir = cargo_toml.parent();
 
@@ -288,22 +298,37 @@ impl ProjectWorkspace {
             .ok()
             .flatten();
 
-        let fetch_metadata = FetchMetadata::new(
-            cargo_toml,
-            workspace_dir,
-            &CargoMetadataConfig {
-                features: features.clone(),
-                targets: targets.clone(),
-                extra_args: extra_args.clone(),
-                metadata_extra_args: metadata_extra_args.clone(),
-                config_path: config_path.clone(),
-                extra_env: extra_env.clone(),
-                toolchain_version: toolchain.clone(),
-                kind: "workspace",
-            },
-            &sysroot,
-            *no_deps,
-        );
+        // blaze's own `cargo metadata` needs the target's `cfg` first; cargo's is asked only
+        // when blaze's says no.
+        let mut own = config.own_metadata.as_ref().map(|own| {
+            let target = targets.first().map(Deref::deref);
+            let cfg = rustc_cfg::get(toolchain_config, target, extra_env);
+            let metadata = (own.metadata)(cargo_toml, target, &cfg, extra_env)
+                .inspect_err(|e| {
+                    eprintln!("blaze could not resolve the workspace itself, so cargo does: {e:#}")
+                })
+                .ok();
+            (cfg, metadata)
+        });
+        let own_metadata = own.as_mut().and_then(|it| it.1.take());
+        let fetch_metadata = own_metadata.is_none().then(|| {
+            FetchMetadata::new(
+                cargo_toml,
+                workspace_dir,
+                &CargoMetadataConfig {
+                    features: features.clone(),
+                    targets: targets.clone(),
+                    extra_args: extra_args.clone(),
+                    metadata_extra_args: metadata_extra_args.clone(),
+                    config_path: config_path.clone(),
+                    extra_env: extra_env.clone(),
+                    toolchain_version: toolchain.clone(),
+                    kind: "workspace",
+                },
+                &sysroot,
+                *no_deps,
+            )
+        });
 
         // We spawn a bunch of processes to query various information about the workspace's
         // toolchain and sysroot
@@ -312,8 +337,13 @@ impl ProjectWorkspace {
         let join = thread::scope(|s| {
             let rustc_cfg = Builder::new()
                 .name("ProjectWorkspace::rustc_cfg".to_owned())
-                .spawn_scoped(s, || {
-                    rustc_cfg::get(toolchain_config, targets.first().map(Deref::deref), extra_env)
+                .spawn_scoped(s, || match &own {
+                    Some((cfg, _)) => cfg.clone(),
+                    None => rustc_cfg::get(
+                        toolchain_config,
+                        targets.first().map(Deref::deref),
+                        extra_env,
+                    ),
                 })
                 .expect("failed to spawn thread");
             let target_data = Builder::new()
@@ -398,7 +428,10 @@ impl ProjectWorkspace {
 
             let cargo_metadata = Builder::new()
                 .name("ProjectWorkspace::cargo_metadata".to_owned())
-                .spawn_scoped(s, || fetch_metadata.exec(false, progress))
+                .spawn_scoped(s, || match fetch_metadata {
+                    Some(fetch_metadata) => fetch_metadata.exec(false, progress),
+                    None => Ok((own_metadata.expect("blaze's own metadata"), None)),
+                })
                 .expect("failed to spawn thread");
             let loaded_sysroot = Builder::new()
                 .name("ProjectWorkspace::loaded_sysroot".to_owned())
