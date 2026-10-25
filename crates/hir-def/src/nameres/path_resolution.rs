@@ -653,9 +653,9 @@ impl DefMap {
 
             let visible = curr_per_ns
                 .filter_visibility(|vis| vis.is_visible_from_def_map(db, self, original_module));
-            curr_per_ns = match visible.is_none()
-                && !curr_per_ns.is_none()
-                && self.is_test_harness(db, original_module)
+            // A name can be a private module and a public function at once: the harness keeps
+            // the module.
+            curr_per_ns = match visible != curr_per_ns && self.is_test_harness(db, original_module)
             {
                 true => curr_per_ns,
                 false => visible,
