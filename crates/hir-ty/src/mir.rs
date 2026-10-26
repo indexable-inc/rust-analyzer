@@ -52,7 +52,7 @@ pub use lower::is_builtin_index;
 pub use lower::{
     MirLowerError, is_by_move_coroutine, lower_body_to_mir, lower_to_mir_with_store,
     mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
-    mir_body_query, promoted_mir_body_query,
+    mir_body_query, promoted_mir_body_query, set_mir_capacity,
 };
 pub use monomorphization::monomorphized;
 pub(crate) use monomorphization::opaque_of_impl;
@@ -73,6 +73,7 @@ pub use transform::{
     monomorphized_runtime_mir_body_for_coroutine_query, monomorphized_runtime_mir_body_query,
     runtime_mir_body_for_closure_query, runtime_mir_body_for_coroutine_by_move_query,
     runtime_mir_body_for_coroutine_query, runtime_mir_body_query, runtime_promoted_mir_body_query,
+    set_runtime_mir_capacity,
 };
 
 pub type BasicBlockId = Idx<BasicBlock>;

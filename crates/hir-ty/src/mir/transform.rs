@@ -144,7 +144,21 @@ fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db
     Ok(body)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_cycle_result)]
+/// How many of the runtime bodies (and their monomorphized copies) salsa keeps the value of once
+/// a revision is over; 0 keeps every one. A body let go is lowered again when it is next asked
+/// for, and what depends on it cannot be backdated then.
+pub fn set_runtime_mir_capacity(db: &mut dyn HirDatabase, capacity: usize) {
+    runtime_mir_body_query::set_lru_capacity(db, capacity);
+    runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
+    runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
+    runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_cycle_result, lru = 0)]
 pub fn runtime_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
@@ -164,7 +178,7 @@ pub fn runtime_promoted_mir_body_query<'db>(
     run_passes(db, built)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_closure_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_closure_cycle_result, lru = 0)]
 pub fn runtime_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
@@ -172,7 +186,7 @@ pub fn runtime_mir_body_for_closure_query<'db>(
     run_passes(db, db.mir_body_for_closure(closure)?)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result, lru = 0)]
 pub fn runtime_mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
@@ -180,7 +194,7 @@ pub fn runtime_mir_body_for_coroutine_query<'db>(
     run_passes(db, db.mir_body_for_coroutine(coroutine)?)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result, lru = 0)]
 pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
@@ -188,7 +202,7 @@ pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     run_passes(db, db.mir_body_for_coroutine_by_move(coroutine)?)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_runtime_mir_body_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_runtime_mir_body_cycle_result, lru = 0)]
 pub fn monomorphized_runtime_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
@@ -200,7 +214,8 @@ pub fn monomorphized_runtime_mir_body_query<'db>(
 
 #[salsa::tracked(
     returns(as_ref),
-    cycle_result = monomorphized_runtime_mir_body_for_closure_cycle_result
+    cycle_result = monomorphized_runtime_mir_body_for_closure_cycle_result,
+    lru = 0
 )]
 pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
@@ -213,7 +228,8 @@ pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
 
 #[salsa::tracked(
     returns(as_ref),
-    cycle_result = monomorphized_runtime_mir_body_for_coroutine_cycle_result
+    cycle_result = monomorphized_runtime_mir_body_for_coroutine_cycle_result,
+    lru = 0
 )]
 pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
@@ -226,7 +242,8 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
 
 #[salsa::tracked(
     returns(as_ref),
-    cycle_result = monomorphized_runtime_mir_body_for_coroutine_cycle_result
+    cycle_result = monomorphized_runtime_mir_body_for_coroutine_cycle_result,
+    lru = 0
 )]
 pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db dyn HirDatabase,

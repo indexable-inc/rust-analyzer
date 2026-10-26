@@ -4307,7 +4307,7 @@ fn cast_kind<'db>(
     })
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_closure_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_closure_cycle_result, lru = 0)]
 pub fn mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
@@ -4316,7 +4316,7 @@ pub fn mir_body_for_closure_query<'db>(
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result, lru = 0)]
 pub fn mir_body_for_coroutine_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
@@ -4327,7 +4327,7 @@ pub fn mir_body_for_coroutine_query<'db>(
 /// The body of the `async` block of an `async` closure that is called by value though it could
 /// be called again: the future that makes owns what the closure captured, where the block
 /// itself borrows from the closure.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result)]
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result, lru = 0)]
 pub fn mir_body_for_coroutine_by_move_query<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
@@ -4704,7 +4704,16 @@ fn captured_place<'a>(
     })
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result)]
+/// How many of the lowered bodies salsa keeps the value of once a revision is over; 0 keeps
+/// every one.
+pub fn set_mir_capacity(db: &mut dyn HirDatabase, capacity: usize) {
+    mir_body_query::set_lru_capacity(db, capacity);
+    mir_body_for_closure_query::set_lru_capacity(db, capacity);
+    mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
+    mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result, lru = 0)]
 pub fn mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
