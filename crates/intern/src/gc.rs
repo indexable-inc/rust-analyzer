@@ -111,6 +111,8 @@ impl GarbageCollector {
         if cfg!(feature = "prevent-gc") {
             return;
         }
+        // What each thread interned is freed now, and its table of them is read no more.
+        crate::local::EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
         let total_nodes = self.storages.iter().map(|storage| storage.len()).sum();
         self.alive.clear();

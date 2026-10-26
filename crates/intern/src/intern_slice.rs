@@ -46,6 +46,28 @@ impl<T: SliceInternable> InternedSlice<T> {
 
         let storage = T::storage().get();
         let hash = Self::hash(storage, &header, slice);
+        let id = ptr::from_ref(storage).addr();
+        let same = |ptr: *const c_void| {
+            // SAFETY: What this thread interned in this epoch is not freed yet, and the pointer
+            // is a `ThinArc`'s.
+            let other = unsafe {
+                InternedSliceRef::<T> {
+                    ptr: NonNull::new_unchecked(ptr.cast_mut()),
+                    _marker: PhantomData,
+                }
+            };
+            let other = other.get();
+            other.header.header == header && other.slice == *slice
+        };
+        if let Some(mine) = crate::local::find(id, hash, |it| same(it.cast())) {
+            // SAFETY: As in `same`.
+            return unsafe {
+                InternedSliceRef {
+                    ptr: NonNull::new_unchecked(mine.cast_mut().cast()),
+                    _marker: PhantomData,
+                }
+            };
+        }
         let shard = &storage.shards()[storage.determine_shard(hash as usize)];
         // Nearly every slice interned already is, and is asked for from many threads at once:
         // looking under a lock other readers share finds it without waiting on them.
@@ -56,10 +78,12 @@ impl<T: SliceInternable> InternedSlice<T> {
             if let Some(bucket) = found {
                 // SAFETY: The bucket is read while its shard is locked; a collection, which frees
                 // it, runs only when no reference to one is alive. The pointer is a `ThinArc`'s.
+                let ptr = unsafe { ThinArc::as_ptr(&bucket.as_ref().0) };
+                crate::local::remember(id, hash, ptr.cast());
                 return unsafe {
                     InternedSliceRef {
                         // INVARIANT: We create it from a `ThinArc`.
-                        ptr: NonNull::new_unchecked(ThinArc::as_ptr(&bucket.as_ref().0).cast_mut()),
+                        ptr: NonNull::new_unchecked(ptr.cast_mut()),
                         _marker: PhantomData,
                     }
                 };
@@ -88,11 +112,13 @@ impl<T: SliceInternable> InternedSlice<T> {
             },
         };
         // SAFETY: We just retrieved/inserted this bucket.
+        let ptr = unsafe { ThinArc::as_ptr(&bucket.as_ref().0) };
+        crate::local::remember(id, hash, ptr.cast());
         // `NonNull::new_unchecked()` is safe because the pointer originates from a `ThinArc`.
         unsafe {
             InternedSliceRef {
                 // INVARIANT: We create it from a `ThinArc`.
-                ptr: NonNull::new_unchecked(ThinArc::as_ptr(&bucket.as_ref().0).cast_mut()),
+                ptr: NonNull::new_unchecked(ptr.cast_mut()),
                 _marker: PhantomData,
             }
         }

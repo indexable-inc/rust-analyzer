@@ -83,10 +83,18 @@ impl<T: Internable> Interned<T> {
 
         let storage = T::storage().get();
         let hash = Self::hash(storage, &obj);
+        let id = ptr::from_ref(storage).addr();
+        // SAFETY: What this thread interned in this epoch is not freed yet.
+        let mine = crate::local::find(id, hash, |it| unsafe { *it.cast::<T>() == obj });
+        if let Some(mine) = mine {
+            // SAFETY: The pointer is an `InternedRef`'s.
+            return unsafe { InternedRef::from_raw(mine.cast()) };
+        }
         // SAFETY: The bucket is read while its shard is locked; a collection, which frees it,
         // runs only when no `InternedRef` is alive.
         let found = |it: Bucket<T>| unsafe { InternedRef { arc: Arc::borrow_arc(&it.as_ref().0) } };
         if let Some(found) = Self::found(storage, hash, &obj, found) {
+            crate::local::remember(id, hash, found.as_raw().cast());
             return found;
         }
         let mut shard = Self::select(storage, hash);
@@ -108,7 +116,9 @@ impl<T: Internable> Interned<T> {
             },
         };
         // SAFETY: We just retrieved/inserted this bucket.
-        unsafe { InternedRef { arc: Arc::borrow_arc(&bucket.as_ref().0) } }
+        let interned = unsafe { InternedRef { arc: Arc::borrow_arc(&bucket.as_ref().0) } };
+        crate::local::remember(id, hash, interned.as_raw().cast());
+        interned
     }
 
     /// What `then` makes of the bucket `obj` is in, looked for under a lock that other readers

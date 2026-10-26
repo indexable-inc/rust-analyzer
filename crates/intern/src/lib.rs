@@ -5,6 +5,7 @@
 mod gc;
 mod intern;
 mod intern_slice;
+mod local;
 mod symbol;
 
 pub use self::gc::{GarbageCollector, GcInternedSliceVisit, GcInternedVisit};
