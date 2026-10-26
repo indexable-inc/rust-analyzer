@@ -20,6 +20,7 @@ pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
 pub mod transport;
+pub mod wrap;
 
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;

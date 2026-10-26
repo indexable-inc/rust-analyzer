@@ -9,8 +9,10 @@
 extern crate rustc_driver as _;
 
 mod listed;
+mod unsandboxed;
 mod wrap;
 pub use listed::{Own, is_listed, own_libraries_with, serve_listed_with};
+pub use unsandboxed::{Unsandboxed, unsandboxed_macros_with};
 pub use wrap::{Wrap, asked, wrap_expanders};
 
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
@@ -144,6 +146,9 @@ pub struct Loaded {
     /// The server of the libraries that list their macros ([`serve_listed_with`]), started
     /// when the first of them is loaded.
     listed_server: Option<Result<ProcMacroClient, ProcMacroLoadingError>>,
+    /// The two servers again, for the libraries run outside the sandbox
+    /// ([`unsandboxed_macros_with`]): the toolchain's and the listed one's.
+    unsandboxed_servers: [Option<Result<ProcMacroClient, ProcMacroLoadingError>>; 2],
 }
 
 impl Loaded {
@@ -230,23 +235,48 @@ impl Loaded {
                 .collect(),
             None => FxHashSet::default(),
         };
+        // The libraries of the crates the caller runs outside the sandbox.
+        let outside: FxHashSet<AbsPathBuf> = proc_macros
+            .values()
+            .filter_map(|it| it.as_ref().ok())
+            .filter(|(name, path)| unsandboxed::unsandboxed(ws.workspace_root(), name, path))
+            .map(|(_, path)| path.clone())
+            .collect();
+        let outside_env = {
+            let mut env = extra_env.clone();
+            env.insert(proc_macro_api::wrap::UNSANDBOXED.to_owned(), Some("1".to_owned()));
+            env
+        };
         // The toolchain's server is started for the libraries the other does not serve only,
         // so a load whose proc macros are all listed starts none of the toolchain's.
-        let unlisted = proc_macros.values().any(|it| match it {
-            Ok((_, path)) => !listed.contains(path),
-            Err(_) => false,
-        });
-        if self.proc_macro_server.is_none() && unlisted {
-            self.proc_macro_server = spawn_proc_macro_server(ws, extra_env, load_config);
-        }
-        if let Some(server) = listed::server().filter(|_| !listed.is_empty())
-            && self.listed_server.is_none()
-        {
-            let spawned =
-                ProcMacroClient::spawn(server, extra_env, None, load_config.proc_macro_processes);
-            self.listed_server = Some(spawned.map_err(|e| {
-                ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
-            }));
+        let wanted = |listed_one: bool, outside_one: bool| {
+            proc_macros.values().any(|it| match it {
+                Ok((_, path)) => {
+                    listed.contains(path) == listed_one && outside.contains(path) == outside_one
+                }
+                Err(_) => false,
+            })
+        };
+        for (outside_one, env) in [(false, extra_env), (true, &outside_env)] {
+            let (toolchain, listed_one) = match outside_one {
+                false => (&mut self.proc_macro_server, &mut self.listed_server),
+                true => {
+                    let [toolchain, listed_one] = &mut self.unsandboxed_servers;
+                    (toolchain, listed_one)
+                }
+            };
+            if toolchain.is_none() && wanted(false, outside_one) {
+                *toolchain = spawn_proc_macro_server(ws, env, load_config);
+            }
+            if let Some(server) = listed::server().filter(|_| wanted(true, outside_one))
+                && listed_one.is_none()
+            {
+                let spawned =
+                    ProcMacroClient::spawn(server, env, None, load_config.proc_macro_processes);
+                *listed_one = Some(spawned.map_err(|e| {
+                    ProcMacroLoadingError::ProcMacroSrvError(e.to_string().into_boxed_str())
+                }));
+            }
         }
         let proc_macros = {
             fn running(
@@ -262,15 +292,19 @@ impl Loaded {
             }
             let (proc_macro_server, listed_server) =
                 (running(&self.proc_macro_server), running(&self.listed_server));
+            let [outside_server, outside_listed_server] =
+                [&self.unsandboxed_servers[0], &self.unsandboxed_servers[1]].map(running);
             proc_macros
                 .into_iter()
                 .map(|(crate_id, path)| {
                     (
                         crate_id,
                         path.and_then(|(_, path)| {
-                            let server = match listed.contains(&path) {
-                                true => &listed_server,
-                                false => &proc_macro_server,
+                            let server = match (listed.contains(&path), outside.contains(&path)) {
+                                (true, false) => &listed_server,
+                                (false, false) => &proc_macro_server,
+                                (true, true) => &outside_listed_server,
+                                (false, true) => &outside_server,
                             };
                             server.as_ref().map_err(Clone::clone).and_then(|proc_macro_server| {
                                 load_proc_macro(proc_macro_server, &path, &[])
