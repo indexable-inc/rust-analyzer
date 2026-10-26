@@ -66,6 +66,7 @@ use crate::{
 use super::{OperandKind, Place};
 
 mod as_place;
+mod deref_pattern;
 mod match_tree;
 mod pattern_matching;
 
@@ -201,6 +202,9 @@ struct MirLowerCtx<'a, 'db> {
     guarded_moves: Option<Vec<GuardedMove<'db>>>,
     /// The reference a guard reads each binding of `guarded_moves` through.
     guard_refs: FxHashMap<BindingId, LocalId>,
+    /// The reference each deref pattern through a smart pointer that is not a `Box` was
+    /// tested through, for binding after the test.
+    deref_temps: FxHashMap<deref_pattern::DerefKey, LocalId>,
     /// While the pattern of a destructuring assignment is lowered: what it assigns, and the
     /// value it destructures, where a part that cannot be moved out of it is reported.
     assigned: Vec<Assigned>,
@@ -385,6 +389,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             or_choices: FxHashMap::default(),
             guarded_moves: None,
             guard_refs: FxHashMap::default(),
+            deref_temps: FxHashMap::default(),
             assigned: Vec::new(),
             assigned_from: MirSpan::Unknown,
             copy: FxHashMap::default(),

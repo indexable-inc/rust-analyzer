@@ -22,6 +22,7 @@ use crate::{
     next_solver::Region,
 };
 
+mod reflection;
 mod simd;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -581,6 +582,9 @@ impl<'db> Evaluator<'db> {
                 .exec_simd_intrinsic(name, args, generic_args, destination, locals, span)
                 .map(|()| true);
         }
+        if self.exec_reflection_intrinsic(name, args, destination, locals)? {
+            return Ok(true);
+        }
         // FIXME(#17451): Add `f16` and `f128` intrinsics.
         if let Some(name) = name.strip_suffix("f64") {
             let result = match name {
@@ -794,127 +798,6 @@ impl<'db> Evaluator<'db> {
                 let ty = self.type_id_ty(ty)?;
                 let id = self.type_id(TypeIdOf::Ty(ty));
                 destination.write_from_bytes(self, &id)
-            }
-            // Reflection (`core::mem::type_info`), which only const eval answers. A field's
-            // id stands for the field, as rustc's field representing type does.
-            "type_id_variants" => {
-                let [id] = args else { not_supported!("type_id_variants args") };
-                let ty = self.type_id_of(id)?;
-                let variants = self.reflected_variants(ty)?;
-                destination.write_from_bytes(self, &super::word_bytes(variants))
-            }
-            "type_id_fields" => {
-                let [id, variant] = args else { not_supported!("type_id_fields args") };
-                let ty = self.type_id_of(id)?;
-                let fields = self.reflected_fields(ty, from_bytes!(usize, variant.get(self)?))?;
-                destination.write_from_bytes(self, &super::word_bytes(fields.len()))
-            }
-            "type_id_field_representing_type" => {
-                let [id, variant, field] = args else {
-                    not_supported!("type_id_field_representing_type args")
-                };
-                let base = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, variant.get(self)?);
-                let field = from_bytes!(usize, field.get(self)?);
-                let fields = self.reflected_fields(base, variant)?.len();
-                if field >= fields {
-                    return Err(MirEvalError::UndefinedBehavior(format!(
-                        "field {field} of a variant with {fields}"
-                    )));
-                }
-                let id = self.type_id(TypeIdOf::Field { base, variant, field });
-                destination.write_from_bytes(self, &id)
-            }
-            "field_representing_type_actual_type_id"
-            | "field_representing_type_name"
-            | "field_representing_type_offset" => {
-                let [id] = args else { not_supported!("{name} args") };
-                let Some(&TypeIdOf::Field { base, variant, field }) = self.type_id_entry(id)?
-                else {
-                    not_supported!("{name} of a `TypeId` that is not a field's")
-                };
-                let (field_name, field_ty) = self.reflected_fields(base, variant)?.swap_remove(field);
-                match name {
-                    "field_representing_type_actual_type_id" => {
-                        let ty = self.type_id_ty(field_ty)?;
-                        let id = self.type_id(TypeIdOf::Ty(ty));
-                        destination.write_from_bytes(self, &id)
-                    }
-                    "field_representing_type_name" => self.write_str(destination, &field_name),
-                    _ => {
-                        let offset = self.reflected_offset(base, variant, field, locals)?;
-                        destination.write_from_bytes(self, &super::word_bytes(offset))
-                    }
-                }
-            }
-            "variant_name" => {
-                let [id, variant] = args else { not_supported!("variant_name args") };
-                let ty = self.type_id_of(id)?;
-                let variant = from_bytes!(usize, variant.get(self)?);
-                let TyKind::Adt(adt, _) = ty.kind() else {
-                    not_supported!("variant_name of {ty:?}, which is not an ADT")
-                };
-                let name = match self.adt_variant(adt.def_id(), variant)? {
-                    VariantId::EnumVariantId(it) => {
-                        let variants = &it.lookup(self.db).parent.enum_variants(self.db).variants;
-                        variants.get_index(variant).map(|(name, _)| name.clone())
-                    }
-                    VariantId::StructId(it) => Some(StructSignature::of(self.db, it).name.clone()),
-                    VariantId::UnionId(it) => Some(UnionSignature::of(self.db, it).name.clone()),
-                };
-                let name = name.map(|it| it.as_str().to_owned()).unwrap_or_default();
-                self.write_str(destination, &name)
-            }
-            "size_of_type_id" => {
-                let [id] = args else { not_supported!("size_of_type_id args") };
-                let ty = self.type_id_of(id)?;
-                let size = self.size_align_of(ty, locals)?.map(|(size, _)| super::word_bytes(size));
-                let usize = Ty::new_uint(self.interner(), rustc_type_ir::UintTy::Usize);
-                self.write_option(destination, usize, size, locals)
-            }
-            "type_id_is_signed" => {
-                let [id] = args else { not_supported!("type_id_is_signed args") };
-                let ty = self.type_id_of(id)?;
-                destination.write_from_bytes(self, &[matches!(ty.kind(), TyKind::Int(_)) as u8])
-            }
-            "type_id_array_len" => {
-                let [id] = args else { not_supported!("type_id_array_len args") };
-                let len = match self.type_id_of(id)?.kind() {
-                    TyKind::Array(_, len) => match try_const_usize(self.db, len) {
-                        Some(len) => len as usize,
-                        None => not_supported!("the length of an array that is not known"),
-                    },
-                    _ => 0,
-                };
-                destination.write_from_bytes(self, &super::word_bytes(len))
-            }
-            "type_id_element_ty" | "type_id_points_to" => {
-                let [id] = args else { not_supported!("{name} args") };
-                let inner = match (name, self.type_id_of(id)?.kind()) {
-                    ("type_id_element_ty", TyKind::Array(it, _) | TyKind::Slice(it)) => Some(it),
-                    ("type_id_points_to", TyKind::RawPtr(it, _) | TyKind::Ref(_, it, _)) => Some(it),
-                    _ => None,
-                };
-                let inner = match inner {
-                    Some(it) => {
-                        let ty = self.type_id_ty(it)?;
-                        Some(self.type_id(TypeIdOf::Ty(ty)).to_vec())
-                    }
-                    None => None,
-                };
-                let Some(type_id) = self.lang_items().TypeId else {
-                    not_supported!("no `TypeId` in core")
-                };
-                let type_id = Ty::new_adt(self.interner(), type_id.into(), GenericArgs::empty());
-                self.write_option(destination, type_id, inner, locals)
-            }
-            "type_id_points_mutably" => {
-                let [id] = args else { not_supported!("type_id_points_mutably args") };
-                let mutably = matches!(
-                    self.type_id_of(id)?.kind(),
-                    TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
-                );
-                destination.write_from_bytes(self, &[mutably as u8])
             }
             "type_name" => {
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
@@ -1833,77 +1716,6 @@ impl<'db> Evaluator<'db> {
             _ => erased,
         });
         Ok(ty.fold_with(&mut Anonymized(interner)))
-    }
-
-    /// How many variants reflection says `ty` has: an enum's, and one for anything else.
-    fn reflected_variants(&self, ty: Ty<'db>) -> Result<'db, usize> {
-        Ok(match ty.kind() {
-            TyKind::Adt(adt, _) => match adt.def_id() {
-                AdtId::EnumId(it) => it.enum_variants(self.db).variants.len(),
-                AdtId::StructId(_) | AdtId::UnionId(_) => 1,
-            },
-            _ => 1,
-        })
-    }
-
-    /// The variant `index` of an ADT, in the order they are written.
-    fn adt_variant(&self, adt: AdtId, index: usize) -> Result<'db, VariantId> {
-        match adt {
-            AdtId::StructId(it) if index == 0 => Ok(it.into()),
-            AdtId::UnionId(it) if index == 0 => Ok(it.into()),
-            AdtId::EnumId(it) => match it.enum_variants(self.db).variants.get_index(index) {
-                Some((_, &(variant, _))) => Ok(variant.into()),
-                None => Err(MirEvalError::UndefinedBehavior(format!("variant {index} of {adt:?}"))),
-            },
-            _ => Err(MirEvalError::UndefinedBehavior(format!("variant {index} of {adt:?}"))),
-        }
-    }
-
-    /// The names and types of the fields of the variant `variant` of `ty`, in the order they
-    /// are written: an ADT's or a tuple's, none of anything else.
-    fn reflected_fields(&self, ty: Ty<'db>, variant: usize) -> Result<'db, Vec<(String, Ty<'db>)>> {
-        let variants = self.reflected_variants(ty)?;
-        if variant >= variants {
-            return Err(MirEvalError::UndefinedBehavior(format!(
-                "variant {variant} of a type with {variants}"
-            )));
-        }
-        Ok(match ty.kind() {
-            TyKind::Adt(adt, args) => {
-                let variant = self.adt_variant(adt.def_id(), variant)?;
-                let names = variant.fields(self.db).fields();
-                self.db
-                    .field_types(variant)
-                    .iter()
-                    .map(|(id, field)| {
-                        let ty = field.ty().instantiate(self.interner(), args).skip_norm_wip();
-                        (names[id].name.as_str().to_owned(), ty)
-                    })
-                    .collect()
-            }
-            TyKind::Tuple(fields) => {
-                fields.iter().enumerate().map(|(i, ty)| (i.to_string(), ty)).collect()
-            }
-            _ => Vec::new(),
-        })
-    }
-
-    /// Where the field `field` of the variant `variant` of `base` is in a value of it.
-    fn reflected_offset(
-        &mut self,
-        base: Ty<'db>,
-        variant: usize,
-        field: usize,
-        locals: &Locals<'db>,
-    ) -> Result<'db, usize> {
-        let layout = match base.kind() {
-            TyKind::Adt(adt, args) => {
-                let variant = self.adt_variant(adt.def_id(), variant)?;
-                self.layout_of_variant(variant, args, locals)?.1
-            }
-            _ => self.layout(base)?,
-        };
-        Ok(layout.fields.offset(field).bytes_usize())
     }
 
     /// `text` as a `&'static str` in `destination`.

@@ -225,11 +225,18 @@ impl FloatExt for Float {
     fn to_ty<'db>(&self, interner: DbInterner<'db>) -> Ty<'db> {
         use Float::*;
         let types = interner.default_types();
+        // As rustc: `f16b` and `ppcf128` are lang-item structs, not builtin types.
+        let lang_struct = |item: Option<hir_def::StructId>, name: &str| match item {
+            Some(id) => Ty::new_adt(interner, id.into(), types.empty.generic_args),
+            None => panic!("the scalar `{name}` needs its lang item"),
+        };
         match *self {
             F16 => types.types.f16,
+            F16B => lang_struct(interner.lang_items().F16B, "f16b"),
             F32 => types.types.f32,
             F64 => types.types.f64,
             F128 => types.types.f128,
+            PpcF128 => lang_struct(interner.lang_items().PpcF128, "ppcf128"),
         }
     }
 

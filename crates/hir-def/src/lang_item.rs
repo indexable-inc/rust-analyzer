@@ -534,6 +534,8 @@ language_item_table! { LangItems =>
     UnsafeCell,              sym::unsafe_cell,         StructId;
     UnsafePinned,            sym::unsafe_pinned,       StructId;
     VaList,                  sym::va_list,             StructId;
+    F16B,                    sym::f16b,                StructId;
+    PpcF128,                 sym::ppcf128,             StructId;
 
     Deref,                   sym::deref,               TraitId;
     DerefMut,                sym::deref_mut,           TraitId;
@@ -655,6 +657,12 @@ language_item_table! { LangItems =>
     FutureOutput,            sym::future_output,       TypeAliasId;
 
     TypeId,                  sym::type_id,             StructId;
+    /// `core::mem::type_info::Type`, what reflection's `type_id_type_of` makes.
+    TypeInfo,                sym::type_info,           StructId;
+    /// `core::mem::type_info::Generic`, an element of what `type_id_generics` makes.
+    TypeInfoGeneric,         sym::type_info_generic,   EnumId;
+    /// `core::mem::type_info::FnPtr`, what `type_id_function_ptr` makes.
+    TypeInfoFnPtr,           sym::FnPtr,               StructId;
 
     Option,                  sym::Option,              EnumId;
     OptionSome,              sym::Some,                EnumVariantId;

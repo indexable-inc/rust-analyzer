@@ -71,6 +71,11 @@ bitflags! {
         const IS_UNSAFE_PINNED = 1 << 7;
         /// Indicates whether this struct is `CovariantUnsafeCell`.
         const IS_COVARIANT_UNSAFE_CELL = 1 << 8;
+        /// Indicates whether this struct is `f16b`, laid out as the backend's bfloat scalar.
+        const IS_F16B = 1 << 9;
+        /// Indicates whether this struct is `ppcf128`, laid out as the backend's IBM
+        /// double-double scalar.
+        const IS_PPC_F128 = 1 << 10;
     }
 }
 
@@ -110,6 +115,8 @@ impl StructSignature {
                     flags |= StructFlags::IS_COVARIANT_UNSAFE_CELL
                 }
                 _ if lang == sym::unsafe_pinned => flags |= StructFlags::IS_UNSAFE_PINNED,
+                _ if lang == sym::f16b => flags |= StructFlags::IS_F16B,
+                _ if lang == sym::ppcf128 => flags |= StructFlags::IS_PPC_F128,
                 _ => (),
             }
         }

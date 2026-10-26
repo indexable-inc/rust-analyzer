@@ -169,7 +169,7 @@ fn type_name() {
 }
 
 const TYPE_INFO: &str = r#"
-    //- minicore: option
+    //- minicore: option, send, slice, matches
     #![feature(lang_items)]
     #[lang = "type_id"]
     pub struct TypeId { t: (u64, u64) }
@@ -189,11 +189,44 @@ const TYPE_INFO: &str = r#"
     #[rustc_intrinsic]
     pub const fn field_representing_type_offset(id: TypeId) -> usize;
     #[rustc_intrinsic]
-    pub const fn size_of_type_id(id: TypeId) -> Option<usize>;
+    pub const fn type_id_size_of(id: TypeId) -> Option<usize>;
     #[rustc_intrinsic]
     pub const fn type_id_points_to(id: TypeId) -> Option<TypeId>;
     #[rustc_intrinsic]
-    pub const fn variant_name(id: TypeId, variant: usize) -> &'static str;
+    pub const fn type_id_variant_name(id: TypeId, variant: usize) -> &'static str;
+
+    #[rustc_intrinsic]
+    pub const fn type_id_type_of(id: TypeId) -> Type;
+    #[rustc_intrinsic]
+    pub const fn type_id_non_exhaustive(id: TypeId) -> bool;
+    #[rustc_intrinsic]
+    pub const fn type_id_variant_non_exhaustive(id: TypeId, variant: usize) -> bool;
+    #[rustc_intrinsic]
+    pub const fn type_id_generics(id: TypeId) -> &'static [Generic];
+    #[rustc_intrinsic]
+    pub const fn type_id_function_ptr(id: TypeId) -> Option<FnPtr>;
+
+    #[lang = "type_info"]
+    pub struct Type { pub kind: TypeKind }
+    pub enum TypeKind {
+        Tuple, Array, Slice, DynTrait(DynTrait), Struct, Enum, Union, Bool, Char, Int, Float,
+        Str(Str), Reference, Pointer, FnPtr, Other,
+    }
+    pub struct DynTrait { pub predicates: &'static [DynTraitPredicate] }
+    pub struct DynTraitPredicate { pub trait_ty: Trait }
+    pub struct Trait { pub ty: TypeId, pub is_auto: bool }
+    pub struct Str {}
+    #[lang = "type_info_generic"]
+    pub enum Generic { Lifetime(Lifetime), Type(GenericType), Const(Const) }
+    pub struct Lifetime {}
+    pub struct GenericType { pub ty: TypeId }
+    pub struct Const { pub ty: TypeId }
+    #[lang = "FnPtr"]
+    pub struct FnPtr {
+        is_unsafe: bool, abi: Abi, inputs: &'static [TypeId], output: TypeId, variadic: bool,
+        is_splatted: bool, splatted_index: u8,
+    }
+    pub enum Abi { Named(&'static str), ExternRust, ExternC }
 
     const fn same(a: TypeId, b: TypeId) -> bool {
         a.t.0 == b.t.0 && a.t.1 == b.t.1
@@ -206,6 +239,10 @@ const TYPE_INFO: &str = r#"
     #[repr(C)]
     struct Packed { x: u32, y: u8 }
     enum Shape { Dot, Line(u16, u64) }
+    #[non_exhaustive]
+    enum Open { A, #[non_exhaustive] B { x: u8 } }
+    struct Pair<'a, T, const N: usize>(&'a T, [T; N]);
+    trait Draw {}
 "#;
 
 #[test]
@@ -216,7 +253,7 @@ fn type_info_counts_and_measures() {
             const GOAL: usize = {{
                 let point = type_id::<Point<'static>>();
                 let shape = type_id::<Shape>();
-                let size = match size_of_type_id(field(point, 1)) {{ Some(it) => it, None => 9 }};
+                let size = match type_id_size_of(field(point, 1)) {{ Some(it) => it, None => 9 }};
                 let offset = field_representing_type_offset(
                     type_id_field_representing_type(type_id::<Packed>(), 0, 1),
                 );
@@ -255,8 +292,99 @@ fn type_info_names() {
         "y",
     );
     check_str(
-        &format!("{TYPE_INFO}\n    const GOAL: &str = variant_name(type_id::<Shape>(), 1);"),
+        &format!(
+            "{TYPE_INFO}\n    const GOAL: &str = type_id_variant_name(type_id::<Shape>(), 1);"
+        ),
         "Line",
+    );
+}
+
+#[test]
+fn type_info_kinds() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const fn kind(id: TypeId) -> usize {{
+                match type_id_type_of(id).kind {{
+                    TypeKind::Struct => 1,
+                    TypeKind::Enum => 2,
+                    TypeKind::Int => 3,
+                    TypeKind::Str(_) => 4,
+                    TypeKind::Reference => 5,
+                    TypeKind::FnPtr => 6,
+                    TypeKind::Other => 7,
+                    TypeKind::DynTrait(it) => match it.predicates {{
+                        [principal, auto] => {{
+                            8 + (same(principal.trait_ty.ty, type_id::<dyn Draw>())
+                                && !principal.trait_ty.is_auto
+                                && same(auto.trait_ty.ty, type_id::<dyn Send>())
+                                && auto.trait_ty.is_auto) as usize
+                        }}
+                        _ => 0,
+                    }},
+                    _ => 0,
+                }}
+            }}
+            const GOAL: usize = kind(type_id::<Point<'static>>())
+                + kind(type_id::<Shape>()) * 10
+                + kind(type_id::<u8>()) * 100
+                + kind(type_id::<str>()) * 1000
+                + kind(type_id::<&u8>()) * 10000
+                + kind(type_id::<fn(u8)>()) * 100000
+                + kind(type_id::<!>()) * 1000000
+                + kind(type_id::<dyn Draw + Send>()) * 10000000;"
+        ),
+        97654321,
+    );
+}
+
+#[test]
+fn type_info_non_exhaustive() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const GOAL: usize = type_id_non_exhaustive(type_id::<Open>()) as usize
+                + type_id_non_exhaustive(type_id::<Shape>()) as usize * 10
+                + type_id_variant_non_exhaustive(type_id::<Open>(), 0) as usize * 100
+                + type_id_variant_non_exhaustive(type_id::<Open>(), 1) as usize * 1000
+                + type_id_non_exhaustive(type_id::<u8>()) as usize * 10000;"
+        ),
+        1001,
+    );
+}
+
+#[test]
+fn type_info_generics_and_fn_ptrs() {
+    check_number(
+        &format!(
+            "{TYPE_INFO}
+            const GOAL: usize = {{
+                let generics = match type_id_generics(type_id::<Pair<'static, u16, 3>>()) {{
+                    [Generic::Lifetime(_), Generic::Type(t), Generic::Const(c)] => {{
+                        1 + same(t.ty, type_id::<u16>()) as usize
+                            + same(c.ty, type_id::<usize>()) as usize
+                    }}
+                    _ => 0,
+                }};
+                let none = type_id_generics(type_id::<u8>()).len();
+                let f = match type_id_function_ptr(type_id::<unsafe extern \"C\" fn(u8, u16) -> u32>()) {{
+                    Some(f) => {{
+                        f.is_unsafe as usize
+                            + matches!(f.abi, Abi::ExternC) as usize
+                            + match f.inputs {{
+                                [a, b] => (same(*a, type_id::<u8>()) && same(*b, type_id::<u16>())) as usize,
+                                _ => 0,
+                            }}
+                            + same(f.output, type_id::<u32>()) as usize
+                            + (!f.variadic && !f.is_splatted && f.splatted_index == 255) as usize
+                    }}
+                    None => 0,
+                }};
+                let not_fn = match type_id_function_ptr(type_id::<u8>()) {{ Some(_) => 0, None => 1 }};
+                generics + none * 10 + f * 100 + not_fn * 1000
+            }};"
+        ),
+        1503,
     );
 }
 

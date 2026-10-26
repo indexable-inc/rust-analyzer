@@ -16,7 +16,10 @@ use hir_def::{
 use rustc_type_ir::inherent::IntoKind;
 use syntax::ast::RangeOp;
 
-use crate::mir::lower::{MirLowerCtx, Ty, TyKind};
+use crate::{
+    infer::PatAdjust,
+    mir::lower::{MirLowerCtx, Ty, TyKind},
+};
 
 /// One step from a matched value to a part of it.
 #[derive(Clone, PartialEq)]
@@ -277,13 +280,25 @@ impl<'db> MirLowerCtx<'_, 'db> {
     /// Adds what `pattern` asks of the value at `place` to `pairs`. `None` when the pattern
     /// has a part whose test is not known here.
     fn pairs_of(&self, pattern: PatId, mut place: Vec<Step>, pairs: &mut Vec<Pair>) -> Option<()> {
-        let derefs = self.infer.pat_adjustments.get(&pattern).map_or(0, |it| it.len());
-        place.extend(std::iter::repeat_n(Step::Deref, derefs));
+        // A deref through a smart pointer that is not a `Box` is a call into a temporary, a
+        // test of its own that is not followed here.
+        let adjustments = self.infer.pat_adjustments.get(&pattern).map_or(&[][..], |it| &**it);
+        for adjustment in adjustments {
+            if adjustment.kind == PatAdjust::OverloadedDeref && !adjustment.source.as_ref().is_box()
+            {
+                return None;
+            }
+            place.push(Step::Deref);
+        }
         let ty = self.infer.pat_ty(pattern);
         match &self.store[pattern] {
             Pat::Wild | Pat::Bind { subpat: None, .. } => (),
             &Pat::Bind { subpat: Some(inner), .. } => self.pairs_of(inner, place, pairs)?,
             &Pat::Ref { pat: inner, .. } | &Pat::Box { inner } => {
+                place.push(Step::Deref);
+                self.pairs_of(inner, place, pairs)?
+            }
+            &Pat::Deref { inner } if ty.is_box() => {
                 place.push(Step::Deref);
                 self.pairs_of(inner, place, pairs)?
             }

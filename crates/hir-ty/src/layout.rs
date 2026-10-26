@@ -155,7 +155,7 @@ fn layout_of_simd_ty<'db>(
     let e_ly = db.layout_of_ty(e_ty.store(), env.store())?;
 
     let cx = LayoutCx::new(dl);
-    Ok(Arc::new(cx.calc.simd_type(e_ly, e_len, repr_packed)?))
+    Ok(Arc::new(cx.calc.layout_of_simd_type(e_ly, e_len, repr_packed)?))
 }
 
 #[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone))]
@@ -267,20 +267,20 @@ pub fn layout_of_ty_query(
                 .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
-            cx.calc.univariant(&fields, &ReprOptions::default(), kind)?
+            cx.calc.layout_of_univariant(&fields, &ReprOptions::default(), kind)?
         }
         TyKind::Array(element, count) => {
             let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
             let element = db.layout_of_ty(element.store(), trait_env)?;
-            cx.calc.array_like::<_, _, ()>(&element, Some(count))?
+            cx.calc.layout_of_array_like::<_, _, ()>(&element, Some(count))?
         }
         TyKind::Slice(element) => {
             let element = db.layout_of_ty(element.store(), trait_env)?;
-            cx.calc.array_like::<_, _, ()>(&element, None)?
+            cx.calc.layout_of_array_like::<_, _, ()>(&element, None)?
         }
         TyKind::Str => {
             let element = scalar_unit(dl, Primitive::Int(Integer::I8, false));
-            cx.calc.array_like::<_, _, ()>(&Layout::scalar(dl, element), None)?
+            cx.calc.layout_of_array_like::<_, _, ()>(&Layout::scalar(dl, element), None)?
         }
         // Potentially-wide pointers.
         TyKind::Ref(_, pointee, _) | TyKind::RawPtr(pointee, _) => {
@@ -347,7 +347,11 @@ pub fn layout_of_ty_query(
                 .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
-            cx.calc.univariant(&fields, &ReprOptions::default(), StructKind::AlwaysSized)?
+            cx.calc.layout_of_univariant(
+                &fields,
+                &ReprOptions::default(),
+                StructKind::AlwaysSized,
+            )?
         }
         TyKind::Coroutine(id, args) => {
             // Laid out as rustc's `coroutine_layout` lays it out: what was captured and where
@@ -406,7 +410,7 @@ pub fn layout_of_ty_query(
             }
             let state = Layout::scalar(dl, CoroutineFrame::state_scalar(held.yields.len()));
             let state = &state;
-            cx.calc.coroutine(&locals, prefix, &kept, &conflicts, |_| &state)?
+            cx.calc.layout_of_coroutine(&locals, prefix, &kept, &conflicts, |_| &state)?
         }
         TyKind::CoroutineWitness(_, _) => {
             return Err(LayoutError::NotImplemented);

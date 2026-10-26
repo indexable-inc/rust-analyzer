@@ -2153,7 +2153,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "ra-ap-rustc_abi"
 version = "0.166.0"
-source = "git+https://github.com/indexable-inc/rustc_abi?branch=main#8f6db283fd604ef63978def1e13dfaaf7f3376db"
 dependencies = [
  "bitflags",
  "ra-ap-rustc_hashes",

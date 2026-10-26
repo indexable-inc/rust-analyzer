@@ -7,7 +7,10 @@ use hir_def::{
     attrs::AttrFlags,
     signatures::{StructFlags, StructSignature, VariantFields},
 };
-use rustc_abi::{Integer, ReprOptions, TargetDataLayout};
+use rustc_abi::{
+    BackendRepr, Float, Integer, NicheOptimizations, Primitive, ReprOptions, Scalar,
+    TargetDataLayout, WrappingRange,
+};
 use rustc_index::IndexVec;
 use smallvec::SmallVec;
 use triomphe::Arc;
@@ -44,7 +47,7 @@ pub fn layout_of_adt_query(
             })
             .collect::<Result<Vec<_>, _>>()
     };
-    let (variants, repr, is_special_no_niche) = match def {
+    let (variants, repr, niche_optimizations) = match def {
         AdtId::StructId(s) => {
             let sig = StructSignature::of(db, s);
             let mut r = SmallVec::<[_; 1]>::new();
@@ -52,14 +55,20 @@ pub fn layout_of_adt_query(
             (
                 r,
                 AttrFlags::repr(db, s.into()).unwrap_or_default(),
-                sig.flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED),
+                // As rustc: `UnsafeCell` and `UnsafePinned` hide their fields' niches.
+                if sig.flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED)
+                {
+                    NicheOptimizations::Disabled
+                } else {
+                    NicheOptimizations::Enabled
+                },
             )
         }
         AdtId::UnionId(id) => {
             let repr = AttrFlags::repr(db, id.into());
             let mut r = SmallVec::new();
             r.push(handle_variant(id.into(), id.fields(db))?);
-            (r, repr.unwrap_or_default(), false)
+            (r, repr.unwrap_or_default(), NicheOptimizations::Enabled)
         }
         AdtId::EnumId(e) => {
             let variants = e.enum_variants(db);
@@ -68,7 +77,7 @@ pub fn layout_of_adt_query(
                 .values()
                 .map(|&(v, _)| handle_variant(v.into(), v.fields(db)))
                 .collect::<Result<SmallVec<_>, _>>()?;
-            (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
+            (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), NicheOptimizations::Enabled)
         }
     };
     // A struct whose last field may be unsized for some generic arguments keeps that field last
@@ -87,14 +96,14 @@ pub fn layout_of_adt_query(
         .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
         .collect::<SmallVec<[_; 1]>>();
     let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
-    let result = if matches!(def, AdtId::UnionId(..)) {
+    let mut result = if matches!(def, AdtId::UnionId(..)) {
         cx.calc.layout_of_union(&repr, &variants)?
     } else {
         cx.calc.layout_of_struct_or_enum(
             &repr,
             &variants,
             matches!(def, AdtId::EnumId(..)),
-            is_special_no_niche,
+            niche_optimizations,
             |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
             variants.iter_enumerated().filter_map(|(id, _)| {
                 let AdtId::EnumId(e) = def else { return None };
@@ -106,6 +115,26 @@ pub fn layout_of_adt_query(
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
     };
+    // As rustc's `layout_of_uncached`: the `f16b` and `ppcf128` lang items are structs over an
+    // integer of their size, laid out as the backend's float scalar of that format.
+    if let AdtId::StructId(s) = def {
+        let flags = StructSignature::of(db, s).flags;
+        let float = if flags.contains(StructFlags::IS_F16B) {
+            Some(Float::F16B)
+        } else if flags.contains(StructFlags::IS_PPC_F128) {
+            Some(Float::PpcF128)
+        } else {
+            None
+        };
+        if let Some(float) = float {
+            assert_eq!(result.size, float.size());
+            result.align = float.align(dl);
+            result.backend_repr = BackendRepr::Scalar(Scalar::Initialized {
+                value: Primitive::Float(float),
+                valid_range: WrappingRange::full(float.size()),
+            });
+        }
+    }
     Ok(Arc::new(result))
 }
 

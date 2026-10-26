@@ -37,9 +37,9 @@ inherits = "release"
 debug = 2
 
 [patch.'crates-io']
-# rustc's layout code, from the tag of the stable in `harness/toolchain`: ra-jit's
-# vendor/rustc_abi, which its own workspace patches in by path.
-ra-ap-rustc_abi = { git = "https://github.com/indexable-inc/rustc_abi", branch = "main" }
+# rustc's layout code, from the commit of the nightly in `harness/toolchain`: ra-jit's
+# vendor/rustc_abi, which a copy of this workspace has next to it, as the solver crates.
+ra-ap-rustc_abi = { path = "../rustc_abi" }
 # The trait solver crates with fixes of rustc's solver backported: ra-jit's vendor/, which
 # a copy of this workspace has next to it too.
 ra-ap-rustc_type_ir = { path = "../rustc_type_ir" }

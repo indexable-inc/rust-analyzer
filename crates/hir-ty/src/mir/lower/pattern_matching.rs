@@ -1,15 +1,16 @@
 //! MIR lowering for patterns
 
 use hir_def::{
-    hir::{ExprId, RecordFieldPat},
+    hir::{ExprId, Literal, RecordFieldPat},
     signatures::VariantFields,
 };
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
     Adjust, Adjustment, BindingMode, ByRef,
+    infer::PatAdjust,
     mir::{
-        CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place, Projection,
+        CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place,
         lower::{
             AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr, Idx,
             MemoryMap, MirLowerCtx, MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem,
@@ -304,15 +305,26 @@ impl<'db> MirLowerCtx<'_, 'db> {
         pattern: PatId,
         mode: MatchingMode,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
-        let cnt = self.infer.pat_adjustments.get(&pattern).map(|x| x.len()).unwrap_or_default();
-        cond_place.projection = Projection::new_from_iter(
-            cond_place
-                .projection
-                .as_slice()
-                .iter()
-                .cloned()
-                .chain((0..cnt).map(|_| ProjectionElem::Deref)),
-        );
+        // What inference peeled off the scrutinee before the pattern: references, and with
+        // `deref_patterns` smart pointers, outermost first.
+        let infer = self.infer;
+        let adjustments = infer.pat_adjustments.get(&pattern).map_or(&[][..], |it| &**it);
+        for (index, adjustment) in adjustments.iter().enumerate() {
+            cond_place = match adjustment.kind {
+                PatAdjust::BuiltinDeref => cond_place.project(ProjectionElem::Deref),
+                PatAdjust::OverloadedDeref => {
+                    let (place, next) = self.deref_pattern_place(
+                        current,
+                        cond_place,
+                        adjustment.source.as_ref(),
+                        (pattern, index as u32),
+                        mode == MatchingMode::Check,
+                    )?;
+                    current = next;
+                    place
+                }
+            };
+        }
         Ok(match &self.store[pattern] {
             Pat::Missing | Pat::Rest | Pat::NotNull => {
                 return Err(MirLowerError::IncompletePattern);
@@ -666,7 +678,32 @@ impl<'db> MirLowerCtx<'_, 'db> {
             Pat::Lit(l) => match &self.store[*l] {
                 Expr::Literal(l) => {
                     if mode == MatchingMode::Check {
-                        let c = self.lower_literal_to_operand(self.infer.pat_ty(pattern), l)?;
+                        let mut ty = self.infer.pat_ty(pattern);
+                        let mut cond_place = cond_place;
+                        // With `deref_patterns`, `"..."` can match a `str` and `b"..."` a
+                        // `[u8]` or `[u8; N]` (inside `deref!` on a `String` or `Vec<u8>`):
+                        // rustc compares the literal with a reference to the place.
+                        if matches!(l, Literal::String(_) | Literal::ByteString(_))
+                            && matches!(
+                                ty.kind(),
+                                TyKind::Str | TyKind::Slice(_) | TyKind::Array(..)
+                            )
+                        {
+                            let interner = self.interner();
+                            let erased = crate::next_solver::Region::new_erased(interner);
+                            let ref_ty =
+                                Ty::new_ref(interner, erased, ty, rustc_ast_ir::Mutability::Not);
+                            let reference = self.temp(ref_ty, current, pattern.into())?;
+                            self.push_assignment(
+                                current,
+                                reference.into(),
+                                Rvalue::Ref(BorrowKind::Shared, cond_place.store()),
+                                pattern.into(),
+                            );
+                            cond_place = reference.into();
+                            ty = ref_ty;
+                        }
+                        let c = self.lower_literal_to_operand(ty, l)?;
                         self.pattern_match_const(current_else, current, c, cond_place, pattern)?
                     } else {
                         (current, current_else)
@@ -731,7 +768,17 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 let cond_place = cond_place.project(ProjectionElem::Deref);
                 self.pattern_match_inner(current, current_else, cond_place, inner, mode)?
             }
-            Pat::Deref { .. } => not_supported!("deref pattern"),
+            &Pat::Deref { inner } => {
+                let pointer = self.place_ty(&cond_place);
+                let (cond_place, next) = self.deref_pattern_place(
+                    current,
+                    cond_place,
+                    pointer,
+                    (pattern, adjustments.len() as u32),
+                    mode == MatchingMode::Check,
+                )?;
+                self.pattern_match_inner(next, current_else, cond_place, inner, mode)?
+            }
         })
     }
 
