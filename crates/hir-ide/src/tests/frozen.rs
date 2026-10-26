@@ -202,6 +202,49 @@ fn served_resolves_the_same() {
     assert_eq!(written(&served), expected(&bytes));
 }
 
+/// A library whose items procedural macros derive and rewrite, beside the crate of those macros.
+const PROC_MACROS: &str = r#"
+//- proc_macros: identity, derive_identity
+//- minicore: derive
+//- /main.rs crate:main deps:lib
+use lib::{made, Shown};
+#[proc_macros::identity]
+fn main() { made(); let _ = Shown; }
+//- /lib.rs crate:lib
+#[derive(proc_macros::DeriveIdentity)]
+pub struct Shown;
+#[proc_macros::identity]
+pub fn made() {}
+pub use proc_macros::DeriveIdentity;
+"#;
+
+#[test]
+fn def_maps_with_procedural_macros_read_back_as_resolved() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let db = TestDB::with_files(PROC_MACROS);
+    let bytes: Vec<(String, Vec<u8>)> = crate::attach_db(&db, || {
+        let encoded =
+            |it| frozen_def::encode(&db, it).map_err(|why| format!("{}: {why}", name(&db, it)));
+        crates(&db)
+            .into_iter()
+            .map(|it| Ok((name(&db, it), encoded(it)?)))
+            .collect::<Result<_, String>>()
+    })
+    .unwrap();
+    assert!(bytes.iter().any(|(name, _)| name == "proc_macros"), "{bytes:?}");
+    for mode in [Mode::Check, Mode::Verify] {
+        let mut db = TestDB::with_files(PROC_MACROS);
+        let maps = by_crate(&db, mode, &bytes);
+        frozen_def::set(&mut db, maps);
+        crate::attach_db(&db, || {
+            for krate in crates(&db) {
+                _ = hir_def::nameres::crate_def_map(&db, krate);
+            }
+        });
+        assert_eq!(frozen_def::differences(), Vec::<String>::new(), "{mode:?}");
+    }
+}
+
 #[test]
 fn checking_finds_a_difference() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());

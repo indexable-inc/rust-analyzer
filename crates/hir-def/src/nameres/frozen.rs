@@ -29,6 +29,7 @@ use hir_expand::{
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
     mod_path::{ModPath, PathKind},
     name::Name,
+    proc_macro::{CustomProcMacroExpander, ProcMacroKind},
 };
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
@@ -47,7 +48,8 @@ use crate::{
     DefWithBodyId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc,
     ExternCrateId, ExternCrateLoc, FunctionLoc, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
-    ModuleIdLt, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId, UseLoc,
+    ModuleIdLt, ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId,
+    UseLoc,
     builtin_derive::BuiltinDeriveImplTrait,
     builtin_type::BuiltinType,
     expr_store::Body,
@@ -857,8 +859,25 @@ impl Enc<'_> {
                 self.u8(5);
                 self.ast_id(ast_id)?;
             }
-            MacroDefKind::ProcMacro(..) => return Err("a procedural macro".to_owned()),
+            MacroDefKind::ProcMacro(ast_id, expander, kind) => {
+                self.u8(6);
+                self.ast_id(ast_id)?;
+                self.proc_macro(expander, kind)?;
+            }
         }
+        Ok(())
+    }
+
+    /// A procedural macro by its place among those its crate's library lists, which the
+    /// crate's source decides. One missing or disabled is so only in this process.
+    fn proc_macro(&mut self, expander: CustomProcMacroExpander, kind: ProcMacroKind) -> R {
+        let listed = expander.listed().ok_or("a procedural macro that is not loaded")?;
+        self.u32(listed);
+        self.u8(match kind {
+            ProcMacroKind::CustomDerive => 0,
+            ProcMacroKind::Bang => 1,
+            ProcMacroKind::Attr => 2,
+        });
         Ok(())
     }
 
@@ -1239,7 +1258,15 @@ impl Enc<'_> {
                 self.edition(edition);
                 Ok(())
             }
-            MacroId::ProcMacroId(_) => Err("a procedural macro".to_owned()),
+            MacroId::ProcMacroId(it) => {
+                self.u8(2);
+                let ProcMacroLoc { container, id, expander, kind, edition } = *it.lookup(db);
+                self.module(container)?;
+                self.ast_id(id)?;
+                self.proc_macro(expander, kind)?;
+                self.edition(edition);
+                Ok(())
+            }
         }
     }
 
@@ -1743,13 +1770,11 @@ impl Enc<'_> {
             edition,
             recursion_limit,
         } = &**data;
-        if *proc_macro
-            || !fn_proc_macro_mapping.is_empty()
-            || !fn_proc_macro_mapping_back.is_empty()
-        {
-            return Err("a crate of procedural macros".to_owned());
+        if fn_proc_macro_mapping.len() != fn_proc_macro_mapping_back.len() {
+            return Err("procedural macros of more than one function".to_owned());
         }
         self.edition(*edition);
+        self.bool(*proc_macro);
         self.bool(*rustc_coherence_is_core);
         self.bool(*no_core);
         self.bool(*no_std);
@@ -1843,6 +1868,14 @@ impl Enc<'_> {
             for it in names {
                 self.name(it)?;
             }
+        }
+        // Each function of a crate of procedural macros that is one, and the other way about.
+        let functions =
+            self.sorted(fn_proc_macro_mapping.iter(), |enc, k| enc.def((**k).into()))?;
+        self.usize(functions.len())?;
+        for (&function, &id) in functions {
+            self.def(function.into())?;
+            self.macro_id(id.into())?;
         }
         self.usize(diagnostics.len())?;
         for it in diagnostics {
@@ -2182,6 +2215,11 @@ impl Dec<'_> {
             }
             4 => MacroDefKind::BuiltInEager(self.ast_id()?, self.index(EagerExpander::ALL)?),
             5 => MacroDefKind::UnimplementedBuiltIn(self.ast_id()?),
+            6 => {
+                let ast_id = self.ast_id()?;
+                let (expander, kind) = self.proc_macro()?;
+                MacroDefKind::ProcMacro(ast_id, expander, kind)
+            }
             it => return Err(format!("macro def kind {it}")),
         };
         Ok(MacroDefId { krate, edition, kind, local_inner, allow_internal_unsafe, edition_panic })
@@ -2454,8 +2492,31 @@ impl Dec<'_> {
                     MacroRulesLoc { container, id, expander, flags, edition }.intern(db),
                 )
             }
+            2 => {
+                let container = self.module()?;
+                let id = self.ast_id()?;
+                let (expander, kind) = self.proc_macro()?;
+                let edition = self.edition()?;
+                MacroId::ProcMacroId(
+                    ProcMacroLoc { container, id, expander, kind, edition }.intern(db),
+                )
+            }
             it => return Err(format!("macro {it}")),
         })
+    }
+
+    fn proc_macro(&mut self) -> R<(CustomProcMacroExpander, ProcMacroKind)> {
+        let listed = self.u32()?;
+        if listed >= !2 {
+            return Err(format!("procedural macro {listed}"));
+        }
+        let kind = match self.u8()? {
+            0 => ProcMacroKind::CustomDerive,
+            1 => ProcMacroKind::Bang,
+            2 => ProcMacroKind::Attr,
+            it => return Err(format!("procedural macro kind {it}")),
+        };
+        Ok((CustomProcMacroExpander::new(listed), kind))
     }
 
     pub fn def(&mut self) -> R<ModuleDefId> {
@@ -2800,6 +2861,7 @@ impl Dec<'_> {
         let krate = self.krate;
         let edition = self.edition()?;
         let mut data = DefMapCrateData::new(edition);
+        data.proc_macro = self.bool()?;
         data.rustc_coherence_is_core = self.bool()?;
         data.no_core = self.bool()?;
         data.no_std = self.bool()?;
@@ -2888,9 +2950,19 @@ impl Dec<'_> {
             let id = dec.macro_id()?;
             Ok((id, dec.many(Self::name)?.into_boxed_slice()))
         })?;
-        TArc::get_mut(&mut def_map.data)
-            .ok_or("the def map's crate data is shared")?
-            .exported_derives = exported.into_iter().collect();
+        let functions = self.many(|dec| {
+            let ModuleDefId::FunctionId(function) = dec.def()? else {
+                return Err("a procedural macro of no function".to_owned());
+            };
+            let MacroId::ProcMacroId(id) = dec.macro_id()? else {
+                return Err("a function of a macro no procedural one".to_owned());
+            };
+            Ok((function, id))
+        })?;
+        let data = TArc::get_mut(&mut def_map.data).ok_or("the def map's crate data is shared")?;
+        data.exported_derives = exported.into_iter().collect();
+        data.fn_proc_macro_mapping_back = functions.iter().map(|&(f, id)| (id, f)).collect();
+        data.fn_proc_macro_mapping = functions.into_iter().collect();
         def_map.diagnostics = self.many(Self::diagnostic)?;
         Ok(def_map)
     }

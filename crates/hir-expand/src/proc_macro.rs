@@ -256,6 +256,15 @@ impl CustomProcMacroExpander {
         Self { proc_macro_id: Self::PROC_MACRO_ATTR_DISABLED }
     }
 
+    /// The place of the macro among those its crate's library lists, when it has one: not one
+    /// missing or disabled.
+    pub const fn listed(&self) -> Option<u32> {
+        match self.proc_macro_id {
+            Self::MISSING_EXPANDER | Self::DISABLED_ID | Self::PROC_MACRO_ATTR_DISABLED => None,
+            id => Some(id),
+        }
+    }
+
     /// The macro-expander is missing or has yet to be build.
     pub const fn is_missing(&self) -> bool {
         self.proc_macro_id == Self::MISSING_EXPANDER
