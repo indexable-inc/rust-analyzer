@@ -1379,6 +1379,33 @@ pub mod ip_address {
 }
 
 #[test]
+fn eager_include_names_a_macro_an_earlier_include_defined() {
+    // rquickjs-sys: `include!` and `concat!` come from the prelude, so these calls resolve late,
+    // and `bindings_env!` is a `macro_rules!` of the textual scope only.
+    check(
+        r#"
+//- minicore: include, concat, env
+//- /lib.rs env:OUT_DIR=out
+include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+include!(concat!("bindings/", bindings_env!("TARGET"), ".rs"));
+pub struct After;
+//- /out/bindings.rs
+macro_rules! bindings_env { ("TARGET") => { "x86_64" }; }
+pub struct FromOut;
+//- /bindings/x86_64.rs
+pub struct JSValue;
+"#,
+        expect![[r#"
+            crate
+            - After : type value
+            - FromOut : type value
+            - JSValue : type value
+            - (legacy) bindings_env : macro!
+        "#]],
+    );
+}
+
+#[test]
 fn include_with_submod_file() {
     check(
         r#"

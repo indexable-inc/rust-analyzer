@@ -46,6 +46,11 @@ ra-ap-rustc_type_ir = { path = "../rustc_type_ir" }
 ra-ap-rustc_next_trait_solver = { path = "../rustc_next_trait_solver" }
 # rowan 0.17.0 with a flat kind of tree behind its cursor (lib/rowan/Cargo.toml).
 rowan = { path = "lib/rowan" }
+# salsa with ra-jit's local changes: ra-jit's vendor/salsa*, next to a copy of this workspace
+# as well, so the fork's own tests run against the salsa ra-jit is built with.
+salsa = { path = "../salsa" }
+salsa-macros = { path = "../salsa-macros" }
+salsa-macro-rules = { path = "../salsa-macro-rules" }
 
 # line-index = { path = "lib/line-index" }
 # la-arena = { path = "lib/la-arena" }
@@ -53,8 +58,6 @@ rowan = { path = "lib/rowan" }
 
 
 # ungrammar = { path = "lib/ungrammar" }
-
-# salsa = { path = "../salsa" }
 
 [workspace.dependencies]
 # local crates

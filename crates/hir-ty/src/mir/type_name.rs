@@ -6,8 +6,8 @@ use std::fmt::Write;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, GenericDefId, HasModule, ItemContainerId,
     Lookup, ModuleDefId, ModuleIdLt,
-    expr_store::{Body, BodySourceMap},
-    hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId},
+    expr_store::{Body, BodySourceMap, StoreVisitor},
+    hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId, PatId},
     lang_item::lang_items,
     signatures::{
         ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
@@ -73,6 +73,17 @@ pub fn rustc_closure_suffix(
     let mut out = Spelled::new(Spelling::Symbol);
     out.closures(&around);
     Some(out.text)
+}
+
+/// The places rustc numbers a closure by, `n` of each `{closure#n}` from the one outermost in
+/// the body to the closure itself: what its `DefPath` adds to the function's.
+pub fn rustc_closure_places(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    expr: ExprId,
+) -> Option<Vec<usize>> {
+    let around = closures_around(db, owner, expr)?;
+    (!around.is_empty()).then(|| around.iter().map(|&(place, _)| place).collect())
 }
 
 /// The path rustc tells a debugger the code of that closure or `async` block by.
@@ -910,7 +921,9 @@ fn closures_around_query(
     let places = around.iter().map(|&closure| {
         let mut beside = Vec::new();
         match inside.replace(closure) {
-            Some(it) => body.walk_child_exprs(it, |child| closures_in(body, child, &mut beside)),
+            Some(it) => {
+                walk_outside_consts(body, it, |child| closures_in(body, child, &mut beside))
+            }
             None => closures_in(body, body.root_expr(), &mut beside),
         }
         // Stable, so those of one expansion stay in the order they are written in.
@@ -929,7 +942,7 @@ fn find_closures(body: &Body, at: ExprId, target: ExprId, around: &mut Vec<ExprI
     }
     let mut found = at == target;
     if !found {
-        body.walk_child_exprs(at, |child| {
+        walk_outside_consts(body, at, |child| {
             found = found || find_closures(body, child, target, around);
         });
     }
@@ -943,7 +956,33 @@ fn find_closures(body: &Body, at: ExprId, target: ExprId, around: &mut Vec<ExprI
 fn closures_in(body: &Body, at: ExprId, found: &mut Vec<ExprId>) {
     match body[at] {
         Expr::Closure { .. } => found.push(at),
-        _ => body.walk_child_exprs(at, |child| closures_in(body, child, found)),
+        _ => walk_outside_consts(body, at, |child| closures_in(body, child, found)),
+    }
+}
+
+/// The expressions right in `at`, in the patterns too, but not those of an anonymous constant
+/// (`const { .. }`, the length of `[x; n]`, a const argument): rustc makes each of those a
+/// definition of its own and numbers the closures in it under that, not under the body. So a
+/// closure in one is not found (its place is refused) and does not count among the others.
+fn walk_outside_consts(body: &Body, at: ExprId, callback: impl FnMut(ExprId)) {
+    return body.visit_expr_children(at, Visitor { callback, body });
+
+    struct Visitor<'a, F> {
+        callback: F,
+        body: &'a Body,
+    }
+
+    impl<F: FnMut(ExprId)> StoreVisitor for Visitor<'_, F> {
+        fn on_expr(&mut self, expr: ExprId) {
+            (self.callback)(expr);
+        }
+
+        fn on_anon_const_expr(&mut self, _: ExprId) {}
+
+        fn on_pat(&mut self, pat: PatId) {
+            let body = self.body;
+            body.visit_pat_children(pat, self);
+        }
     }
 }
 
