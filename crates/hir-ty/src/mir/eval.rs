@@ -760,7 +760,7 @@ impl<'db> Evaluator<'db> {
                                 }
                             },
                             TyKind::Slice(_) => match metadata {
-                                Some(it) => from_bytes!(u64, it.get(self)?),
+                                Some(it) => from_bytes!(usize, it.get(self)?) as u64,
                                 None => not_supported!("slice place without metadata"),
                             },
                             _ => not_supported!("bad type for const index"),
