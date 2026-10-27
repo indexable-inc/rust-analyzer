@@ -176,6 +176,9 @@ pub(super) struct Regions<'db> {
     /// Whether universal regions are checked against each other: not in a closure whose
     /// signature could not be split into its own regions and its creator's.
     pub(super) check_universals: bool,
+    /// The universal regions of the placeholders of relating two types' `for<'a>`, whose
+    /// errors are rustc's `UniverseInfo::RelateTys`: E0308, one type more general than the other.
+    pub(super) related_placeholders: FxHashSet<usize>,
     /// The body is a method of a trait impl, whose signature the trait fixes: rustc's
     /// `is_bound_region_in_impl_item`, which keeps E0621 from suggesting a change to it.
     pub(super) is_impl_item: bool,
@@ -658,6 +661,7 @@ pub(super) fn build<'db>(
             outlives: Vec::new(),
             type_tests: Vec::new(),
             check_universals: ctx.closure_local.is_none(),
+            related_placeholders: FxHashSet::default(),
             is_impl_item: false,
             unsuggested: FxHashSet::default(),
             closure_env: None,
@@ -683,12 +687,14 @@ pub(super) fn build<'db>(
         aggregate_temps: aggregate_temps(body),
         synthesized: synthesized(ctx),
         placeholders: FxHashMap::default(),
+        relate_universes: FxHashSet::default(),
         elided: Default::default(),
     };
     builder.universal_regions();
     builder.env_aliases();
     builder.location = None;
     builder.signature_projections();
+    builder.signature_higher_ranked();
     builder.annotations();
     for &block in &cfg.order {
         let data = &body.basic_blocks[block];
@@ -750,6 +756,8 @@ struct Builder<'c, 'a, 'db> {
     synthesized: FxHashSet<hir_def::hir::ExprId>,
     /// The universal region of each placeholder the trait solver's answers name.
     placeholders: FxHashMap<Region<'db>, Region<'db>>,
+    /// The universes made to relate two types' `for<'a>`.
+    relate_universes: FxHashSet<rustc_type_ir::UniverseIndex>,
     /// The region variables given the error regions rust-analyzer leaves for elided lifetimes,
     /// each a late-bound lifetime of its own in rustc: the fn pointer two fn items or closures
     /// coerce to, `if r { up } else { down }`, is `for<'a> fn(&'a T)` there.
@@ -852,6 +860,9 @@ impl<'db> Builder<'_, '_, 'db> {
             return it;
         }
         let region = self.new_universal(UniversalKind::Placeholder);
+        if self.relate_universes.contains(&self.ctx.infcx.universe_of_region(placeholder)) {
+            self.regions.related_placeholders.insert(self.regions.universals.len() - 1);
+        }
         self.placeholders.insert(placeholder, region);
         region
     }
@@ -2352,6 +2363,46 @@ impl<'db> Builder<'_, '_, 'db> {
             .collect();
     }
 
+    /// What proving a signature type's higher-ranked where clauses needs, as rustc's
+    /// `add_implied_bounds` applies the region constraints of proving the well-formedness of
+    /// each parameter's type: `Foo<&'lt u8>` with `for<'x> T::Ty<'x>: Sized` normalizes
+    /// `<&'lt u8 as Trait>::Ty<'x>` for a placeholder `'x`, whose `Self: 'x` is `'lt: 'static`
+    /// (`implied-bounds/normalization-placeholder-leak.rs`). The others are what the type
+    /// implies, assumed rather than proven.
+    fn signature_higher_ranked(&mut self) {
+        if self.ctx.closure_local.is_some() || self.ctx.inline_const {
+            return;
+        }
+        let interner = self.interner();
+        let mut clauses = Vec::new();
+        for &local in self
+            .body
+            .param_locals
+            .iter()
+            .chain((!self.returns_opaque).then_some(&super::return_slot()))
+        {
+            let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+            for arg in ty.walk() {
+                let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg) else {
+                    continue;
+                };
+                let TyKind::Adt(def, args) = it.kind() else { continue };
+                for clause in GenericPredicates::query_all(self.ctx.db, def.def_id().into())
+                    .iter_instantiated(interner, args.as_slice())
+                {
+                    let clause = clause.skip_norm_wip();
+                    if matches!(clause.kind().skip_binder(), ClauseKind::Trait(_))
+                        && !clause.kind().bound_vars().is_empty()
+                        && !clauses.contains(&clause)
+                    {
+                        clauses.push(clause);
+                    }
+                }
+            }
+        }
+        self.clauses(clauses, At { category: Category::Signature, span: MirSpan::Unknown }, true);
+    }
+
     /// What normalizing the signature needs, as rustc normalizes the type of each parameter
     /// and the return type: the where clauses of the impl that a projection there is of,
     /// `<&'a () as Visitor<'d>>::Value` with only `impl<'a, 'd: 'a> Visitor<'d> for &'a ()`
@@ -3202,20 +3253,93 @@ impl<'db> Builder<'_, '_, 'db> {
     }
 
     fn relate_regions(&mut self, a: Region<'db>, b: Region<'db>, variance: Variance, at: At) {
-        let static_rv = self.regions.static_rv;
-        let rv = |region: Region<'db>| match region.kind() {
-            RegionKind::ReStatic => Some(static_rv),
-            _ => rv_of(region),
-        };
-        let (Some(a), Some(b)) = (rv(a), rv(b)) else { return };
         match variance {
-            Variance::Covariant => self.outlives(a, b, at),
-            Variance::Contravariant => self.outlives(b, a, at),
+            Variance::Covariant => self.region_outlives(a, b, at),
+            Variance::Contravariant => self.region_outlives(b, a, at),
             Variance::Invariant => {
-                self.outlives(a, b, at);
-                self.outlives(b, a, at);
+                self.region_outlives(a, b, at);
+                self.region_outlives(b, a, at);
             }
             Variance::Bivariant => (),
+        }
+    }
+
+    /// That `longer` outlives `shorter`. A region of a universe that cannot name the
+    /// placeholder `shorter` outlives it only by outliving `'static`, as rustc's
+    /// `add_incompatible_universe`.
+    fn region_outlives(&mut self, longer: Region<'db>, shorter: Region<'db>, at: At) {
+        let shorter = match shorter.is_placeholder()
+            && longer != shorter
+            && !matches!(longer.kind(), RegionKind::ReBound(..) | RegionKind::ReError(_))
+            && self.ctx.infcx.universe_of_region(longer)
+                < self.ctx.infcx.universe_of_region(shorter)
+        {
+            true => Region::new_static(self.interner()),
+            false => shorter,
+        };
+        let static_rv = self.regions.static_rv;
+        let mut rv = |this: &mut Self, region: Region<'db>| match region.kind() {
+            RegionKind::ReStatic => Some(static_rv),
+            RegionKind::RePlaceholder(_) => rv_of(this.placeholder(region)),
+            _ => rv_of(region),
+        };
+        let (Some(longer), Some(shorter)) = (rv(self, longer), rv(self, shorter)) else { return };
+        self.outlives(longer, shorter, at);
+    }
+
+    /// The inputs and output of a signature's `for<'a>` instantiated, as rustc's
+    /// `TypeRelating::binders`: for placeholders of a new universe on the side that must be
+    /// the more general, for variables of that universe, which can name them, on the other.
+    fn instantiate_sig(
+        &mut self,
+        sig: rustc_type_ir::Binder<
+            hir_ty::next_solver::DbInterner<'db>,
+            rustc_type_ir::FnSigTys<hir_ty::next_solver::DbInterner<'db>>,
+        >,
+        universe: rustc_type_ir::UniverseIndex,
+        placeholders: bool,
+    ) -> hir_ty::next_solver::Tys<'db> {
+        let interner = self.interner();
+        let infcx = &self.ctx.infcx;
+        let mut existentials: Vec<(rustc_type_ir::BoundVar, Region<'db>)> = Vec::new();
+        rustc_type_ir::fold_regions(
+            interner,
+            sig.skip_binder().inputs_and_output,
+            |region, depth| match region.kind() {
+                RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(binder), bound)
+                    if binder == depth =>
+                {
+                    if placeholders {
+                        return Region::new_placeholder(
+                            interner,
+                            hir_ty::next_solver::PlaceholderRegion::new(universe, bound),
+                        );
+                    }
+                    if let Some(&(_, it)) = existentials.iter().find(|it| it.0 == bound.var) {
+                        return it;
+                    }
+                    let it = infcx.next_region_var_in_universe(universe, hir_ty::Span::Dummy);
+                    existentials.push((bound.var, it));
+                    it
+                }
+                _ => region,
+            },
+        )
+    }
+
+    /// Two signatures' inputs and output, related as the types of `fn` pointers are.
+    fn relate_sig_tys(
+        &mut self,
+        xs: hir_ty::next_solver::Tys<'db>,
+        ys: hir_ty::next_solver::Tys<'db>,
+        variance: Variance,
+        at: At,
+    ) {
+        let count = xs.len().min(ys.len());
+        for (index, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
+            let inner =
+                if index + 1 == count { variance } else { variance.xform(Variance::Contravariant) };
+            self.relate(x, y, inner, at);
         }
     }
 
@@ -3255,17 +3379,33 @@ impl<'db> Builder<'_, '_, 'db> {
             (TyKind::Array(x, _), TyKind::Array(y, _)) | (TyKind::Slice(x), TyKind::Slice(y)) => {
                 self.relate(x, y, variance, at)
             }
+            // Higher-ranked subtyping, as rustc's `TypeRelating::binders`: `a <: b` holds
+            // when `b`'s `for<'a>` instantiated with placeholders is a supertype of `a`'s
+            // instantiated with variables; invariant, both ways, each still invariant. A region
+            // that cannot name a placeholder outlives it by outliving `'static`, so a closure
+            // parameter `x: fn(&u32)` of a type `fn(&'1 u32)` needs `'1: 'static`.
             (TyKind::FnPtr(sa, _), TyKind::FnPtr(sb, _)) => {
-                let (xs, ys) =
-                    (sa.skip_binder().inputs_and_output, sb.skip_binder().inputs_and_output);
-                let count = xs.len().min(ys.len());
-                for (index, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
-                    let inner = if index + 1 == count {
-                        variance
-                    } else {
-                        variance.xform(Variance::Contravariant)
-                    };
-                    self.relate(x, y, inner, at);
+                if sa.bound_vars().is_empty() && sb.bound_vars().is_empty() {
+                    let (xs, ys) =
+                        (sa.skip_binder().inputs_and_output, sb.skip_binder().inputs_and_output);
+                    self.relate_sig_tys(xs, ys, variance, at);
+                    return;
+                }
+                let mut pass = |this: &mut Self, general_is_b: bool| {
+                    let universe = this.ctx.infcx.create_next_universe();
+                    this.relate_universes.insert(universe);
+                    let xs = this.instantiate_sig(sa, universe, !general_is_b);
+                    let ys = this.instantiate_sig(sb, universe, general_is_b);
+                    this.relate_sig_tys(xs, ys, variance, at);
+                };
+                match variance {
+                    Variance::Covariant => pass(self, true),
+                    Variance::Contravariant => pass(self, false),
+                    Variance::Invariant => {
+                        pass(self, true);
+                        pass(self, false);
+                    }
+                    Variance::Bivariant => (),
                 }
             }
             (TyKind::Dynamic(pa, ra), TyKind::Dynamic(pb, rb)) => {
@@ -4252,8 +4392,26 @@ impl<'db> Builder<'_, '_, 'db> {
                                 .callable_item_signature(def.0)
                                 .instantiate(self.interner(), args)
                                 .skip_norm_wip();
+                            // To a `for<'a> fn`, the item's signature keeps its own `for<'a>`,
+                            // related to the target's as higher-ranked types are.
+                            if let TyKind::FnPtr(to, _) = target.kind()
+                                && !to.bound_vars().is_empty()
+                            {
+                                let interner = self.interner();
+                                let sig =
+                                    rustc_type_ir::fold_regions(interner, sig, |r, _| {
+                                        match r.kind() {
+                                            RegionKind::ReError(_) => self.fresh_elided(),
+                                            _ => r,
+                                        }
+                                    });
+                                let source = Ty::new_fn_ptr(interner, sig);
+                                self.relate(source, target, Variance::Covariant, at);
+                                return Some(target);
+                            }
                             // rustc instantiates the item's late-bound lifetimes and proves
-                            // its signature well-formed with them: `&'a &'b ()` that `'b: 'a`.
+                            // its signature well-formed with them: `&'a &'b ()` that `'b: 'a`,
+                            // when the target has none of its own.
                             let sig = self.ctx.infcx.instantiate_binder_with_fresh_vars(
                                 hir_ty::Span::Dummy,
                                 hir_ty::next_solver::infer::BoundRegionConversionTime::FnCall,

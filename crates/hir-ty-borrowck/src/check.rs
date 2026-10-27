@@ -1679,39 +1679,42 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             // to its creator by how it gets there.
             let escapes = in_closure
                 && matches!(shorter_kind, UniversalKind::Creator | UniversalKind::Static);
-            let (code, message) = if placeholder {
-                ("", "higher-ranked lifetime error".to_owned())
-            } else if escapes
-                && blamed.category == Category::Return
-                && self.regions.closure_env == Some(longer)
-                && self.ctx.closure_kind == Some(rustc_type_ir::ClosureKind::FnMut)
-                && !self.async_closure()
-            {
-                ("", "captured variable cannot escape `FnMut` closure body".to_owned())
-            } else if escapes
-                && matches!(blamed.category, Category::Assignment | Category::CallArgument)
-                && (self.closure_variable_names(longer_rv)
-                    || self.closure_variable_names(shorter_rv))
-            {
-                ("E0521", "borrowed data escapes outside of closure".to_owned())
-            } else if !self.regions.is_impl_item
-                && !in_closure
-                && (named_anon(kind, shorter_kind) || named_anon(shorter_kind, kind))
-                && !self.regions.unsuggested.contains(&if kind == UniversalKind::AnonParam {
-                    longer
+            let (code, message) =
+                if placeholder && self.regions.related_placeholders.contains(&longer) {
+                    ("E0308", "mismatched types".to_owned())
+                } else if placeholder {
+                    ("", "higher-ranked lifetime error".to_owned())
+                } else if escapes
+                    && blamed.category == Category::Return
+                    && self.regions.closure_env == Some(longer)
+                    && self.ctx.closure_kind == Some(rustc_type_ir::ClosureKind::FnMut)
+                    && !self.async_closure()
+                {
+                    ("", "captured variable cannot escape `FnMut` closure body".to_owned())
+                } else if escapes
+                    && matches!(blamed.category, Category::Assignment | Category::CallArgument)
+                    && (self.closure_variable_names(longer_rv)
+                        || self.closure_variable_names(shorter_rv))
+                {
+                    ("E0521", "borrowed data escapes outside of closure".to_owned())
+                } else if !self.regions.is_impl_item
+                    && !in_closure
+                    && (named_anon(kind, shorter_kind) || named_anon(shorter_kind, kind))
+                    && !self.regions.unsuggested.contains(&if kind == UniversalKind::AnonParam {
+                        longer
+                    } else {
+                        shorter
+                    })
+                {
+                    ("E0621", "explicit lifetime required in the type of a parameter".to_owned())
+                } else if blamed.category == Category::CallArgument
+                    && shorter_kind == UniversalKind::Static
+                    && self.parameter_names(longer_rv)
+                {
+                    ("E0521", format!("borrowed data escapes outside of {}", self.owner_descr()))
                 } else {
-                    shorter
-                })
-            {
-                ("E0621", "explicit lifetime required in the type of a parameter".to_owned())
-            } else if blamed.category == Category::CallArgument
-                && shorter_kind == UniversalKind::Static
-                && self.parameter_names(longer_rv)
-            {
-                ("E0521", format!("borrowed data escapes outside of {}", self.owner_descr()))
-            } else {
-                ("", "lifetime may not live long enough".to_owned())
-            };
+                    ("", "lifetime may not live long enough".to_owned())
+                };
             let span = match blamed.category {
                 Category::Return => self.tail(blamed.span),
                 _ => blamed.span,
