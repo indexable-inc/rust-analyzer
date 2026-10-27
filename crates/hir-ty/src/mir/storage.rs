@@ -7,7 +7,8 @@
 //! hir-ide's `hir_fmt` they had each of 724 locals live with 722 others at some point). A
 //! borrowed local has storage where `StorageLive` and `StorageDead` say it
 //! does (`MaybeStorageLive` of `rustc_mir_dataflow`), and all through the body when they do not
-//! mention it or it is mentioned where they say it has none.
+//! mention it or it is mentioned where they say it has none. So does a local a debugger is told
+//! of: it reads the local's memory all through the local's scope, past its last read.
 
 use rustc_index::bit_set::{BitMatrix, DenseBitSet};
 
@@ -49,8 +50,13 @@ fn in_frame(place: &StoredPlace) -> bool {
 }
 
 impl MirBody<'_> {
-    /// Which of `locals` may hold storage at the same point of the body.
-    pub fn frame_storage_conflicts(&self, locals: &[LocalId]) -> StorageConflicts {
+    /// Which of `locals` may hold storage at the same point of the body. Those of `scoped` hold
+    /// it where their markers say, as borrowed ones do.
+    pub fn frame_storage_conflicts(
+        &self,
+        locals: &[LocalId],
+        scoped: impl Fn(LocalId) -> bool,
+    ) -> StorageConflicts {
         let count = locals.len();
         let mut index = vec![None; self.locals.len()];
         for (at, &local) in locals.iter().enumerate() {
@@ -62,6 +68,11 @@ impl MirBody<'_> {
         // The locals with markers, and of the others the ones liveness tells of.
         let mut marked = DenseBitSet::new_empty(count);
         let mut borrowed = DenseBitSet::new_empty(count);
+        for (at, &local) in locals.iter().enumerate() {
+            if scoped(local) {
+                borrowed.insert(at);
+            }
+        }
         for (_, block) in self.basic_blocks.iter() {
             for statement in &block.statements {
                 match &statement.kind {
