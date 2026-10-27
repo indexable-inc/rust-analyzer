@@ -1228,11 +1228,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         self.check_if_assigned_path_is_moved(location, place, span);
         // An immutable variable can be assigned while it has never been initialized.
         if place.projection.is_empty() && self.ctx.is_immutable(place.local) {
-            // A binding of a pattern is a new variable each time, where rustc ends the storage
-            // of the bindings of a candidate whose guard fails; lowering does not.
-            let binds = matches!(span, MirSpan::PatId(_) | MirSpan::BindingId(_));
-            if !binds
-                && self.ever.contains(place.local.into_raw().into_u32() as usize)
+            if self.ever.contains(place.local.into_raw().into_u32() as usize)
                 && !self.access_reported.contains(&(place.key(), span))
             {
                 self.report_illegal_reassignment(place, span);

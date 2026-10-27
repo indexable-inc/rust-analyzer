@@ -552,6 +552,29 @@ fn f<'db>(db: &(dyn 'db + Database)) { take(db) }
     }
 
     #[test]
+    fn a_failed_guard_ends_what_its_pattern_binds() {
+        check_diagnostics(
+            r#"
+//- minicore: copy
+fn p(_: &u8) -> bool { false }
+fn f(v: (u8, u8)) -> u8 {
+    let mut n = 0;
+    loop {
+        n += match v {
+            (ref a, 1) | (2, ref a) if p(a) => *a,
+            (ref a, _) if p(a) => *a,
+            _ => 1,
+        };
+        if n > 2 {
+            return n;
+        }
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
     fn unused_mut_self() {
         check_diagnostics(
             r#"
