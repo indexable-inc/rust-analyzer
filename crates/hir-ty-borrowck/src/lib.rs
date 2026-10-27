@@ -225,7 +225,11 @@ fn check_owner<'db>(
     // the closure needs of it.
     let mut requirements = FxHashMap::default();
     let mut mut_upvars = FxHashMap::default();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics: Vec<Vec<Option<BorrowckDiagnostic>>> = Vec::new();
+    // rustc's `buffered_move_errors`, one for the function and the closures in it: the body,
+    // the error's place as rustc has it and where the error is, by the moves it is about.
+    let mut move_errors: FxHashMap<Vec<usize>, (usize, (LocalId, Vec<PlaceElem>), usize)> =
+        FxHashMap::default();
     for (body, closure, inline_const) in bodies.into_iter().rev() {
         let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
         ctx.inline_const = inline_const.is_some();
@@ -233,10 +237,32 @@ fn check_owner<'db>(
             return result;
         }
         let mut found = Vec::new();
+        let mut moved = Vec::new();
         let (count, needs, used_mut_upvars) =
-            check::check(&ctx, body, &requirements, &mut_upvars, &mut found);
+            check::check(&ctx, body, &requirements, &mut_upvars, &mut found, &mut moved);
         if ctx.tainted.get() {
             return result;
+        }
+        let this = diagnostics.len();
+        let mut found: Vec<_> = found.into_iter().map(Some).collect();
+        // rustc numbers the moves of each body from 0 but buffers the errors of all of them
+        // by those numbers, so a use of a moved value whose moves are numbered as those of
+        // an error a closure gave, of a place the closure's is in (the variable `_1` and the
+        // capture `_1.0`), is not reported; of another place, it replaces the closure's.
+        for error in moved {
+            let Some(key) = error.rustc_key else { continue };
+            if let Some(&(other, ref place, at)) = move_errors.get(&key)
+                && other != this
+            {
+                let reported = check::PlaceRef { local: place.0, projection: &place.1 };
+                let used = check::PlaceRef { local: error.place.0, projection: &error.place.1 };
+                if used.is_prefix_of(reported) {
+                    found[error.at] = None;
+                    continue;
+                }
+                diagnostics[other][at] = None;
+            }
+            move_errors.insert(key, (this, error.place, error.at));
         }
         diagnostics.push(found);
         if let Some(nested) = closure.or(inline_const) {
@@ -244,7 +270,7 @@ fn check_owner<'db>(
             mut_upvars.insert(nested, used_mut_upvars);
         }
     }
-    result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
+    result.diagnostics.extend(diagnostics.into_iter().rev().flatten().flatten());
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
             eprintln!("skipped {skipped}");

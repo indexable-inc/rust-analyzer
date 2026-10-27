@@ -38,9 +38,12 @@ pub(super) fn check<'db>(
     requirements: &FxHashMap<ExprId, (usize, Vec<regions::Requirement<'db>>)>,
     mut_upvars: &FxHashMap<ExprId, Vec<usize>>,
     out: &mut Vec<BorrowckDiagnostic>,
+    moved: &mut Vec<UseOfMoved>,
 ) -> (usize, Vec<regions::Requirement<'db>>, Vec<usize>) {
     let cfg = Cfg::new(body);
     let moves = MoveData::gather(ctx, body, &cfg);
+    let rustc_moves = rustc_move_indices(ctx, body, &moves);
+    let upvar_sources = upvar_sources(ctx, body);
     let flow = InitFlow::compute(body, &cfg, &moves);
     let dominators = Dominators::new(&cfg);
     let capture_temps = capture_temps(body);
@@ -132,6 +135,8 @@ pub(super) fn check<'db>(
         access_reported: FxHashSet::default(),
         uninit_reported: FxHashSet::default(),
         move_reported: FxHashMap::default(),
+        rustc_moves,
+        upvar_sources,
         move_errors: Vec::new(),
         scrutinees: None,
         capture_temps,
@@ -237,7 +242,11 @@ pub(super) fn check<'db>(
     }
     let unused_mut = checker.unused_mut();
     out.extend(checker.errors.into_iter().flatten());
-    out.extend(checker.move_reported.into_values().map(|(_, _, error)| error));
+    for (_, (_, mut error)) in checker.move_reported {
+        error.at = out.len();
+        out.push(error.diagnostic.clone());
+        moved.push(error);
+    }
     out.extend(unused_mut);
     let count = regions.creator_positions.values().filter(|&&it| it < regions::IMPL_ANON).count();
     let mut used_mut_upvars = checker.used_mut_upvars;
@@ -397,6 +406,117 @@ fn union_literals(ctx: &Ctx<'_, '_>) -> FxHashSet<ExprId> {
     found
 }
 
+/// An `E0382` of a body, as rustc buffers it with those of the other bodies of the function:
+/// rustc keeps one buffer of them for a function and the closures in it, keyed by the indices
+/// of the moves each is about, each body numbering its own moves.
+pub(super) struct UseOfMoved {
+    /// The indices of the moves, as rustc numbers them in the body; `None` when one of them is
+    /// a move of rust-analyzer's lowering that rustc's MIR does not have.
+    pub(super) rustc_key: Option<Vec<usize>>,
+    /// The place used, as rustc's MIR has it: a capture is a field of the closure.
+    pub(super) place: (LocalId, Vec<PlaceElem>),
+    pub(super) diagnostic: BorrowckDiagnostic,
+    /// Where the error is in what `check` reports.
+    pub(super) at: usize,
+}
+
+/// Each move out's index as rustc's `MoveData` numbers its move outs: every operand moved,
+/// and every `StorageDead`, in the order of the blocks and their statements. A move rustc's
+/// MIR does not have has none: a drop, a capture copied into a local of the closure body, and
+/// a temporary lowering moves an operand into where rustc moves the place itself.
+fn rustc_move_indices(
+    ctx: &Ctx<'_, '_>,
+    body: &MirBody<'_>,
+    moves: &MoveData,
+) -> Vec<Option<usize>> {
+    let upvar_locals: FxHashSet<LocalId> = ctx.upvars.iter().map(|it| it.local).collect();
+    let variables: FxHashSet<LocalId> = body.binding_locals.values().copied().collect();
+    // For each local, how often it is assigned and whether every assignment moves a place
+    // into the whole of it.
+    let mut assigned: FxHashMap<LocalId, (usize, bool)> = FxHashMap::default();
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            if let StatementKind::Assign(place, rvalue) = &statement.kind {
+                let entry = assigned.entry(place.local).or_insert((0, true));
+                entry.0 += 1;
+                entry.1 &= place.projection.as_slice().is_empty()
+                    && matches!(rvalue, Rvalue::Use(it) if matches!(it.kind, OperandKind::Move(_)));
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let TerminatorKind::Call { destination, .. } = &terminator.kind
+        {
+            assigned.entry(destination.local).or_insert((0, false)).1 = false;
+        }
+    }
+    let lowering_temp = |local: LocalId| {
+        !variables.contains(&local)
+            && !body.param_locals.contains(&local)
+            && !upvar_locals.contains(&local)
+            && assigned.get(&local).is_some_and(|&(count, moved)| count == 1 && moved)
+    };
+    let mut order: Vec<usize> = (0..moves.moves.len())
+        .filter(|&it| {
+            let out = moves.moves[it];
+            let local = moves.paths[out.path].local;
+            let block = &body.basic_blocks[out.location.block];
+            match block.statements.get(out.location.statement) {
+                Some(statement) => match &statement.kind {
+                    StatementKind::StorageDead(_) => {
+                        !lowering_temp(local) && !upvar_locals.contains(&local)
+                    }
+                    StatementKind::Assign(dest, _) if upvar_locals.contains(&dest.local) => {
+                        Some(local) != ctx.closure_local
+                    }
+                    _ => !lowering_temp(local),
+                },
+                None => {
+                    !matches!(
+                        block.terminator.as_ref().map(|it| &it.kind),
+                        Some(TerminatorKind::Drop { .. } | TerminatorKind::DropAndReplace { .. })
+                    ) && !lowering_temp(local)
+                }
+            }
+        })
+        .collect();
+    order.sort_by_key(|&it| {
+        let location = moves.moves[it].location;
+        (index(location.block), location.statement, it)
+    });
+    let mut out = vec![None; moves.moves.len()];
+    for (rustc, it) in order.into_iter().enumerate() {
+        out[it] = Some(rustc);
+    }
+    out
+}
+
+/// In a closure, the place of the closure each local lowering copies a capture into is
+/// (`_2 = move (_1.0)`, `_2 = &(*_1).0`), as rustc's MIR uses that place itself.
+fn upvar_sources(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashMap<LocalId, StoredPlace> {
+    let mut out = FxHashMap::default();
+    let Some(closure) = ctx.closure_local else { return out };
+    for (_, block) in body.basic_blocks.iter() {
+        for statement in &block.statements {
+            let StatementKind::Assign(dest, rvalue) = &statement.kind else { continue };
+            if !dest.projection.as_slice().is_empty() || ctx.upvar_of_local(dest.local).is_none() {
+                continue;
+            }
+            let source = match rvalue {
+                Rvalue::Use(it) => match &it.kind {
+                    OperandKind::Move(place) | OperandKind::Copy(place) => place,
+                    _ => continue,
+                },
+                Rvalue::Ref(_, place) => place,
+                _ => continue,
+            };
+            if source.local == closure {
+                out.entry(dest.local).or_insert_with(|| source.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Whether the variable `place` starts from is declared without `mut`: rustc's
 /// `limit_capture_mutability` makes a closure's mutable borrow of such a place a unique one.
 /// In a closure, a capture of its own captures is checked against how the variable it captured
@@ -435,7 +555,7 @@ impl<'p> PlaceRef<'p> {
         (self.local, self.projection.to_vec())
     }
 
-    fn is_prefix_of(self, other: PlaceRef<'_>) -> bool {
+    pub(super) fn is_prefix_of(self, other: PlaceRef<'_>) -> bool {
         self.local == other.local && other.projection.starts_with(self.projection)
     }
 }
@@ -546,7 +666,11 @@ struct Checker<'a, 'b, 'db> {
     access_reported: FxHashSet<((LocalId, Vec<PlaceElem>), MirSpan)>,
     uninit_reported: FxHashSet<LocalId>,
     /// The `E0382` reported for a set of moves, with the place it is about.
-    move_reported: FxHashMap<Vec<usize>, ((LocalId, Vec<PlaceElem>), Location, BorrowckDiagnostic)>,
+    move_reported: FxHashMap<Vec<usize>, ((LocalId, Vec<PlaceElem>), UseOfMoved)>,
+    /// For each move out, its index in rustc's numbering, if rustc's MIR has it.
+    rustc_moves: Vec<Option<usize>>,
+    /// In a closure, the place of the closure each local a capture is copied into is.
+    upvar_sources: FxHashMap<LocalId, StoredPlace>,
     move_errors: Vec<MoveError>,
     scrutinees: Option<FxHashMap<BindingId, Option<ExprId>>>,
     /// The temporaries that hold a borrow a closure captures, with the span of the closure.
@@ -2586,7 +2710,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             self.report("E0381", span, message);
             return;
         }
-        if let Some((reported, _, _)) = self.move_reported.get(&move_outs) {
+        if let Some((reported, _)) = self.move_reported.get(&move_outs) {
             let reported = PlaceRef { local: reported.0, projection: &reported.1 };
             if used.is_prefix_of(reported) {
                 return;
@@ -2599,7 +2723,21 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let what = if partially { "partially moved value" } else { "moved value" };
         let message = format!("{} of {what}: {name}", action.noun());
         let diagnostic = BorrowckDiagnostic { code: "E0382", span, message, at_signature: false };
-        self.move_reported.insert(move_outs, (used.key(), location, diagnostic));
+        let mut rustc_key =
+            move_outs.iter().map(|&it| self.rustc_moves[it]).collect::<Option<Vec<usize>>>();
+        if let Some(key) = &mut rustc_key {
+            key.sort_unstable();
+        }
+        let place = match self.upvar_sources.get(&used.local) {
+            Some(source) => {
+                let mut projection = source.projection.as_slice().to_vec();
+                projection.extend_from_slice(used.projection);
+                (source.local, projection)
+            }
+            None => used.key(),
+        };
+        let error = UseOfMoved { rustc_key, place, diagnostic, at: 0 };
+        self.move_reported.insert(move_outs, (used.key(), error));
     }
 
     /// The moves out of `path` or a path above it that reach `location` without an init in
