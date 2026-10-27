@@ -248,12 +248,13 @@ impl ProjectWorkspace {
 
         // Resolve the Cargo.toml to the workspace root as we base the `target` dir off of it.
         // blaze's own reading is never left to cargo when it fails.
-        let own_root = match &config.own_metadata {
-            Some(own) => Some((own.root)(cargo_toml).with_context(|| {
-                format!("blaze could not find the workspace of {cargo_toml}")
-            })?),
-            None => None,
-        };
+        let own_root =
+            match &config.own_metadata {
+                Some(own) => Some((own.root)(cargo_toml).with_context(|| {
+                    format!("blaze could not find the workspace of {cargo_toml}")
+                })?),
+                None => None,
+            };
         let mut cmd = sysroot.tool(Tool::Cargo, workspace_dir, extra_env);
         cmd.args(["locate-project", "--workspace", "--manifest-path", cargo_toml.as_str()]);
         let cargo_toml = &match own_root {
@@ -304,8 +305,10 @@ impl ProjectWorkspace {
             Some(own) => {
                 let target = targets.first().map(Deref::deref);
                 let cfg = rustc_cfg::get(toolchain_config, target, extra_env);
-                let metadata = (own.metadata)(cargo_toml, target, &cfg, extra_env)
-                    .with_context(|| format!("blaze could not resolve the workspace {cargo_toml}"))?;
+                let metadata =
+                    (own.metadata)(cargo_toml, target, &cfg, extra_env).with_context(|| {
+                        format!("blaze could not resolve the workspace {cargo_toml}")
+                    })?;
                 Some((cfg, Some(metadata)))
             }
             None => None,
