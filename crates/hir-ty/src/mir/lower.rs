@@ -1962,8 +1962,15 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             operands
                                 .push(Operand { kind: OperandKind::Move(tmp.store()), span: None });
                         }
+                        // A `Copy` capture leaves the binding live: a coroutine keeps it across
+                        // a suspension the closure is awaited over.
                         UpvarCapture::ByValue => {
-                            operands.push(Operand { kind: OperandKind::Move(p), span: None })
+                            let kind = if self.is_copy(capture.captured_ty(self.db)) {
+                                OperandKind::Copy(p)
+                            } else {
+                                OperandKind::Move(p)
+                            };
+                            operands.push(Operand { kind, span: None })
                         }
                         UpvarCapture::ByUse => not_supported!("capture by use"),
                     }
