@@ -340,7 +340,11 @@ mod tests {
             for a in 0..count {
                 for b in 0..count {
                     let want = reachable[b] && reachable[a] && want[b][a];
-                    assert_eq!(fast.dominates(block(a), block(b)), want, "round {round}: {a} dom {b}");
+                    assert_eq!(
+                        fast.dominates(block(a), block(b)),
+                        want,
+                        "round {round}: {a} dom {b}"
+                    );
                 }
             }
         }

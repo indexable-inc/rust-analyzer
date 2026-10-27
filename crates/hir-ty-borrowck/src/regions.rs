@@ -7227,7 +7227,10 @@ enum Normalized {
     /// What it gives names a placeholder, a variable of another universe or a type variable.
     Here,
     Fails,
-    Gives { ty: StoredTy, pairs: Vec<(StoredRegion, StoredRegion)> },
+    Gives {
+        ty: StoredTy,
+        pairs: Vec<(StoredRegion, StoredRegion)>,
+    },
 }
 
 /// Normalizes `ty`, whose region variables are the first `vars`, in `env`, with the region
