@@ -155,8 +155,8 @@ pub struct CargoConfig {
     /// The directory a build put the executables of the workspace in, which the tests of a
     /// package are told as `CARGO_BIN_EXE_<name>`.
     pub executables: Option<AbsPathBuf>,
-    /// Where the workspace and its `cargo metadata` come from instead of cargo. Cargo is
-    /// asked when it says no.
+    /// Where the workspace and its `cargo metadata` come from instead of cargo. When it fails,
+    /// so does the load: cargo is not asked instead.
     pub own_metadata: Option<OwnMetadata>,
 }
 
