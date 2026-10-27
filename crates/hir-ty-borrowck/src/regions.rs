@@ -199,8 +199,9 @@ pub(super) struct Regions<'db> {
     /// constraints. Empty when what it captures is not known exactly.
     pub(super) members: Vec<Rv>,
     pub(super) choices: Vec<Rv>,
-    /// The body returns an `impl Trait` that captures no lifetime, of a hidden type that names
-    /// no other alias: what it returns must be `'static`, rustc's `OpaqueType` constraint.
+    /// The body returns an `impl Trait` that captures no lifetime, of a hidden type alias
+    /// liveness keeps some region of live: what it returns must be `'static`, rustc's
+    /// `OpaqueType` constraint, and a borrow of a local in it is used later, E0597.
     pub(super) returns_static_opaque: bool,
     /// A variable a function item or constructor is called through, read at the call: rust-
     /// analyzer lowers `f(x)` with `let f = Foo::<&'a u32>` as a call of the item itself.
@@ -263,7 +264,9 @@ fn projections<'db>(ty: Ty<'db>) -> Vec<(hir_ty::next_solver::SolverDefId<'db>, 
 /// Which arguments of the `impl Trait` `def`, of `len` of them, its hidden type may name: the
 /// others are bivariant in rustc's `variances_of` the opaque type, and its liveness skips
 /// them. Every one, unless `use<..>` lists them; before edition 2024, outside a trait and its
-/// impls and outside an `async fn`, the type parameters and the lifetimes its bounds name.
+/// impls and outside an `async fn`, the type parameters and the lifetimes its bounds name. In
+/// a trait or its impls the trait's or impl's own are always captured, as rustc relates an
+/// `impl Trait` there (a GAT of the trait) invariantly in all of them, whatever `use<..>` says.
 /// `None` where this does not work it out, which counts every argument captured.
 pub(super) fn opaque_captures(
     db: &dyn hir_ty::db::HirDatabase,
@@ -289,6 +292,11 @@ pub(super) fn opaque_captures(
         return None;
     }
     let is_lifetime = |id: &GenericParamId| matches!(id, GenericParamId::LifetimeParamId(_));
+    let in_trait = match function.lookup(db).container {
+        ItemContainerId::TraitId(_) => true,
+        ItemContainerId::ImplId(it) => db.impl_trait(it).is_some(),
+        _ => false,
+    };
     let signature = FunctionSignature::of(db, function);
     let written = signature.ret_type.and_then(|ret| match &signature.store[ret] {
         TypeRef::ImplTrait(bounds) if index.into_raw().into_u32() == 0 => Some(bounds),
@@ -382,6 +390,9 @@ pub(super) fn opaque_captures(
                 else {
                     return true;
                 };
+                if in_trait && param.parent != function.into() {
+                    return true;
+                }
                 let written = match output {
                     Some(hir_ty::ElidedOutput::Written(it)) => names(
                         &signature.store[hir_def::type_ref::LifetimeRefId::from_raw(
@@ -411,16 +422,11 @@ pub(super) fn opaque_captures(
     if unknown {
         return None;
     }
-    let in_trait = match function.lookup(db).container {
-        ItemContainerId::TraitId(_) => true,
-        ItemContainerId::ImplId(it) => db.impl_trait(it).is_some(),
-        _ => false,
-    };
     let edition = hir_def::HasModule::krate(&function, db).data(db).edition;
     // An `async fn`'s future captures everything; an `impl Trait` it declares it returns, the
     // future's output, is as any other.
     if edition.at_least_2024() || in_trait || signature.is_async() && written.is_some() {
-        return None;
+        return Some(vec![true; len]);
     }
     Some(
         params
@@ -718,6 +724,7 @@ pub(super) fn build<'db>(
         impl_self: None,
         returns_opaque: false,
         opaque_bounds: Vec::new(),
+        opaque_hidden: None,
         elided_output: None,
         inferred: Default::default(),
         location: None,
@@ -783,6 +790,9 @@ struct Builder<'c, 'a, 'db> {
     /// The trait and projection bounds of the returned `impl Trait`, of the type it hides,
     /// proven where the body first assigns the return slot.
     opaque_bounds: Vec<Clause<'db>>,
+    /// The hidden type of the returned `impl Trait`, which must be well-formed where the body
+    /// defines it, as rustc's `add_item_bounds_for_hidden_type` requires (#114728).
+    opaque_hidden: Option<Ty<'db>>,
     /// The region lifetime elision gives the elided lifetimes of the return type.
     elided_output: Option<Region<'db>>,
     /// rustc's `inferred_outlives_of` the ADTs the body uses.
@@ -1273,8 +1283,18 @@ impl<'db> Builder<'_, '_, 'db> {
             // `'static` when nothing it could capture is, and left free otherwise.
             let opaque = signature.as_ref().is_some_and(|(_, output)| has_opaque(*output));
             self.returns_opaque = opaque;
+            // A return type with `_` in it is rustc's E0121, which takes the type the body
+            // infers (`recover_infer_ret_ty`), and an error where it cannot name it (a closure):
+            // the error relates to nothing, and the return slot is checked as any other local,
+            // its regions inferred. rust-analyzer recovers none, so it is the body's type here.
+            let recovered = signature.as_ref().is_some_and(|(_, output)| {
+                output.walk().any(|it| {
+                    rustc_type_ir::inherent::GenericArg::as_type(&it)
+                        .is_some_and(|ty| ty.is_ty_error())
+                })
+            });
             let ty = match &signature {
-                Some((_, output)) if !opaque => *output,
+                Some((_, output)) if !opaque && !recovered => *output,
                 // The type an `impl Trait` hides is inferred, the lifetimes of its trait objects
                 // too; a trait object the signature writes next to it keeps its default.
                 Some((_, output))
@@ -1344,11 +1364,9 @@ impl<'db> Builder<'_, '_, 'db> {
                         })
                     })
             });
-            self.regions.returns_static_opaque = hidden_static
-                && !captures_lifetime
-                && !rustc_type_ir::TypeVisitableExt::has_aliases(&ty);
             let ty = rustc_type_ir::fold_regions(self.interner(), ty, |region, depth| {
-                if (opaque || signature.is_none()) && matches!(region.kind(), RegionKind::ReVar(_))
+                if (opaque || recovered || signature.is_none())
+                    && matches!(region.kind(), RegionKind::ReVar(_))
                 {
                     return self.fresh();
                 }
@@ -1372,7 +1390,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.fresh_elided()
                     }
                     _ if hidden_static => self.static_region(),
-                    _ if opaque => self.fresh(),
+                    _ if opaque || recovered => self.fresh(),
                     (Some(it), _) => it,
                     (None, true) => self.new_universal(UniversalKind::Anon),
                     // The elided lifetimes of the type of a constant or a static are `'static`.
@@ -1391,6 +1409,13 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
                 _ => ty,
             };
+            // What it returns is borrowed for `'static` through rustc's `OpaqueType` constraint,
+            // but rustc explains the borrow by the return value it is live in first, E0597: only
+            // where alias liveness keeps no region of the hidden type live, an alias whose bounds
+            // say it outlives `'static`, is it the return that is blamed, E0515.
+            self.regions.returns_static_opaque = hidden_static
+                && !captures_lifetime
+                && !super::liveness::live_regions(self.ctx, &self.regions, ty).is_empty();
             local_tys[return_local.into_raw().into_u32() as usize] = Some(ty);
             // rustc proves an `impl Trait`'s bounds of the type it hides where the body
             // defines it: `impl Iterator<Item = Box<dyn Foo>>` hiding `Iter<'a, T>` needs the
@@ -1431,6 +1456,7 @@ impl<'db> Builder<'_, '_, 'db> {
                         });
                     self.opaque_bounds.push(clause);
                 }
+                self.opaque_hidden = Some(ty);
             }
             let mut unsuggested = Vec::new();
             regions_of(ty, &mut unsuggested);
@@ -3975,9 +4001,13 @@ impl<'db> Builder<'_, '_, 'db> {
         }
         if projection.is_empty() {
             self.sized_local(place.local, dest, span);
-            if place.local == super::return_slot() && !self.opaque_bounds.is_empty() {
+            if place.local == super::return_slot() {
                 let bounds = std::mem::take(&mut self.opaque_bounds);
-                self.clauses(bounds, At { category: Category::Predicate, span }, true);
+                let at = At { category: Category::Signature, span };
+                self.clauses(bounds, at, true);
+                if let Some(hidden) = self.opaque_hidden.take() {
+                    self.well_formed(hidden, at, 0);
+                }
             }
         }
         let first = self.regions.outlives.len();
@@ -4874,6 +4904,13 @@ impl<'db> Builder<'_, '_, 'db> {
                         args.as_closure().tupled_upvars_ty(),
                         lifetimes(args.as_closure().parent_args().as_slice()),
                     )),
+                    // An `async` closure holds its captures as any closure does: `async || x`
+                    // borrows `x` into its upvar, rustc's operand of `CoroutineClosure`.
+                    TyKind::CoroutineClosure(def, args) => Some((
+                        def.0.loc(self.ctx.db).expr,
+                        args.as_coroutine_closure().tupled_upvars_ty(),
+                        lifetimes(args.as_coroutine_closure().parent_args().as_slice()),
+                    )),
                     TyKind::Coroutine(def, args) => {
                         let expr = def.0.loc(self.ctx.db).expr;
                         if let TyKind::Coroutine(_, typed) = written.kind() {
@@ -5256,7 +5293,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 for (arg, input) in args.iter().zip(inputs) {
                     let fn_item = arg.span().and_then(|it| self.fn_item(arg, it));
                     if let Some(ty) = fn_item.or_else(|| self.operand_ty(arg)) {
-                        let at = At { category, span: arg.span().unwrap_or(span) };
+                        let at = At { category, span };
                         self.relate(ty, input, Variance::Covariant, at);
                     }
                 }
@@ -6480,6 +6517,9 @@ pub(super) fn outlives_components<'db>(
         }
         TyKind::Closure(_, args) => {
             outlives_components(args.as_closure().tupled_upvars_ty(), regions, params)
+        }
+        TyKind::CoroutineClosure(_, args) => {
+            outlives_components(args.as_coroutine_closure().tupled_upvars_ty(), regions, params)
         }
         TyKind::Coroutine(_, args) => {
             outlives_components(args.as_coroutine().tupled_upvars_ty(), regions, params);

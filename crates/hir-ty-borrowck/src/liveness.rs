@@ -664,6 +664,17 @@ fn live_regions_of<'db>(
     rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Visit { ctx, regions, out });
 }
 
+/// [`live_regions_of`] `ty`.
+pub(super) fn live_regions<'db>(
+    ctx: &Ctx<'_, 'db>,
+    regions: &Regions<'db>,
+    ty: Ty<'db>,
+) -> Vec<Rv> {
+    let mut out = Vec::new();
+    live_regions_of(ctx, regions, ty, &mut out);
+    out
+}
+
 /// The one region the bounds of the alias `ty` say it outlives: `Some(None)` for `'static`,
 /// `None` when they name none or several, or when `ty` is under a binder of its own type,
 /// `fn(T::Gat<'a, '_>)`, whose bounds rustc does not match.

@@ -1545,7 +1545,20 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
         let projection = loan.projection.clone();
         let place = PlaceRef { local: loan.local, projection: &projection };
-        let capture = self.capture_temps.get(&loan.assigned).copied();
+        // rustc's `borrow_spans` knows a capture only by a closure's or a coroutine's aggregate:
+        // what an `async` closure borrows is blamed as any other borrow of a local.
+        let capture = self.capture_temps.get(&loan.assigned).copied().filter(|it| {
+            !matches!(
+                it,
+                MirSpan::ExprId(expr) if matches!(
+                    self.ctx.store[*expr],
+                    hir_def::hir::Expr::Closure {
+                        closure_kind: hir_def::hir::ClosureKind::CoroutineClosure(_),
+                        ..
+                    }
+                )
+            )
+        });
         // A loan whose region outlives a universal one must be valid for it, and the error
         // says why: it is returned, or it goes to where a closure escapes to.
         let universal = self
