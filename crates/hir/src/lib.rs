@@ -3673,6 +3673,20 @@ impl TypeParam {
             .collect()
     }
 
+    /// [`TypeParam::trait_bounds`] with the bounds' generic arguments, for blaze's lints.
+    pub fn trait_refs(self, db: &dyn HirDatabase) -> Vec<TraitRef<'_>> {
+        let self_ty = self.ty(db).ty.instantiate_identity().skip_norm_wip();
+        GenericPredicates::query_explicit(db, self.id.parent())
+            .iter_identity()
+            .filter_map(|pred| match &pred.kind().skip_binder() {
+                ClauseKind::Trait(trait_ref) if trait_ref.self_ty() == self_ty => {
+                    Some(TraitRef::new(self.id.parent(), trait_ref.trait_ref))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn default(self, db: &dyn HirDatabase) -> Option<Type<'_>> {
         let ty = generic_arg_from_param(db, self.id.into())?;
         match ty.kind() {
@@ -4530,6 +4544,15 @@ impl<'db> Type<'db> {
     fn builtin_type_crate(db: &'db dyn HirDatabase) -> base_db::Crate {
         // It doesn't really matter.
         all_crates(db)[0]
+    }
+
+    /// The type owned by no item's generics, when it names none of them, so that it can be
+    /// asked of together with the types of any item: for blaze's lints.
+    pub fn without_params(&self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+        if self.ty.skip_binder().has_param() {
+            return None;
+        }
+        Some(Type { owner: TypeOwnerId::NoParams(Self::builtin_type_crate(db)), ty: self.ty })
     }
 
     fn from_def(db: &'db dyn HirDatabase, def: impl Into<TyDefId>) -> Self {
