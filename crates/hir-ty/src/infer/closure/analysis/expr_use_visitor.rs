@@ -559,9 +559,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
             }
 
             Expr::Let { pat, expr: init } => {
-                self.walk_local(init, pat, None, |this| {
-                    this.borrow_expr(init, BorrowKind::Immutable)
-                })?;
+                self.walk_local(init, pat, None)?;
             }
 
             Expr::Match { expr: discr, ref arms } => {
@@ -696,7 +694,7 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
     fn walk_stmt(&mut self, stmt: &Statement) -> Result {
         match *stmt {
             Statement::Let { pat, initializer: Some(expr), else_branch: els, .. } => {
-                self.walk_local(expr, pat, els, |_| Ok(()))?;
+                self.walk_local(expr, pat, els)?;
             }
 
             Statement::Let { .. } => {}
@@ -729,13 +727,9 @@ impl<'a, 'db, D: Delegate<'db>> ExprUseVisitor<'a, 'db, D> {
         self.delegate.fake_read(discr_place, cause, self.cx);
     }
 
-    fn walk_local<F>(&mut self, expr: ExprId, pat: PatId, els: Option<ExprId>, mut f: F) -> Result
-    where
-        F: FnMut(&mut Self) -> Result,
-    {
+    fn walk_local(&mut self, expr: ExprId, pat: PatId, els: Option<ExprId>) -> Result {
         self.walk_expr(expr)?;
         let expr_place = self.cat_expr(expr)?;
-        f(self)?;
         self.fake_read_scrutinee(expr_place.clone(), els.is_some());
         self.walk_pat(expr_place, pat, false)?;
         if let Some(els) = els {

@@ -17,8 +17,8 @@ use smallvec::SmallVec;
 use crate::{
     consteval::try_const_usize,
     mir::{
-        BasicBlockId, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem, PlaceTy,
-        Projection, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+        BasicBlockId, BorrowKind, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem,
+        PlaceTy, Projection, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     },
     next_solver::TyKind,
 };
@@ -449,6 +449,14 @@ impl InitState {
         }
     }
 
+    pub(super) fn apply(&mut self, paths: &[PathId], change: Change) {
+        match change {
+            Change::Init => self.set(paths, true),
+            Change::Uninit => self.set(paths, false),
+            Change::Borrowed => paths.iter().for_each(|&path| self.maybe_init.insert(path)),
+        }
+    }
+
     /// (maybe init, maybe uninit) of `path` itself.
     pub(super) fn of(&self, path: PathId) -> (bool, bool) {
         (self.maybe_init.contains(path), self.maybe_uninit.contains(path))
@@ -456,11 +464,24 @@ impl InitState {
 }
 
 /// Something a statement or terminator does to the paths, with every path below the one it
-/// names: a move out or a drop leaves them uninitialized, an assignment initializes them.
+/// names.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Effect {
     pub(super) path: PathId,
-    pub(super) init: bool,
+    pub(super) change: Change,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Change {
+    /// An assignment: the paths hold a value.
+    Init,
+    /// A move out, a drop, `StorageDead`: they hold none.
+    Uninit,
+    /// A mutable borrow (`&mut`, `&raw mut`), through which they may be assigned: they may hold a
+    /// value, and may still hold none, as rustc's `MaybeInitializedPlaces` has it (#90752: an enum
+    /// a `match` found `None` and then `*(&mut x) = Some(..)`). It writes no drop flag. rustc
+    /// counts `&raw const` too, which MIR lowering here makes a shared borrow.
+    Borrowed,
 }
 
 /// The effects of the statement `at` of `block`, or of its terminator when `at` is the number
@@ -477,7 +498,7 @@ pub(super) fn effects_at<'db>(
     let moved = |operand: &crate::mir::Operand, effects: &mut Vec<Effect>| {
         if let OperandKind::Move(place) = &operand.kind {
             for path in data.paths_of(ctx, place) {
-                effects.push(Effect { path, init: false });
+                effects.push(Effect { path, change: Change::Uninit });
             }
         }
     };
@@ -485,26 +506,31 @@ pub(super) fn effects_at<'db>(
     if let Some(statement) = data_block.statements.get(at) {
         statement.kind.for_each_operand(&mut |operand| moved(operand, &mut effects));
         match &statement.kind {
-            StatementKind::Assign(place, _) => {
+            StatementKind::Assign(place, rvalue) => {
                 for path in data.paths_of(ctx, &init_target(ctx, body, place)) {
-                    effects.push(Effect { path, init: true });
+                    effects.push(Effect { path, change: Change::Init });
+                }
+                if let Rvalue::Ref(BorrowKind::Mut { .. }, borrowed) = rvalue
+                    && let Lookup::Exact(path) = data.lookup(ctx, borrowed)
+                {
+                    effects.push(Effect { path, change: Change::Borrowed });
                 }
             }
             StatementKind::Deinit(place) => {
                 for path in data.paths_of(ctx, place) {
-                    effects.push(Effect { path, init: false });
+                    effects.push(Effect { path, change: Change::Uninit });
                 }
             }
             StatementKind::StorageDead(local) => {
                 if let Some(path) = data.for_local(*local) {
-                    effects.push(Effect { path, init: false });
+                    effects.push(Effect { path, change: Change::Uninit });
                 }
             }
             StatementKind::InlineAsm(asm) => {
                 for operand in &asm.operands {
                     if let crate::mir::AsmOperand::Reg { output: Some(place), .. } = operand {
                         for path in data.paths_of(ctx, place) {
-                            effects.push(Effect { path, init: true });
+                            effects.push(Effect { path, change: Change::Init });
                         }
                     }
                 }
@@ -517,7 +543,7 @@ pub(super) fn effects_at<'db>(
     terminator.kind.for_each_operand(&mut |operand| moved(operand, &mut effects));
     if let TerminatorKind::Drop { place, .. } = &terminator.kind {
         for path in data.paths_of(ctx, place) {
-            effects.push(Effect { path, init: false });
+            effects.push(Effect { path, change: Change::Uninit });
         }
     }
     effects
@@ -643,7 +669,7 @@ impl InitAnalysis {
                 let here =
                     effects.entry((id, at)).or_insert_with(|| effects_at(ctx, data, body, id, at));
                 for effect in here.iter() {
-                    state.set(&subtrees[effect.path], effect.init);
+                    state.apply(&subtrees[effect.path], effect.change);
                 }
             }
             let Some(terminator) = &block.terminator else { continue };
@@ -660,7 +686,7 @@ impl InitAnalysis {
             let here =
                 effects.entry((id, at)).or_insert_with(|| effects_at(ctx, data, body, id, at));
             for effect in here.iter() {
-                state.set(&subtrees[effect.path], effect.init);
+                state.apply(&subtrees[effect.path], effect.change);
             }
             if let Some(cleanup) = terminator.kind.unwind() {
                 let mut unwound = state.clone();
@@ -727,7 +753,7 @@ impl InitAnalysis {
             let mut state = entry.clone();
             for at in 0..block.statements.len() {
                 for effect in effects_at(ctx, data, body, id, at) {
-                    state.set(&data.subtree(effect.path), effect.init);
+                    state.apply(&data.subtree(effect.path), effect.change);
                 }
             }
             if data.holds_nothing(ctx, place, &state) {

@@ -174,7 +174,6 @@ unicode-width = "0.2.2"
 url = "2.5.4"
 xshell = "0.2.7"
 thin-vec = "0.2.16"
-petgraph = { version = "0.8.2", default-features = false }
 hashbrown = { version = "0.17.0", features = [
     "inline-more",
 ], default-features = false }

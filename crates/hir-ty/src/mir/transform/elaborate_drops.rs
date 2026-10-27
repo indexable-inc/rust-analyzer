@@ -30,7 +30,7 @@ use crate::{
 use super::{
     Ctx,
     move_paths::{
-        InitAnalysis, InitState, Lookup, MoveData, PathId, Step, edge_effects, effects_at,
+        Change, InitAnalysis, InitState, Lookup, MoveData, PathId, Step, edge_effects, effects_at,
     },
 };
 
@@ -145,11 +145,16 @@ pub(super) fn elaborate_drops<'db>(
                 break;
             }
             for effect in &effects {
-                state.set(&subtrees[effect.path], effect.init);
+                state.apply(&subtrees[effect.path], effect.change);
+                let value = match effect.change {
+                    Change::Init => true,
+                    Change::Uninit => false,
+                    Change::Borrowed => continue,
+                };
                 writes.push((
                     id,
                     at,
-                    FlagWrite { paths: subtrees[effect.path].clone(), value: effect.init },
+                    FlagWrite { paths: subtrees[effect.path].clone(), value },
                 ));
             }
         }
