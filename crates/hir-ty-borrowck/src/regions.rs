@@ -1330,6 +1330,18 @@ impl<'db> Builder<'_, '_, 'db> {
                     (None, false) => self.static_region(),
                 })
             });
+            // rustc's MIR has the return slot's type normalized: a projection whose impl
+            // gives it a lifetime of its own is that lifetime an existential region, live
+            // where the slot is.
+            let ty = match ty.kind() {
+                TyKind::Alias(alias)
+                    if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. })
+                        && self.normalize(ty).is_none() =>
+                {
+                    normalize_with_fresh(self.ctx, ty).unwrap_or(ty)
+                }
+                _ => ty,
+            };
             local_tys[return_local.into_raw().into_u32() as usize] = Some(ty);
             // rustc proves an `impl Trait`'s bounds of the type it hides where the body
             // defines it: `impl Iterator<Item = Box<dyn Foo>>` hiding `Iter<'a, T>` needs the
@@ -6496,6 +6508,18 @@ pub(super) fn blame_with(path: &[Outlives], opaque: bool) -> Option<Outlives> {
 /// regions: the solver gives the result regions of its own, related to those it came from only
 /// by constraints it records.
 pub(super) fn normalize<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
+    normalize_impl(ctx, ty, false)
+}
+
+/// `ty` normalized as `normalize` does, a region the result has of its own (an impl's
+/// lifetime that nothing constrains, `impl<'a, T: 'a> Tr for T { type A = <T as Mk<'a>>::R }`)
+/// left a region variable of its own, as rustc's normalization in borrowck gives it an
+/// existential region.
+fn normalize_with_fresh<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
+    normalize_impl(ctx, ty, true)
+}
+
+fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Option<Ty<'db>> {
     use hir_ty::next_solver::{
         infer::{region_constraints::Constraint, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
@@ -6541,5 +6565,5 @@ pub(super) fn normalize<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>>
             _ => region,
         }
     });
-    (!unmapped).then_some(normalized)
+    (allow_fresh || !unmapped).then_some(normalized)
 }
