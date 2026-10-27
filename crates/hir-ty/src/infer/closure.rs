@@ -1008,18 +1008,28 @@ impl<'db> InferenceContext<'db> {
             },
         };
         // First, convert the types that the user supplied (if any).
-        let supplied_arguments = decl_inputs.iter().map(|&input| match input {
-            Some(input) => self.make_ty(input),
-            None => self.table.next_ty_var(closure_expr.into()),
-        });
+        let (supplied, bound_vars) =
+            self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs));
+        let supplied_arguments: Vec<_> = supplied
+            .into_iter()
+            .map(|input| match input {
+                // The solver takes no type with a lifetime bound outside it.
+                Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),
+                Some(ty) => self.process_user_written_ty(ty),
+                None => self.table.next_ty_var(closure_expr.into()),
+            })
+            .collect();
 
-        Binder::dummy(interner.mk_fn_sig(
-            supplied_arguments,
-            supplied_return,
-            false,
-            Safety::Safe,
-            ExternAbi::RustCall,
-        ))
+        Binder::bind_with_vars(
+            interner.mk_fn_sig(
+                supplied_arguments,
+                supplied_return,
+                false,
+                Safety::Safe,
+                ExternAbi::RustCall,
+            ),
+            bound_vars,
+        )
     }
 
     /// Invoked when we are translating the coroutine that results

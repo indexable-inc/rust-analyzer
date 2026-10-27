@@ -962,6 +962,22 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         Some(Pattern::new(self.interner, pat_kind))
     }
 
+    /// The types a closure's parameters are written with, and what their signature binds: as
+    /// rustc, a lifetime they leave out is a late-bound one of it, `|h: &H|` takes a `&H` of
+    /// any lifetime.
+    pub(crate) fn lower_closure_params(
+        &mut self,
+        params: &[Option<TypeRefId>],
+    ) -> (Vec<Option<Ty<'db>>>, BoundVarKinds<'db>) {
+        let (lowered, _) = self.with_shifted_in(&[], |ctx: &mut TyLoweringContext<'_, '_>| {
+            ctx.with_elision(true, |ctx| {
+                let params = params.iter().map(|&it| it.map(|it| ctx.lower_ty(it))).collect();
+                (params, ctx.bound_vars_with_elided())
+            })
+        });
+        lowered
+    }
+
     fn lower_fn_ptr(&mut self, fn_: &FnType) -> Ty<'db> {
         let interner = self.interner;
         let (params, ret_ty) = fn_.split_params_and_ret();
@@ -3429,6 +3445,69 @@ impl ElidedLifetimes {
         }
         regions
     }
+}
+
+/// The signature `sig` of `function` with each lifetime its parameters leave out, an error, a
+/// late-bound one of its own, and one its return type leaves out the one the elision rules give
+/// it: the fn pointer rustc reifies `function` to, `fn(&T) -> &U` as `for<'a> fn(&'a T) -> &'a U`.
+/// `sig` as it is where the lifetimes left out are not known.
+pub(crate) fn bind_elided_lifetimes<'db>(
+    db: &'db dyn HirDatabase,
+    function: FunctionId,
+    sig: PolyFnSig<'db>,
+) -> PolyFnSig<'db> {
+    let interner = DbInterner::new_no_crate(db);
+    let elided = elided_lifetimes(db, function);
+    let inputs = sig.skip_binder().inputs();
+    if inputs.len() != elided.params.len() || !sig.skip_binder().references_error() {
+        return sig;
+    }
+    let mut vars: Vec<BoundVariableKind<'db>> = sig.bound_vars().iter().collect();
+    let mut of_params = Vec::new();
+    let mut tys = Vec::with_capacity(inputs.len() + 1);
+    for (&input, count) in inputs.iter().zip(&elided.params) {
+        let Some(count) = *count else { return sig };
+        let (start, mut seen) = (of_params.len(), 0);
+        let input = rustc_type_ir::fold_regions(interner, input, |region, depth| {
+            if !region.is_error() {
+                return region;
+            }
+            seen += 1;
+            let var = match (count, of_params.get(start)) {
+                (1, Some(&var)) => var,
+                _ => {
+                    let var = BoundVar::from_usize(vars.len());
+                    vars.push(BoundVariableKind::Region(BoundRegionKind::Anon));
+                    of_params.push(var);
+                    var
+                }
+            };
+            Region::new_bound(interner, depth, BoundRegion { var, kind: BoundRegionKind::Anon })
+        });
+        if (of_params.len() - start) as u32 != count.min(seen) {
+            return sig;
+        }
+        tys.push(input);
+    }
+    let output =
+        rustc_type_ir::fold_regions(interner, sig.skip_binder().output(), |region, depth| {
+            match elided.output {
+                Some(ElidedOutput::Elided(index)) if region.is_error() => {
+                    let Some(&var) = of_params.get(index as usize) else { return region };
+                    Region::new_bound(
+                        interner,
+                        depth,
+                        BoundRegion { var, kind: BoundRegionKind::Anon },
+                    )
+                }
+                _ => region,
+            }
+        });
+    tys.push(output);
+    Binder::bind_with_vars(
+        FnSig { inputs_and_output: Tys::new_from_slice(&tys), ..sig.skip_binder() },
+        BoundVarKinds::new_from_iter(vars),
+    )
 }
 
 /// `ty` with the arguments an `impl Trait` `function` returns has for the lifetimes its

@@ -499,7 +499,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
     /// constant must to be promoted.
     pub(crate) fn is_plain(&self, ty: Ty<'db>) -> bool {
         hir_ty::drop::has_drop_glue(&self.infcx, ty, self.env) == hir_ty::drop::DropGlue::None
-            && hir_ty::drop::is_freeze(self.db, self.infcx.interner, ty)
+            && hir_ty::drop::is_freeze(&self.infcx, ty, self.env)
     }
 
     pub(crate) fn has_destructor(&self, adt: hir_def::AdtId) -> bool {

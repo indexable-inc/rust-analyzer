@@ -47,7 +47,16 @@ pub enum DropGlue {
 
 /// Whether no part of a value of `ty` can change behind a shared reference: no `UnsafeCell`,
 /// no union, no type parameter. rustc promotes `&expr` only of such a type.
-pub fn is_freeze<'db>(db: &'db dyn HirDatabase, interner: DbInterner<'db>, ty: Ty<'db>) -> bool {
+pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> bool {
+    let mut ocx = ObligationCtxt::new(infcx);
+    // A field of an associated type, `Cow<str>`'s `<str as ToOwned>::Owned`, is what it
+    // normalizes to; one the solver can't decide stays the alias, which is not `Freeze`.
+    let ty = match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty) {
+        Ok(normalized) if !matches!(normalized.kind(), TyKind::Infer(_)) => normalized,
+        _ => ty,
+    };
+    let interner = infcx.interner;
+    let db = interner.db;
     match ty.kind() {
         TyKind::Bool
         | TyKind::Char
@@ -61,10 +70,10 @@ pub fn is_freeze<'db>(db: &'db dyn HirDatabase, interner: DbInterner<'db>, ty: T
         | TyKind::FnPtr(..)
         | TyKind::FnDef(..) => true,
         TyKind::Array(element, _) | TyKind::Slice(element) | TyKind::Pat(element, _) => {
-            is_freeze(db, interner, element)
+            is_freeze(infcx, element, env)
         }
-        TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(db, interner, field)),
-        TyKind::Closure(_, args) => is_freeze(db, interner, args.as_closure().tupled_upvars_ty()),
+        TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(infcx, field, env)),
+        TyKind::Closure(_, args) => is_freeze(infcx, args.as_closure().tupled_upvars_ty(), env),
         TyKind::Adt(def, args) => {
             let variants: Vec<hir_def::VariantId> = match def.def_id() {
                 AdtId::StructId(id) => {
@@ -81,7 +90,7 @@ pub fn is_freeze<'db>(db: &'db dyn HirDatabase, interner: DbInterner<'db>, ty: T
             variants.into_iter().all(|variant| {
                 db.field_types(variant).iter().all(|(_, field)| {
                     let ty = field.ty().instantiate(interner, args).skip_norm_wip();
-                    is_freeze(db, interner, ty)
+                    is_freeze(infcx, ty, env)
                 })
             })
         }

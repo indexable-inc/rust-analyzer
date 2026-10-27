@@ -150,7 +150,7 @@ fn ssa_locals<'db>(ctx: &Ctx<'db>, body: &MirBody<'db>) -> Ssa {
     }
     for (local, decl) in body.locals.iter() {
         if borrowed[local_index(local)]
-            && !crate::drop::is_freeze(ctx.db, ctx.infcx.interner, decl.ty.as_ref())
+            && !crate::drop::is_freeze(&ctx.infcx, decl.ty.as_ref(), ctx.env)
         {
             assignments[local_index(local)] = Assignments::Many;
         }

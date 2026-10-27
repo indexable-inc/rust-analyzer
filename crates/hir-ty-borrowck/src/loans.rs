@@ -119,20 +119,44 @@ fn is_call(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
     }
 }
 
-/// Whether `expr` is a unit struct or variant of a type with no `Drop` impl: what rustc
-/// promotes whatever the rest of the type holds, as it asks that of the value.
-fn is_unit_value(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
-    matches!(ctx.store[expr], Expr::Path(_))
-        && ctx.infer.variant_resolution_for_expr(expr).is_some()
-        && matches!(ctx.infer.expr_ty(expr).kind(),
-            TyKind::Adt(def, _) if hir_ty::drop::destructor(ctx.db, def.def_id()).is_none())
-}
-
-/// Whether `expr` is the empty array `[]`, which holds no value to drop or to mutate through a
-/// shared reference: rustc promotes `&[]` and `&mut []` of any element type, `[T]` or
-/// `[Cell<u8>]`, as it asks that of the elements and there are none.
-fn is_empty_array(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
-    matches!(&ctx.store[expr], Expr::Array(Array::ElementList { elements }) if elements.is_empty())
+/// Whether the value `expr` makes has nothing to drop and no cell in it, which rustc asks of a
+/// value it promotes rather than of its type: `&[MarkupElement::Emphasis]` or
+/// `&FormatElement::Line(LineMode::Hard)` is promoted, though another variant holds a `Cow` or
+/// a `Box`, and `&[]` of any element type, `[Cell<u8>]` too. A struct, variant, tuple or array
+/// is made of its parts, unless its type has a `Drop` impl or is `UnsafeCell` or a union.
+fn plain_value(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
+    let parts_of = |ty: hir_ty::next_solver::Ty<'_>| match ty.kind() {
+        TyKind::Adt(def, _) => {
+            let id = def.def_id();
+            !matches!(id, hir_def::AdtId::UnionId(_))
+                && hir_ty::drop::destructor(ctx.db, id).is_none()
+                && !matches!(id, hir_def::AdtId::StructId(it)
+                    if Some(it) == ctx.infcx.interner.lang_items().UnsafeCell)
+        }
+        _ => true,
+    };
+    let ty = ctx.infer.expr_ty(expr);
+    match &ctx.store[expr] {
+        Expr::Literal(_) | Expr::Ref { .. } => true,
+        Expr::Path(_) if ctx.infer.variant_resolution_for_expr(expr).is_some() => parts_of(ty),
+        Expr::Path(_) if names_const_item(ctx, body, expr) => {
+            hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env) && !const_item_called(ctx, body, expr)
+        }
+        Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
+            exprs.iter().all(|&it| plain_value(ctx, body, it))
+        }
+        &Expr::Array(Array::Repeat { initializer, .. }) => plain_value(ctx, body, initializer),
+        Expr::RecordLit { fields, spread: hir_def::hir::RecordSpread::None, .. } => {
+            parts_of(ty) && fields.iter().all(|it| plain_value(ctx, body, it.expr))
+        }
+        Expr::Call { callee, args }
+            if matches!(ctx.infer.expr_ty(*callee).kind(), TyKind::FnDef(def, _)
+                if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))) =>
+        {
+            parts_of(ty) && args.iter().all(|&it| plain_value(ctx, body, it))
+        }
+        _ => ctx.is_plain(ty),
+    }
 }
 
 /// Whether `expr` names a `const` item outside any impl or trait: rustc asks whether its value,
@@ -155,8 +179,9 @@ fn names_const_item(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::E
     )
 }
 
-/// Whether the `const` item `expr` names has as its value what a function returns, which rustc
-/// takes to need dropping when its type does (`const S: String = String::new()`).
+/// Whether the `const` item `expr` names has in its value what a function returns of a type
+/// that needs dropping, which rustc takes to need dropping (`const S: String = String::new()`,
+/// or `P { a: String::new() }`): it looks through the aggregates the value is built of.
 fn const_item_called(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
     use hir_def::resolver::{HasResolver, ValueNs};
     let Expr::Path(path) = &ctx.store[expr] else { return false };
@@ -172,20 +197,32 @@ fn const_item_called(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::
     let def = DefWithBodyId::ConstId(konst);
     let value = hir_def::expr_store::Body::of(ctx.db, def);
     let infer = hir_ty::InferenceResult::of(ctx.db, InferBodyId::DefWithBodyId(def));
-    let mut root = value.root_expr();
-    while let Expr::Block { statements, tail: Some(tail), .. } = &value.store[root]
-        && statements.is_empty()
-    {
-        root = *tail;
+    let needs_drop = |expr| {
+        hir_ty::drop::has_drop_glue(&ctx.infcx, infer.expr_ty(expr), ctx.env)
+            != hir_ty::drop::DropGlue::None
+    };
+    let mut stack = vec![value.root_expr()];
+    while let Some(expr) = stack.pop() {
+        match &value.store[expr] {
+            Expr::Block { statements, tail: Some(tail), .. } if statements.is_empty() => {
+                stack.push(*tail)
+            }
+            Expr::MethodCall { .. } if needs_drop(expr) => return true,
+            Expr::Call { callee, args } => match infer.expr_ty(*callee).kind() {
+                TyKind::FnDef(def, _) if matches!(def.0, hir_def::CallableDefId::FunctionId(_)) => {
+                    if needs_drop(expr) {
+                        return true;
+                    }
+                }
+                _ => stack.extend(args.iter().copied()),
+            },
+            Expr::RecordLit { fields, .. } => stack.extend(fields.iter().map(|it| it.expr)),
+            Expr::Tuple { exprs } => stack.extend(exprs.iter().copied()),
+            Expr::Array(Array::ElementList { elements }) => stack.extend(elements.iter().copied()),
+            _ => (),
+        }
     }
-    match &value.store[root] {
-        Expr::MethodCall { .. } => true,
-        Expr::Call { callee, .. } => matches!(
-            infer.expr_ty(*callee).kind(),
-            TyKind::FnDef(def, _) if matches!(def.0, hir_def::CallableDefId::FunctionId(_))
-        ),
-        _ => false,
-    }
+    false
 }
 
 /// The locals a `static` is read through.
@@ -288,7 +325,7 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
                 && (certain.contains(&id) || !calls(inner))
             {
                 let ty = body.locals[place.local].ty.as_ref();
-                if hir_ty::drop::is_freeze(ctx.db, ctx.infcx.interner, ty)
+                if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
                     && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
                         == hir_ty::drop::DropGlue::None
                 {
@@ -395,7 +432,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
                 && promotable(&defs, &temp, place.local, 0)
             {
                 let ty = body.locals[place.local].ty.as_ref();
-                if hir_ty::drop::is_freeze(ctx.db, ctx.infcx.interner, ty)
+                if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
                     && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
                         == hir_ty::drop::DropGlue::None
                 {
@@ -503,15 +540,7 @@ impl Loans {
                 // rustc promotes no call, not even of a `const fn` in a `const` block.
                 item || (!is_call(ctx, expr)
                     && (ctx.is_plain(body.locals[local].ty.as_ref())
-                        || is_unit_value(ctx, expr)
-                        || is_empty_array(ctx, expr)
-                        || (names_const_item(ctx, body, expr)
-                            && hir_ty::drop::is_freeze(
-                                ctx.db,
-                                ctx.infcx.interner,
-                                body.locals[local].ty.as_ref(),
-                            )
-                            && !const_item_called(ctx, body, expr))))
+                        || plain_value(ctx, body, expr)))
             });
         // Nor what borrows one it does not promote, `&&TEST_DROP`.
         let rejected: FxHashSet<hir_def::hir::ExprId> =

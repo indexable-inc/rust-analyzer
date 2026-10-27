@@ -92,7 +92,7 @@ impl<'db> Ctx<'db> {
 
     /// Whether a value of `ty` has nothing to drop and no cell in it.
     fn is_plain(&self, ty: Ty<'db>) -> bool {
-        !self.needs_drop(ty) && crate::drop::is_freeze(self.db, self.infcx.interner, ty)
+        !self.needs_drop(ty) && crate::drop::is_freeze(&self.infcx, ty, self.env)
     }
 
     fn bool_ty(&self) -> Ty<'db> {

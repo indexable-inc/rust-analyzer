@@ -344,6 +344,126 @@ fn f() -> () {
         );
     }
 
+    // salsa's `&dyn Database` methods: the object's `'static` is not an elided input lifetime.
+    #[test]
+    fn a_trait_objects_default_lifetime_is_not_elided() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Z: 'static { fn z(&self) -> &u8; }
+fn f(d: &dyn Z) -> &u8 { d.z() }
+fn g<'a>(d: &'a dyn Z, x: &'a u8) -> &'a u8 { if true { d.z() } else { x } }
+"#,
+        );
+    }
+
+    // biome_fs: an alias's elided lifetime is one lifetime wherever the alias uses it.
+    #[test]
+    fn an_aliases_elided_lifetime_is_one_lifetime() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait TS<'s> {}
+type Pair<'f, 's> = (&'f dyn TS<'s>, &'f dyn TS<'s>);
+fn same<'s>(_: &dyn TS<'s>, _: &dyn TS<'s>) {}
+fn split(pair: Pair) { same(pair.0, pair.1) }
+"#,
+        );
+    }
+
+    // helix-vcs: a closure's elided parameter lifetimes are its own, for any lifetime.
+    #[test]
+    fn a_closures_annotated_reference_is_higher_ranked() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn, copy, slice, index
+struct H { a: u32 }
+fn f(hs: &[H], inv: bool) -> (u32, u32) {
+    let r = if inv { |h: &H| h.a } else { |h: &H| h.a };
+    let x = H { a: 1 };
+    (r(&x), r(&hs[0]))
+}
+"#,
+        );
+    }
+
+    // biome's `use_sorted_keys`: the pointer two fn items coerce to holds for any lifetime.
+    #[test]
+    fn fn_items_coerce_to_a_higher_ranked_pointer() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn, copy
+struct T(u8);
+impl T {
+    fn a(x: &T, y: &T) -> bool { x.0 < y.0 }
+    fn b(x: &T, y: &T) -> bool { x.0 > y.0 }
+}
+fn find(_: impl FnMut(&T) -> bool) {}
+fn f(k: bool) {
+    let c = match k { true => T::a, false => T::b };
+    let t = T(3);
+    find(|x| c(x, &t))
+}
+"#,
+        );
+    }
+
+    // biome_formatter's buffers: `&S<Self::C>` implies what `S<C>` does.
+    #[test]
+    fn implied_bounds_see_through_a_projection() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+struct S<C>(C);
+trait B { type C; fn st(&self) -> &S<Self::C>; }
+impl<W: B<C = C> + ?Sized, C> B for &mut W {
+    type C = C;
+    fn st(&self) -> &S<Self::C> { (**self).st() }
+}
+"#,
+        );
+    }
+
+    // biome's `markup!`: a value with no destructor and no interior mutability is promoted,
+    // whatever its type.
+    #[test]
+    fn promotion_goes_by_the_value() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, drop, option, copy
+struct D;
+impl Drop for D { fn drop(&mut self) {} }
+enum M { Hard, Soft }
+enum F { L(M), T(D) }
+fn take(_: Option<&'static F>) {}
+fn take_d(_: &'static D) {}
+fn g() {
+    take(Some(&F::L(M::Hard)));
+    take_d(&D);
+         //^^ error: temporary value dropped while borrowed
+}
+"#,
+        );
+    }
+
+    // biome's organize_imports: `use<>` on an `impl Trait` inside the return type.
+    #[test]
+    fn use_bound_of_a_nested_impl_trait_captures_nothing() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, option, copy
+//- /main.rs edition:2024
+struct N(u8);
+fn att(n: &N) -> Option<impl Sized + use<>> { Some(n.0) }
+impl N { fn with(self, _i: impl Sized) -> N { self } }
+fn f(mut n: N) -> N {
+    if let Some(a) = att(&n) { n = n.with(a); }
+    n
+}
+"#,
+        );
+    }
+
     #[test]
     fn unused_mut_self() {
         check_diagnostics(

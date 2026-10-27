@@ -850,18 +850,18 @@ fn issue_4966() {
             236..240 'iter': T
             255..257 '{}': Vec<A>
             269..413 '{     ...r(); }': ()
-            279..284 'inner': Map<impl Fn(&'? f64) -> f64>
-            287..311 'Map { ... 0.0 }': Map<impl Fn(&'? f64) -> f64>
-            296..309 '|_: &f64| 0.0': impl Fn(&'? f64) -> f64
-            297..298 '_': &'? f64
+            279..284 'inner': Map<impl Fn(&'?0.0 f64) -> f64>
+            287..311 'Map { ... 0.0 }': Map<impl Fn(&'?0.0 f64) -> f64>
+            296..309 '|_: &f64| 0.0': impl Fn(&'?0.0 f64) -> f64
+            297..298 '_': &'_ f64
             306..309 '0.0': f64
-            322..328 'repeat': Repeat<Map<impl Fn(&'? f64) -> f64>>
-            331..356 'Repeat...nner }': Repeat<Map<impl Fn(&'? f64) -> f64>>
-            349..354 'inner': Map<impl Fn(&'? f64) -> f64>
+            322..328 'repeat': Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>
+            331..356 'Repeat...nner }': Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>
+            349..354 'inner': Map<impl Fn(&'?0.0 f64) -> f64>
             367..370 'vec': Vec<{unknown}>
-            373..382 'from_iter': fn from_iter<{unknown}, Repeat<Map<impl Fn(&'? f64) -> f64>>>(Repeat<Map<impl Fn(&'? f64) -> f64>>) -> Vec<{unknown}>
+            373..382 'from_iter': fn from_iter<{unknown}, Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>>(Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>) -> Vec<{unknown}>
             373..390 'from_i...epeat)': Vec<{unknown}>
-            383..389 'repeat': Repeat<Map<impl Fn(&'? f64) -> f64>>
+            383..389 'repeat': Repeat<Map<impl Fn(&'?0.0 f64) -> f64>>
             397..400 'vec': Vec<{unknown}>
             397..410 'vec.foo_bar()': {unknown}
         "#]],

@@ -930,6 +930,18 @@ impl<'db> InferenceContext<'db> {
     ///
     /// This is really an internal helper. From outside the coercion
     /// module, you should instantiate a `CoerceMany` instance.
+    /// The signature of the fn pointer the function item `ty` is reified to, which binds the
+    /// lifetimes its parameters leave out.
+    fn reified_sig(&self, ty: Ty<'db>) -> PolyFnSig<'db> {
+        let sig = ty.fn_sig(self.table.interner());
+        match ty.kind() {
+            TyKind::FnDef(def, _) if let CallableDefId::FunctionId(function) = def.0 => {
+                crate::lower::bind_elided_lifetimes(self.db, function, sig)
+            }
+            _ => sig,
+        }
+    }
+
     fn try_find_coercion_lub(
         &mut self,
         exprs: &[ExprId],
@@ -997,21 +1009,20 @@ impl<'db> InferenceContext<'db> {
                         }) {
                             // We have a LUB of prev_ty and new_ty, just return it.
                             Ok(ok) => return Ok(self.table.register_infer_ok(ok)),
-                            Err(_) => (
-                                Some(prev_ty.fn_sig(self.table.interner())),
-                                Some(new_ty.fn_sig(self.table.interner())),
-                            ),
+                            Err(_) => {
+                                (Some(self.reified_sig(prev_ty)), Some(self.reified_sig(new_ty)))
+                            }
                         }
                     }
                     (TyKind::Closure(_, args), TyKind::FnDef(..)) => {
-                        let b_sig = new_ty.fn_sig(self.table.interner());
+                        let b_sig = self.reified_sig(new_ty);
                         let a_sig = self
                             .interner()
                             .signature_unclosure(args.as_closure().sig(), b_sig.safety());
                         (Some(a_sig), Some(b_sig))
                     }
                     (TyKind::FnDef(..), TyKind::Closure(_, args)) => {
-                        let a_sig = prev_ty.fn_sig(self.table.interner());
+                        let a_sig = self.reified_sig(prev_ty);
                         let b_sig = self
                             .interner()
                             .signature_unclosure(args.as_closure().sig(), a_sig.safety());
