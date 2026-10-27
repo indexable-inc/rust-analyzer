@@ -36,7 +36,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         Ok(Some((place, current)))
     }
 
-    fn lower_expr_to_some_place_with_adjust(
+    pub(super) fn lower_expr_to_some_place_with_adjust(
         &mut self,
         expr_id: ExprId,
         prev_block: BasicBlockId,
