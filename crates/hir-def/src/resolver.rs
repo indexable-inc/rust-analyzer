@@ -420,8 +420,9 @@ impl<'db> Resolver<'db> {
             for scope in self.scopes() {
                 match scope {
                     Scope::ExprScope(scope) => {
+                        // A name a pattern binds twice means its last binding.
                         let entry =
-                            scope.expr_scopes.entries(scope.scope_id).iter().find(|entry| {
+                            scope.expr_scopes.entries(scope.scope_id).iter().rev().find(|entry| {
                                 entry.name() == first_name && entry.hygiene() == hygiene_id
                             });
 
@@ -830,7 +831,7 @@ impl<'db> Resolver<'db> {
         for scope in self.scopes() {
             match scope {
                 Scope::ExprScope(scope) => {
-                    for entry in scope.expr_scopes.entries(scope.scope_id) {
+                    for entry in scope.expr_scopes.entries(scope.scope_id).iter().rev() {
                         if entry.hygiene() == hygiene_id {
                             if entry.binding() == to_be_renamed {
                                 // This currently resolves to our renamed variable, now `will_be_resolved_to`
@@ -878,7 +879,7 @@ impl<'db> Resolver<'db> {
         for scope in self.scopes() {
             match scope {
                 Scope::ExprScope(scope) => {
-                    for entry in scope.expr_scopes.entries(scope.scope_id) {
+                    for entry in scope.expr_scopes.entries(scope.scope_id).iter().rev() {
                         if entry.binding() == to_be_renamed {
                             will_resolve_to_renamed = true;
                         } else if entry.hygiene() == hygiene_id && entry.name() == name {

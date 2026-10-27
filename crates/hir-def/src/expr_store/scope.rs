@@ -141,8 +141,9 @@ impl ExprScopes {
     }
 
     pub fn resolve_name_in_scope(&self, scope: ScopeId, name: &Name) -> Option<&ScopeEntry> {
+        // A name a pattern binds twice (`a @ (Ok(a) | Err(a))`) means its last binding.
         self.scope_chain(Some(scope))
-            .find_map(|scope| self.entries(scope).iter().find(|it| it.name == *name))
+            .find_map(|scope| self.entries(scope).iter().rev().find(|it| it.name == *name))
     }
 
     pub fn scope_for(&self, expr: ExprId) -> Option<ScopeId> {

@@ -587,11 +587,29 @@ enum TryBlock {
     Heterogeneous { label: LabelId },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatBoundCtx {
+    Product,
+    Or,
+}
+
+/// The names a pattern binds, kept like rustc's resolver keeps them: a stack of product and
+/// or-pattern contexts, each with the bindings made in it.
+#[derive(Debug)]
 struct BindingList {
-    map: FxHashMap<(Name, HygieneId), BindingId>,
+    ctxs: Vec<(PatBoundCtx, FxHashMap<(Name, HygieneId), BindingId>)>,
     is_used: FxHashMap<BindingId, bool>,
     reject_new: bool,
+}
+
+impl Default for BindingList {
+    fn default() -> Self {
+        BindingList {
+            ctxs: vec![(PatBoundCtx::Product, FxHashMap::default())],
+            is_used: FxHashMap::default(),
+            reject_new: false,
+        }
+    }
 }
 
 impl BindingList {
@@ -602,15 +620,37 @@ impl BindingList {
         hygiene: HygieneId,
         mode: BindingAnnotation,
     ) -> BindingId {
-        let id = *self
-            .map
-            .entry((name, hygiene))
-            .or_insert_with_key(|(name, hygiene)| ec.alloc_binding(name.clone(), mode, *hygiene));
+        let key = (name, hygiene);
+        // `(a, a)` is an error, and the second `a` is a binding of its own.
+        let bound_in_product = self
+            .ctxs
+            .iter()
+            .any(|(ctx, map)| *ctx == PatBoundCtx::Product && map.contains_key(&key));
+        // The alternatives of `V1(a) | V2(a)` bind the same `a`.
+        let bound_in_or = self.ctxs.iter().find_map(|(ctx, map)| match ctx {
+            PatBoundCtx::Or => map.get(&key).copied(),
+            PatBoundCtx::Product => None,
+        });
+        let id = bound_in_or.unwrap_or_else(|| ec.alloc_binding(key.0.clone(), mode, key.1));
         if ec.store.bindings[id].mode != mode {
             ec.store.bindings[id].problems = Some(BindingProblems::BoundInconsistently);
         }
         self.check_is_used(ec, id);
+        if bound_in_product {
+            ec.store.bindings[id].problems = Some(BindingProblems::BoundMoreThanOnce);
+        }
+        self.ctxs.last_mut().expect("a pattern has a binding context").1.insert(key, id);
         id
+    }
+
+    fn push(&mut self, ctx: PatBoundCtx) {
+        self.ctxs.push((ctx, FxHashMap::default()));
+    }
+
+    /// Ends the innermost context, moving its bindings to the one around it.
+    fn pop(&mut self) {
+        let (_, bound) = self.ctxs.pop().expect("a pattern has a binding context");
+        self.ctxs.last_mut().expect("a pattern has a binding context").1.extend(bound);
     }
 
     fn check_is_used(&mut self, ec: &mut ExprCollector<'_>, id: BindingId) {
@@ -3142,13 +3182,18 @@ impl<'db> ExprCollector<'db> {
                 let Some(first) = it.next() else {
                     break 'b Pat::Or(Box::new([]));
                 };
+                binding_list.push(PatBoundCtx::Or);
+                binding_list.push(PatBoundCtx::Product);
                 pats.push(self.collect_pat(first, binding_list));
+                binding_list.pop();
                 binding_list.reject_new = true;
                 for rest in it {
                     for it in binding_list.is_used.values_mut() {
                         *it = false;
                     }
+                    binding_list.push(PatBoundCtx::Product);
                     pats.push(self.collect_pat(rest, binding_list));
+                    binding_list.pop();
                     for (&id, &is_used) in binding_list.is_used.iter() {
                         if !is_used {
                             self.store.bindings[id].problems =
@@ -3156,6 +3201,7 @@ impl<'db> ExprCollector<'db> {
                         }
                     }
                 }
+                binding_list.pop();
                 binding_list.reject_new = prev_reject_new;
                 let current_is_used = mem::replace(&mut binding_list.is_used, prev_is_used);
                 for (id, _) in current_is_used.into_iter() {
