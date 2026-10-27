@@ -170,34 +170,53 @@ fn check_owner<'db>(
     };
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
     let mut bodies = vec![(body, None, None)];
+    // What each body is written as: `None` for the owner's.
+    let mut written = vec![None];
+    let mut seen = rustc_hash::FxHashSet::default();
     let mut index = 0;
     while let Some(&(body, _, _)) = bodies.get(index) {
+        let at = written[index];
         index += 1;
-        for &closure in &body.closures {
-            match db.mir_body_for_closure(closure) {
-                Ok(it) => bodies.push((it, Some(closure.loc(db).expr), None)),
-                Err(error) => {
-                    result.skipped.get_or_insert_with(|| format!("closure: {error:?}"));
-                }
-            }
-        }
+        let mut nested = Vec::new();
+        nested.extend(body.closures.iter().map(|&it| Nested::Closure(it)));
         // The body of an `async` block or `async fn`, checked as rustc checks a coroutine: as
         // a closure of the body that makes it.
-        for coroutine in coroutines(body) {
-            match db.mir_body_for_coroutine(coroutine) {
-                Ok(it) => bodies.push((it, Some(coroutine.loc(db).expr), None)),
-                Err(error) => {
-                    result.skipped.get_or_insert_with(|| format!("coroutine: {error:?}"));
-                }
-            }
-        }
+        nested.extend(coroutines(body).into_iter().map(Nested::Coroutine));
         // A `const { .. }` block, which MIR lowering makes a constant of its own, checked with
         // the body as rustc checks an inline const.
-        for konst in inline_consts(db, body) {
-            match db.mir_body(InferBodyId::AnonConstId(konst)) {
-                Ok(it) => bodies.push((it, None, Some(konst.loc(db).expr))),
+        nested.extend(inline_consts(db, body).into_iter().map(Nested::Const));
+        // Those in code that is never reached, which MIR lowering leaves out: rustc borrow
+        // checks every body nested in the item's (`nested_bodies_within`), so a closure after a
+        // `return` is checked too.
+        nested.extend(nested_bodies_written(db, owner, store, infer, at));
+        for it in nested {
+            if !seen.insert(it) {
+                continue;
+            }
+            let (lowered, what) = match it {
+                Nested::Closure(closure) => (
+                    db.mir_body_for_closure(closure)
+                        .map(|body| (body, Some(closure.loc(db).expr), None)),
+                    "closure",
+                ),
+                Nested::Coroutine(coroutine) => (
+                    db.mir_body_for_coroutine(coroutine)
+                        .map(|body| (body, Some(coroutine.loc(db).expr), None)),
+                    "coroutine",
+                ),
+                Nested::Const(konst) => (
+                    db.mir_body(InferBodyId::AnonConstId(konst))
+                        .map(|body| (body, None, Some(konst.loc(db).expr))),
+                    "inline const",
+                ),
+            };
+            match lowered {
+                Ok(it) => {
+                    written.push(it.1.or(it.2));
+                    bodies.push(it);
+                }
                 Err(error) => {
-                    result.skipped.get_or_insert_with(|| format!("inline const: {error:?}"));
+                    result.skipped.get_or_insert_with(|| format!("{what}: {error:?}"));
                 }
             }
         }
@@ -227,6 +246,9 @@ fn check_owner<'db>(
     }
     result.diagnostics.extend(diagnostics.into_iter().rev().flatten());
     if debugging(db, owner) {
+        if let Some(skipped) = &result.skipped {
+            eprintln!("skipped {skipped}");
+        }
         for it in &result.diagnostics {
             eprintln!("diagnostic {it:?}");
         }
@@ -294,6 +316,64 @@ fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
             {
                 out.push(id.0);
             }
+        }
+    }
+    out
+}
+
+/// A body checked with the one it is written in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Nested<'db> {
+    Closure(hir_ty::db::InternedClosureId<'db>),
+    Coroutine(InternedCoroutineId<'db>),
+    Const(hir_ty::db::AnonConstId<'db>),
+}
+
+/// The closures, `async` blocks and `const { .. }` blocks written directly in the body written
+/// as `at` (the owner's for `None`), not in another of them, reached or not.
+fn nested_bodies_written<'db>(
+    db: &'db dyn HirDatabase,
+    owner: InferBodyId<'db>,
+    store: &ExpressionStore,
+    infer: &InferenceResult<'db>,
+    at: Option<ExprId>,
+) -> Vec<Nested<'db>> {
+    use hir_def::hir::{ClosureKind, CoroutineKind, Expr};
+    use hir_ty::next_solver::TyKind;
+    use rustc_type_ir::inherent::IntoKind;
+    let mut stack = Vec::new();
+    match at {
+        Some(at) => store.walk_child_exprs(at, |it| stack.push(it)),
+        None => match owner {
+            InferBodyId::DefWithBodyId(def) => {
+                stack.push(hir_def::expr_store::Body::of(db, def).root_expr())
+            }
+            InferBodyId::AnonConstId(konst) => stack.push(konst.loc(db).expr),
+        },
+    }
+    let mut out = Vec::new();
+    while let Some(expr) = stack.pop() {
+        match &store[expr] {
+            // The kinds MIR lowering makes a body of.
+            Expr::Closure {
+                closure_kind:
+                    ClosureKind::Closure
+                    | ClosureKind::Coroutine { kind: CoroutineKind::Async, .. }
+                    | ClosureKind::CoroutineClosure(CoroutineKind::Async),
+                ..
+            } => match infer.expr_ty(expr).kind() {
+                TyKind::Closure(id, _) => out.push(Nested::Closure(id.0)),
+                TyKind::CoroutineClosure(id, _) => out.push(Nested::Closure(id.0.as_closure(db))),
+                TyKind::Coroutine(id, _) => out.push(Nested::Coroutine(id.0)),
+                _ => {}
+            },
+            Expr::Closure { .. } => {}
+            Expr::Const(_)
+                if let Some(konst) = hir_ty::mir::inline_const_at(db, owner, infer, expr) =>
+            {
+                out.push(Nested::Const(konst))
+            }
+            _ => store.walk_child_exprs(expr, |it| stack.push(it)),
         }
     }
     out

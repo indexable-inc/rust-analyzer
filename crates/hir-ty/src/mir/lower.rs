@@ -2282,24 +2282,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// block of a constant's own body is lowered in place, as it is already evaluated. The
     /// constant is the `const { .. }` expression, which owns the block's bindings.
     fn inline_const(&self, expr: ExprId) -> Option<AnonConstId<'db>> {
-        let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)) = self.owner else {
-            return None;
-        };
-        let ty = self.expr_ty_without_adjust(expr);
-        if ty.references_non_lt_error() || ty.has_infer() {
-            return None;
-        }
-        let token = LoweringMode::Analysis.allow_tracked_structs()?;
-        Some(AnonConstId::new(
-            self.db,
-            AnonConstLoc {
-                owner: self.store_owner,
-                expr,
-                ty: StoredEarlyBinder::bind(ty.store()),
-                allow_using_generic_params: true,
-            },
-            token,
-        ))
+        inline_const_at(self.db, self.owner, self.infer, expr)
     }
 
     fn lower_const_to_operand(
@@ -4328,6 +4311,34 @@ fn cast_kind<'db>(
         (Some(CastTy::Ptr(..)), Some(CastTy::Ptr(..))) => CastKind::PtrToPtr,
         _ => not_supported!("Unknown cast between {source_ty:?} and {target_ty:?}"),
     })
+}
+
+/// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own; `None`
+/// where it is lowered in place, as an inline const of a constant's or static's value is.
+pub fn inline_const_at<'db>(
+    db: &'db dyn HirDatabase,
+    owner: InferBodyId<'db>,
+    infer: &InferenceResult<'db>,
+    expr: ExprId,
+) -> Option<AnonConstId<'db>> {
+    let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_)) = owner else {
+        return None;
+    };
+    let ty = infer.expr_ty(expr);
+    if ty.references_non_lt_error() || ty.has_infer() {
+        return None;
+    }
+    let token = LoweringMode::Analysis.allow_tracked_structs()?;
+    Some(AnonConstId::new(
+        db,
+        AnonConstLoc {
+            owner: owner.expression_store_owner(db),
+            expr,
+            ty: StoredEarlyBinder::bind(ty.store()),
+            allow_using_generic_params: true,
+        },
+        token,
+    ))
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_closure_cycle_result, lru = 0)]

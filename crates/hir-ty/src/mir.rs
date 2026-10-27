@@ -50,9 +50,9 @@ pub use eval::{
 pub use held::{HeldLocals, YieldPoint};
 pub use lower::is_builtin_index;
 pub use lower::{
-    MirLowerError, is_by_move_coroutine, lower_body_to_mir, lower_to_mir_with_store,
-    mir_body_for_closure_query, mir_body_for_coroutine_by_move_query, mir_body_for_coroutine_query,
-    mir_body_query, promoted_mir_body_query, set_mir_capacity,
+    MirLowerError, inline_const_at, is_by_move_coroutine, lower_body_to_mir,
+    lower_to_mir_with_store, mir_body_for_closure_query, mir_body_for_coroutine_by_move_query,
+    mir_body_for_coroutine_query, mir_body_query, promoted_mir_body_query, set_mir_capacity,
 };
 pub use monomorphization::monomorphized;
 pub(crate) use monomorphization::opaque_of_impl;
