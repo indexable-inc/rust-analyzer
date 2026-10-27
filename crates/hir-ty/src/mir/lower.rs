@@ -1198,6 +1198,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         for (expansion, choice) in expansions.into_iter().enumerate() {
                             self.or_choices = choice.into_iter().collect();
                             let outer = self.guarded_moves.replace(Vec::new());
+                            // A nested guard must preserve the enclosing guard's references.
+                            let outer_refs = self.guard_refs.clone();
                             self.arm_unreached = !reached;
                             let matched = match last_arm && expansion + 1 == count {
                                 true => self.pattern_match(current, None, cond_place, *pat),
@@ -1211,7 +1213,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             let otherwise = otherwise.unwrap_or_else(|| self.new_basic_block());
                             let bound = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                             let guarded = self.lower_guard(guard, then, expr_id.into());
-                            self.guard_refs.clear();
+                            self.guard_refs = outer_refs;
                             if let Some((held, failed)) = guarded? {
                                 let failed = self.guard_failed(failed, bound, guard.into());
                                 self.set_goto(failed, otherwise, expr_id.into());
@@ -1233,6 +1235,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         Some(_) => self.guarded_moves.replace(Vec::new()),
                         None => self.guarded_moves.take(),
                     };
+                    let outer_refs = self.guard_refs.clone();
                     self.arm_unreached = !reached;
                     let matched = match last_arm {
                         true => self.pattern_match(current, None, cond_place, *pat),
@@ -1247,7 +1250,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         let o = *otherwise.get_or_insert_with(|| self.new_basic_block());
                         let bound = self.drop_scopes.last().map_or(0, |it| it.locals.len());
                         let guarded = self.lower_guard(guard, then, expr_id.into());
-                        self.guard_refs.clear();
+                        self.guard_refs = outer_refs;
                         if let Some((held, failed)) = guarded? {
                             let failed = self.guard_failed(failed, bound, guard.into());
                             self.set_goto(failed, o, expr_id.into());
