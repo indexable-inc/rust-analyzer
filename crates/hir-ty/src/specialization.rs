@@ -1,7 +1,15 @@
 //! Impl specialization related things
 
 use either::Either;
-use hir_def::{HasModule, ImplId, signatures::ImplSignature, unstable_features::UnstableFeatures};
+use hir_def::{
+    HasModule, ImplId, LifetimeParamId, TypeOrConstParamId, hir::generics::GenericParams,
+    signatures::ImplSignature, unstable_features::UnstableFeatures,
+};
+use rustc_hash::FxHashSet;
+use rustc_type_ir::{
+    AliasTyKind, ConstKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
+    TypeVisitor, inherent::IntoKind as _,
+};
 use tracing::debug;
 
 use crate::{
@@ -10,7 +18,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::TraitImpls,
     next_solver::{
-        DbInterner, TypingMode, Unnormalized,
+        ClauseKind, Const, DbInterner, Region, Ty, TyKind, TypingMode, Unnormalized,
         infer::{DbInternerInferExt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         util::clauses_as_obligations,
@@ -183,5 +191,111 @@ pub(crate) fn specialized_ancestor(
     }
     ancestors.iter().copied().find(|&ancestor| {
         ancestors.iter().all(|&other| other == ancestor || specializes(db, ancestor, other))
+    })
+}
+
+/// A parameter of an impl, as rustc's `constrained_generic_params::Parameter`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Parameter {
+    TypeOrConst(TypeOrConstParamId),
+    Lifetime(LifetimeParamId),
+}
+
+/// The parameters in `value`, as rustc's `parameters_for`: those in an associated type or an
+/// unevaluated constant only with `include_nonconstraining`, as they do not constrain one.
+fn parameters_for<'db>(
+    value: impl TypeVisitable<DbInterner<'db>>,
+    include_nonconstraining: bool,
+    out: &mut FxHashSet<Parameter>,
+) {
+    struct Collect<'a> {
+        include_nonconstraining: bool,
+        out: &'a mut FxHashSet<Parameter>,
+    }
+    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_> {
+        type Result = ();
+        fn visit_ty(&mut self, ty: Ty<'db>) {
+            match ty.kind() {
+                TyKind::Alias(alias)
+                    if !self.include_nonconstraining
+                        && matches!(
+                            alias.kind,
+                            AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }
+                        ) =>
+                {
+                    return;
+                }
+                TyKind::Param(param) => {
+                    self.out.insert(Parameter::TypeOrConst(param.id.into()));
+                }
+                _ => (),
+            }
+            ty.super_visit_with(self)
+        }
+        fn visit_region(&mut self, region: Region<'db>) {
+            if let RegionKind::ReEarlyParam(param) = region.kind() {
+                self.out.insert(Parameter::Lifetime(param.id));
+            }
+        }
+        fn visit_const(&mut self, konst: Const<'db>) {
+            match konst.kind() {
+                ConstKind::Unevaluated(_) if !self.include_nonconstraining => return,
+                ConstKind::Param(param) => {
+                    self.out.insert(Parameter::TypeOrConst(param.id.into()));
+                }
+                _ => (),
+            }
+            konst.super_visit_with(self)
+        }
+    }
+    value.visit_with(&mut Collect { include_nonconstraining, out });
+}
+
+/// Whether a type or const parameter of `impl_id` is constrained neither by its header nor
+/// by the associated types its where clauses equate with what is (rustc's E0207,
+/// `enforce_impl_non_lifetime_params_are_constrained`). rustc's `assoc_def` refuses to
+/// project an item such an impl defines, which would leave the parameter an inference
+/// variable nothing constrains, and gives an error instead.
+#[salsa::tracked(returns(copy))]
+pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> bool {
+    let interner = DbInterner::new_no_crate(db);
+    let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
+    let trait_ref = db.impl_trait(impl_id).map(|it| it.instantiate_identity().skip_norm_wip());
+    if self_ty.references_error() || trait_ref.is_some_and(|it| it.references_error()) {
+        return false;
+    }
+    let mut constrained = FxHashSet::default();
+    match trait_ref {
+        Some(trait_ref) => parameters_for(trait_ref, false, &mut constrained),
+        None => parameters_for(self_ty, false, &mut constrained),
+    }
+    // rustc's `setup_constraining_predicates`: `<T as Trait>::Assoc == U` constrains `U` once
+    // what the projection names is.
+    let projections: Vec<_> = GenericPredicates::query_own_explicit(db, impl_id.into())
+        .iter_identity()
+        .filter_map(|it| match it.skip_norm_wip().kind().skip_binder() {
+            ClauseKind::Projection(projection) => Some(projection),
+            _ => None,
+        })
+        .collect();
+    loop {
+        let before = constrained.len();
+        for projection in &projections {
+            if Some(projection.projection_term.trait_ref(interner)) == trait_ref {
+                continue;
+            }
+            let mut inputs = FxHashSet::default();
+            parameters_for(projection.projection_term, true, &mut inputs);
+            if inputs.is_subset(&constrained) {
+                parameters_for(projection.term, false, &mut constrained);
+            }
+        }
+        if constrained.len() == before {
+            break;
+        }
+    }
+    GenericParams::of(db, impl_id.into()).iter_type_or_consts().any(|(local_id, _)| {
+        let param = TypeOrConstParamId { parent: impl_id.into(), local_id };
+        !constrained.contains(&Parameter::TypeOrConst(param))
     })
 }

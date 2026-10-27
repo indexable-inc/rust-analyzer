@@ -1052,6 +1052,13 @@ impl<'db> Builder<'_, '_, 'db> {
                         .skip_binder();
                     let mut inputs: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
                     let mut output = sig.output();
+                    // rustc's writeback taints a body whose signature, normalized, has an
+                    // error in it, and MIR building then makes no body to check: a projection
+                    // of an item an impl with a parameter it does not constrain (E0207)
+                    // defines, `-> Self::Output<'a>` in that impl.
+                    if normalizes_to_error(self.ctx, inputs.iter().copied().chain([output])) {
+                        self.ctx.tainted.set(true);
+                    }
                     let written = hir_def::signatures::FunctionSignature::of(self.ctx.db, function);
                     // A C variadic's `ap: ...` is a `VaList` the signature does not list.
                     if written.is_varargs()
@@ -6906,6 +6913,33 @@ pub(super) fn normalize<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>>
 /// existential region.
 fn normalize_with_fresh<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<Ty<'db>> {
     normalize_impl(ctx, ty, true)
+}
+
+/// Whether one of `tys`, with no error type in it, has one once normalized. Its regions are
+/// `'static`: they select no impl, and rust-analyzer gives an elided one as an error.
+fn normalizes_to_error<'db>(ctx: &Ctx<'_, 'db>, tys: impl IntoIterator<Item = Ty<'db>>) -> bool {
+    use hir_ty::next_solver::{infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt};
+    use rustc_type_ir::TypeVisitableExt as _;
+    let interner = ctx.infcx.interner;
+    tys.into_iter().any(|ty| {
+        if !ty.has_aliases() {
+            return false;
+        }
+        let ty = rustc_type_ir::fold_regions(interner, ty, |region, depth| match region.kind() {
+            RegionKind::ReBound(rustc_type_ir::BoundVarIndexKind::Bound(debruijn), _)
+                if debruijn < depth =>
+            {
+                region
+            }
+            _ => Region::new_static(interner),
+        });
+        !ty.references_error()
+            && ctx.infcx.probe(|_| {
+                ObligationCtxt::new(&ctx.infcx)
+                    .deeply_normalize(&ObligationCause::dummy(), ctx.env, ty)
+                    .is_ok_and(|it| it.references_error())
+            })
+    })
 }
 
 fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Option<Ty<'db>> {

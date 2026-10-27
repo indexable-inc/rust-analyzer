@@ -242,6 +242,11 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                         _ => None,
                     })
                 };
+                if type_of(impl_id).is_some()
+                    && crate::specialization::impl_has_unconstrained_params(db, impl_id)
+                {
+                    return FetchEligibleAssocItemResponse::Err(ErrorGuaranteed);
+                }
                 type_of(impl_id)
                     // A specializing impl has the types of the impl it specializes.
                     .or_else(|| {
@@ -262,10 +267,8 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                     .name
                     .as_ref()
                     .expect("unnamed consts should not get passed to the solver");
-                impl_items
-                    .items
-                    .iter()
-                    .find_map(|(impl_assoc_name, impl_assoc_id)| {
+                let in_impl =
+                    impl_items.items.iter().find_map(|(impl_assoc_name, impl_assoc_id)| {
                         if let AssocItemId::ConstId(impl_assoc_id) = *impl_assoc_id
                             && impl_assoc_name == trait_assoc_name
                         {
@@ -273,7 +276,13 @@ impl<'db> SolverDelegate for SolverContext<'db> {
                         } else {
                             None
                         }
-                    })
+                    });
+                if in_impl.is_some()
+                    && crate::specialization::impl_has_unconstrained_params(db, impl_id)
+                {
+                    return FetchEligibleAssocItemResponse::Err(ErrorGuaranteed);
+                }
+                in_impl
                     .or_else(
                         || {
                             if trait_assoc_data.has_body() { Some(trait_assoc_id) } else { None }

@@ -298,10 +298,11 @@ impl<'db> Check<'_, 'db> {
         let wfcx = Wfcx::new(db, function.into());
         // What it assumes well-formed is normalized for what that implies apart from the
         // normalizing of its signature for its well-formedness, as rustc's implied bounds.
-        let mut assumed: Vec<Ty<'db>> = inputs.iter().map(|&ty| wfcx.normalize(ty)).collect();
+        let mut assumed: Vec<Ty<'db>> =
+            inputs.iter().map(|&ty| wfcx.normalize(ty, &mut Vec::new())).collect();
         if let ItemContainerId::ImplId(impl_) = function.lookup(db).container {
             let Some(header) = self.header(impl_) else { return };
-            assumed.extend(header.into_iter().map(|ty| wfcx.normalize(ty)));
+            assumed.extend(header.into_iter().map(|ty| wfcx.normalize(ty, &mut Vec::new())));
         }
         assumed.retain(|ty| !ty.references_error());
         // An `impl Trait` it returns has those lifetimes too.
@@ -320,7 +321,9 @@ impl<'db> Check<'_, 'db> {
             self.trait_opaques(function, output, &known);
         }
         if !output.has_opaque_types() {
-            assumed.extend(Some(wfcx.normalize(output)).filter(|ty| !ty.references_error()));
+            assumed.extend(
+                Some(wfcx.normalize(output, &mut Vec::new())).filter(|ty| !ty.references_error()),
+            );
             let known = self.known(function.into(), &assumed);
             let mut needs = self.where_needs(function.into());
             // Its signature, normalized, is well-formed: what that needs of what outlives
@@ -331,14 +334,13 @@ impl<'db> Check<'_, 'db> {
                 .chain([Site::Output(function)]);
             for (&ty, site) in inputs.iter().chain([&output]).zip(sites) {
                 let mut found = Vec::new();
-                let normalized = wfcx.normalize(ty);
-                if normalized.references_error() {
-                    continue;
+                let normalized = wfcx.normalize(ty, &mut found);
+                if !normalized.references_error() {
+                    if ty.has_aliases() {
+                        outlives::wf(db, &mut self.inferred, normalized, &mut found);
+                    }
+                    outlives::trait_needs(db, &wfcx, normalized, &mut found);
                 }
-                if ty.has_aliases() {
-                    outlives::wf(db, &mut self.inferred, normalized, &mut found);
-                }
-                outlives::trait_needs(db, &wfcx, normalized, &mut found);
                 needs.extend(found.into_iter().map(|it| (it, site)));
             }
             self.resolve(&known, needs);
