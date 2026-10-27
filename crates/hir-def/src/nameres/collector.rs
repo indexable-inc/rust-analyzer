@@ -2865,6 +2865,24 @@ impl ModCollector<'_, '_> {
                         of_another_crate(&import.path)
                     })
                 };
+                // The std prelude is another crate's, collected in full. Its `include!` read at
+                // item level puts the `macro_rules!` of the file in the textual scope of what
+                // follows: syn 1's `#[macro_use] mod token` has `Token!` from
+                // `include!("await.rs")`, and its `mod op` names it with nothing imported.
+                let prelude = || {
+                    if def_map.block.is_some() {
+                        return None;
+                    }
+                    let (prelude, _) = def_map.prelude?;
+                    if prelude.krate(db) == def_map.krate {
+                        return None;
+                    }
+                    def_map
+                        .resolve_in_prelude(db, name)
+                        .take_macros()
+                        .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
+                        .map(|it| it.definition(db))
+                };
                 def_map
                     .legacy_macro_in_textual_scope(db, self.module_id, name)
                     .or_else(|| {
@@ -2878,6 +2896,7 @@ impl ModCollector<'_, '_> {
                     .filter(|&id| sub_namespace_match(db, id, Some(MacroSubNs::Bang)))
                     .map(|it| it.definition(self.def_collector.db))
                     .or_else(imported)
+                    .or_else(prelude)
             },
             &mut |ptr, call_id| eager_callback_buffer.push((ptr, call_id)),
         ) {

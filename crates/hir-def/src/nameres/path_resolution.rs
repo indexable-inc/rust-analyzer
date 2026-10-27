@@ -790,7 +790,7 @@ impl DefMap {
         from_crate_root.or_else(from_extern_prelude)
     }
 
-    fn resolve_in_prelude(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
+    pub(super) fn resolve_in_prelude(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
         if let Some((prelude, _use)) = self.prelude {
             let def_map = if prelude.krate(db) == self.krate { self } else { prelude.def_map(db) };
             def_map.module(db, prelude).name_in_scope(db, name)

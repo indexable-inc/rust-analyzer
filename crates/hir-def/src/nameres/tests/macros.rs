@@ -1406,6 +1406,52 @@ pub struct JSValue;
 }
 
 #[test]
+fn macro_use_module_exports_macro_rules_an_include_defined() {
+    // syn 1.0.109: `#[macro_use] mod token` gets `Token!` from `include!("await.rs")`, and
+    // `mod op`, which imports nothing, names it.
+    check(
+        r#"
+//- minicore: include
+//- /lib.rs
+#[macro_use]
+mod token;
+mod op;
+//- /token.rs
+macro_rules! export_token_macro {
+    ($($await_rule:tt)*) => {
+        #[macro_export]
+        macro_rules! Token {
+            [+] => { pub struct Add; };
+        }
+    };
+}
+include!("await.rs");
+//- /await.rs
+export_token_macro! {[await]}
+//- /op.rs
+Token![+];
+"#,
+        expect![[r#"
+            crate
+            - Token : macro!
+            - op : type
+            - token : type
+            - (legacy) Token : macro!
+            - (legacy) export_token_macro : macro!
+
+            crate::op
+            - Add : type value
+            - (legacy) Token : macro!
+            - (legacy) export_token_macro : macro!
+
+            crate::token
+            - (legacy) Token : macro!
+            - (legacy) export_token_macro : macro!
+        "#]],
+    );
+}
+
+#[test]
 fn include_with_submod_file() {
     check(
         r#"
