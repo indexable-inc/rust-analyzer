@@ -18,6 +18,7 @@ mod loans;
 mod moves;
 mod names;
 mod polonius;
+mod qualifs;
 mod regions;
 pub mod timings;
 

@@ -124,107 +124,18 @@ fn is_call(ctx: &Ctx<'_, '_>, expr: hir_def::hir::ExprId) -> bool {
 /// Whether the value `expr` makes has nothing to drop and no cell in it, which rustc asks of a
 /// value it promotes rather than of its type: `&[MarkupElement::Emphasis]` or
 /// `&FormatElement::Line(LineMode::Hard)` is promoted, though another variant holds a `Cow` or
-/// a `Box`, and `&[]` of any element type, `[Cell<u8>]` too. A struct, variant, tuple or array
-/// is made of its parts, unless its type has a `Drop` impl or is `UnsafeCell` or a union.
-fn plain_value(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
-    let parts_of = |ty: hir_ty::next_solver::Ty<'_>| match ty.kind() {
-        TyKind::Adt(def, _) => {
-            let id = def.def_id();
-            !matches!(id, hir_def::AdtId::UnionId(_))
-                && hir_ty::drop::destructor(ctx.db, id).is_none()
-                && !matches!(id, hir_def::AdtId::StructId(it)
-                    if Some(it) == ctx.infcx.interner.lang_items().UnsafeCell)
-        }
-        _ => true,
+/// a `Box`, and `&[]` of any element type, `[Cell<u8>]` too.
+fn plain_value<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, expr: hir_def::hir::ExprId) -> bool {
+    let cx = super::qualifs::ValueCx {
+        db: ctx.db,
+        infcx: &ctx.infcx,
+        env: ctx.env,
+        owner: body.owner,
+        store: ctx.store,
+        infer: ctx.infer,
+        consts: &Default::default(),
     };
-    let ty = ctx.infer.expr_ty(expr);
-    match &ctx.store[expr] {
-        Expr::Literal(_) | Expr::Ref { .. } => true,
-        Expr::Path(_) if ctx.infer.variant_resolution_for_expr(expr).is_some() => parts_of(ty),
-        Expr::Path(_) if names_const_item(ctx, body, expr) => {
-            hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env) && !const_item_called(ctx, body, expr)
-        }
-        Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
-            exprs.iter().all(|&it| plain_value(ctx, body, it))
-        }
-        &Expr::Array(Array::Repeat { initializer, .. }) => plain_value(ctx, body, initializer),
-        Expr::RecordLit { fields, spread: hir_def::hir::RecordSpread::None, .. } => {
-            parts_of(ty) && fields.iter().all(|it| plain_value(ctx, body, it.expr))
-        }
-        Expr::Call { callee, args }
-            if matches!(ctx.infer.expr_ty(*callee).kind(), TyKind::FnDef(def, _)
-                if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))) =>
-        {
-            parts_of(ty) && args.iter().all(|&it| plain_value(ctx, body, it))
-        }
-        _ => ctx.is_plain(ty),
-    }
-}
-
-/// Whether `expr` names a `const` item outside any impl or trait: rustc asks whether its value,
-/// not its type, needs dropping, which only a value that does (a `String` that is not empty)
-/// fails; such a value is taken to be promotable when its type has no interior mutability.
-fn names_const_item(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
-    use hir_def::{
-        Lookup,
-        resolver::{HasResolver, ValueNs},
-    };
-    let Expr::Path(path) = &ctx.store[expr] else { return false };
-    let owner = body.owner;
-    let mut resolver = owner.resolver(ctx.db);
-    let _guard = resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
-    let hygiene = ctx.store.expr_path_hygiene(expr);
-    matches!(
-        resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene),
-        Some(ValueNs::ConstId(it))
-            if matches!(it.lookup(ctx.db).container, hir_def::ItemContainerId::ModuleId(_))
-    )
-}
-
-/// Whether the `const` item `expr` names has in its value what a function returns of a type
-/// that needs dropping, which rustc takes to need dropping (`const S: String = String::new()`,
-/// or `P { a: String::new() }`): it looks through the aggregates the value is built of.
-fn const_item_called(ctx: &Ctx<'_, '_>, body: &MirBody<'_>, expr: hir_def::hir::ExprId) -> bool {
-    use hir_def::resolver::{HasResolver, ValueNs};
-    let Expr::Path(path) = &ctx.store[expr] else { return false };
-    let owner = body.owner;
-    let mut resolver = owner.resolver(ctx.db);
-    let _guard = resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
-    let hygiene = ctx.store.expr_path_hygiene(expr);
-    let Some(ValueNs::ConstId(konst)) =
-        resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene)
-    else {
-        return false;
-    };
-    let def = DefWithBodyId::ConstId(konst);
-    let value = hir_def::expr_store::Body::of(ctx.db, def);
-    let infer = hir_ty::InferenceResult::of(ctx.db, InferBodyId::DefWithBodyId(def));
-    let needs_drop = |expr| {
-        hir_ty::drop::has_drop_glue(&ctx.infcx, infer.expr_ty(expr), ctx.env)
-            != hir_ty::drop::DropGlue::None
-    };
-    let mut stack = vec![value.root_expr()];
-    while let Some(expr) = stack.pop() {
-        match &value.store[expr] {
-            Expr::Block { statements, tail: Some(tail), .. } if statements.is_empty() => {
-                stack.push(*tail)
-            }
-            Expr::MethodCall { .. } if needs_drop(expr) => return true,
-            Expr::Call { callee, args } => match infer.expr_ty(*callee).kind() {
-                TyKind::FnDef(def, _) if matches!(def.0, hir_def::CallableDefId::FunctionId(_)) => {
-                    if needs_drop(expr) {
-                        return true;
-                    }
-                }
-                _ => stack.extend(args.iter().copied()),
-            },
-            Expr::RecordLit { fields, .. } => stack.extend(fields.iter().map(|it| it.expr)),
-            Expr::Tuple { exprs } => stack.extend(exprs.iter().copied()),
-            Expr::Array(Array::ElementList { elements }) => stack.extend(elements.iter().copied()),
-            _ => (),
-        }
-    }
-    false
+    cx.value(expr, 0).is_empty()
 }
 
 /// The locals a `static` is read through.
@@ -467,10 +378,20 @@ fn const_promotable(
             let _guard =
                 resolver.update_to_inner_scope(ctx.db, owner.expression_store_owner(ctx.db), expr);
             let hygiene = ctx.store.expr_path_hygiene(expr);
-            !matches!(
-                resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene),
-                None | Some(ValueNs::LocalBinding(_) | ValueNs::StaticId(_))
-            )
+            match resolver.resolve_path_in_value_ns_fully(ctx.db, path, hygiene) {
+                None | Some(ValueNs::LocalBinding(_)) => false,
+                // rustc's `promote_consts` lets a static be borrowed or read in a static's
+                // value, but not a thread-local or an extern one, which CTFE cannot read.
+                Some(ValueNs::StaticId(it)) => {
+                    matches!(body.owner, InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(_)))
+                        && !hir_def::signatures::StaticSignature::of(ctx.db, it)
+                            .flags
+                            .contains(hir_def::signatures::StaticFlags::EXTERN)
+                        && !hir_def::attrs::AttrFlags::query(ctx.db, it.into())
+                            .contains(hir_def::attrs::AttrFlags::THREAD_LOCAL)
+                }
+                Some(_) => true,
+            }
         }
         Expr::Array(Array::ElementList { elements }) => all(elements.to_vec()),
         Expr::Array(Array::Repeat { initializer, .. }) => {
