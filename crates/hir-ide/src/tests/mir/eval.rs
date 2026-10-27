@@ -1163,6 +1163,56 @@ fn main() {
 }
 
 #[test]
+fn expression_macro_of_one_expression_and_a_semicolon() {
+    // rustc parses `bail!(1)` last in a block as an expression and takes the `;` after the
+    // one expression it expands to: the call's value is that expression. It warns of it for
+    // another crate's macro.
+    check_pass(
+        r#"
+//- minicore: panic, result
+//- /m.rs crate:m
+#[macro_export]
+macro_rules! val { () => { 5u32; } }
+#[macro_export]
+macro_rules! bail { ($e:expr) => { return Err($e); } }
+#[macro_export]
+macro_rules! inner { () => { $crate::val!() } }
+//- /main.rs crate:main deps:m
+fn f(c: bool) -> Result<u32, u32> {
+    if c { m::bail!(1) } else { Ok(m::val!()) }
+}
+
+fn main() {
+    let v: u32 = { m::val!() };
+    let w: u32 = { m::inner!() };
+    let ok = match f(false) { Ok(it) => it, Err(_) => 0 };
+    let err = match f(true) { Ok(_) => 0, Err(it) => it };
+    if v != 5 || w != 5 || ok != 5 || err != 1 {
+        panic!();
+    }
+}
+"#,
+    );
+    // A macro of the crate's own: rustc's `semicolon_in_expressions_from_macros` is an error.
+    check_error_with(
+        r#"
+macro_rules! val { () => { 5u32; } }
+
+fn main() {
+    let _v: u32 = { val!() };
+}
+"#,
+        |e| {
+            matches!(
+                e,
+                MirEvalError::MirLowerError(_, MirLowerError::NotSupported(why))
+                    if why.contains("semicolon_in_expressions_from_macros")
+            )
+        },
+    );
+}
+
+#[test]
 fn statement_macro_last_in_another_statement_macro() {
     // A call last in another's expansion ends where the expansion does: it is a statement
     // macro where the outer call was one (`m!(..);`), and its expansion may be statements,

@@ -4538,6 +4538,27 @@ fn failed_expansion<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> O
         if count == 0 && statements.expr().is_some() {
             return None;
         }
+        // One expression and a `;`: rustc takes the `;` (`ParserAnyMacro::make`) and the
+        // expression is the call's value, as the body is lowered. Its lint
+        // `semicolon_in_expressions_from_macros` is denied by default for a macro of the
+        // crate itself, and not given for another crate's.
+        let one_with_semi = match statements.statements().next() {
+            Some(syntax::ast::Stmt::ExprStmt(only)) if count == 1 => {
+                only.semicolon_token().is_some() && only.expr().is_some()
+            }
+            _ => false,
+        };
+        if one_with_semi && statements.expr().is_none() {
+            if call.loc(db).def.krate != owner.krate(db) {
+                return None;
+            }
+            return Some(
+                "macro call in parentheses or brackets with no `;` after it, whose expansion \
+                 is one expression and a `;`, which rustc's `semicolon_in_expressions_from_macros` \
+                 refuses for a macro of the same crate"
+                    .to_owned(),
+            );
+        }
         let what = match (count, statements.expr().is_some()) {
             (0, false) => "nothing".to_owned(),
             (n, false) => format!("{n} statements and no expression"),

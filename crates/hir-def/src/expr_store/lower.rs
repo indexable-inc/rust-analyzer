@@ -2843,16 +2843,22 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
+    /// `in_expr_place` is whether rustc parses a call there in parentheses or brackets as an
+    /// expression (`parse_stmt_mac`): last in a block, or last in the expansion of a call it
+    /// parses so, with no `;` after it.
     fn collect_macro_as_stmt(
         &mut self,
         statements: &mut Vec<Statement>,
         mac: ast::MacroExpr,
+        in_expr_place: bool,
     ) -> Option<ExprId> {
         if !self.check_cfg(&ast::Expr::MacroExpr(mac.clone())) {
             return None;
         }
 
         let mac_call = mac.macro_call()?;
+        let as_expr =
+            in_expr_place && mac_call.token_tree().is_some_and(|it| it.l_curly_token().is_none());
         let syntax_ptr = AstPtr::new(&ast::Expr::from(mac));
         let macro_ptr = AstPtr::new(&mac_call);
         let expansion = self.collect_macro_call(
@@ -2861,9 +2867,24 @@ impl<'db> ExprCollector<'db> {
             false,
             |this, expansion: Option<ast::MacroStmts>| match expansion {
                 Some(expansion) => {
+                    // rustc parses the expansion of such a call as one expression, and takes
+                    // one `;` after it (`ParserAnyMacro::make`, the lint
+                    // `semicolon_in_expressions_from_macros`): `e;` is the value `e`.
+                    if as_expr
+                        && expansion.expr().is_none()
+                        && let mut written = expansion.statements()
+                        && let (Some(ast::Stmt::ExprStmt(only)), None) =
+                            (written.next(), written.next())
+                        && only.semicolon_token().is_some()
+                        && let Some(expr) = only.expr()
+                    {
+                        return this.maybe_collect_expr(expr);
+                    }
                     expansion.statements().for_each(|stmt| this.collect_stmt(statements, stmt));
                     expansion.expr().and_then(|expr| match expr {
-                        ast::Expr::MacroExpr(mac) => this.collect_macro_as_stmt(statements, mac),
+                        ast::Expr::MacroExpr(mac) => {
+                            this.collect_macro_as_stmt(statements, mac, as_expr)
+                        }
                         expr => this.maybe_collect_expr(expr),
                     })
                 }
@@ -2907,7 +2928,7 @@ impl<'db> ExprCollector<'db> {
                 let has_semi = stmt.semicolon_token().is_some();
                 // Note that macro could be expanded to multiple statements
                 if let Some(ast::Expr::MacroExpr(mac)) = expr {
-                    if let Some(expr) = self.collect_macro_as_stmt(statements, mac) {
+                    if let Some(expr) = self.collect_macro_as_stmt(statements, mac, !has_semi) {
                         statements.push(Statement::Expr { expr, has_semi })
                     }
                 } else if let Some(expr) = expr.and_then(|expr| self.maybe_collect_expr(expr)) {
@@ -3006,7 +3027,7 @@ impl<'db> ExprCollector<'db> {
         let mut statements = Vec::new();
         block.statements().for_each(|s| self.collect_stmt(&mut statements, s));
         let tail = block.tail_expr().and_then(|e| match e {
-            ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(&mut statements, mac),
+            ast::Expr::MacroExpr(mac) => self.collect_macro_as_stmt(&mut statements, mac, true),
             expr => self.maybe_collect_expr(expr),
         });
         let tail = tail.or_else(|| {
