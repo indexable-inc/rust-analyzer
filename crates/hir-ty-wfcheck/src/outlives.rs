@@ -4,13 +4,13 @@
 
 use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
 use rustc_hash::{FxHashMap, FxHashSet};
-use salsa::SalsaValue;
 use rustc_type_ir::{
     ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind, TypeFoldable,
     TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
     TypeVisitor,
     inherent::{GenericArgs as _, IntoKind, Term as _, Ty as _},
 };
+use salsa::SalsaValue;
 
 use hir_ty::{
     GenericPredicates,
@@ -586,20 +586,17 @@ fn required<'db>(
     match ty.kind() {
         TyKind::Ref(region, inner, _) => needs.push(Needs::Type(inner, region)),
         TyKind::Adt(def, args) => {
-            let clauses: Vec<Clause<'db>> =
-                GenericPredicates::query_all(db, def.def_id().into())
-                    .iter_instantiated(interner, args.as_slice())
-                    .map(|it| it.skip_norm_wip())
-                    .collect();
+            let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, def.def_id().into())
+                .iter_instantiated(interner, args.as_slice())
+                .map(|it| it.skip_norm_wip())
+                .collect();
             clause_needs(&clauses, &mut needs);
             for predicate in inferred_of(db, def.def_id()) {
                 let OutlivesPredicate(arg, region) =
                     EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
                 match arg.kind() {
                     GenericArgKind::Type(ty) => needs.push(Needs::Type(ty, region)),
-                    GenericArgKind::Lifetime(longer) => {
-                        needs.push(Needs::Region(longer, region))
-                    }
+                    GenericArgKind::Lifetime(longer) => needs.push(Needs::Region(longer, region)),
                     GenericArgKind::Const(_) => (),
                 }
             }
