@@ -379,6 +379,17 @@ impl WorkspaceBuildScripts {
         match message {
             Message::BuildScriptExecuted(mut message) => {
                 with_output_for(&message.package_id, &mut |name, data| {
+                    // A package both the target and the host build (a dependency of a proc
+                    // macro) has its script run for each, which can say different things;
+                    // the code read is the target's. With `--target` cargo runs the host's in
+                    // `<dir>/<profile>` and the target's in `<dir>/<triple>/<profile>`.
+                    let depth = message.out_dir.components().count();
+                    if data.out_dir.as_ref().is_some_and(|was| {
+                        !message.out_dir.as_str().is_empty()
+                            && depth < Utf8Path::new(was.as_str()).components().count()
+                    }) {
+                        return;
+                    }
                     progress(format!("build script {name} run"));
                     let cfgs = {
                         let mut acc = Vec::new();
@@ -621,5 +632,50 @@ fn is_dylib(path: &Utf8Path) -> bool {
     match path.extension().map(|e| e.to_ascii_lowercase()) {
         None => false,
         Some(ext) => matches!(ext.as_str(), "dll" | "dylib" | "so"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executed(out_dir: &str, cfgs: &[&str]) -> String {
+        serde_json::json!({
+            "reason": "build-script-executed",
+            "package_id": "path+file:///w/dep#0.1.0",
+            "linked_libs": [],
+            "linked_paths": [],
+            "cfgs": cfgs,
+            "env": [],
+            "out_dir": out_dir,
+        })
+        .to_string()
+    }
+
+    /// The cfgs a package's script is read to have said after `lines`.
+    fn cfgs_after(lines: &[String]) -> Vec<String> {
+        let mut data = BuildScriptOutput::default();
+        let mut with_output_for =
+            |_: &PackageId, cb: &mut dyn FnMut(&str, &mut BuildScriptOutput)| cb("dep", &mut data);
+        for line in lines {
+            WorkspaceBuildScripts::said(line, &mut with_output_for, &|_| {}, &|e| panic!("{e}"));
+        }
+        data.cfgs.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn the_targets_run_of_a_script_the_host_also_runs_is_kept() {
+        let host = executed("/w/target/debug/build/dep/1111/out", &["host_only"]);
+        let target =
+            executed("/w/target/wasm32-unknown-unknown/debug/build/dep/2222/out", &["for_target"]);
+        assert_eq!(cfgs_after(&[host.clone(), target.clone()]), ["for_target"]);
+        assert_eq!(cfgs_after(&[target, host]), ["for_target"]);
+    }
+
+    #[test]
+    fn a_script_run_again_says_what_it_said_last() {
+        let first = executed("/w/target/debug/build/dep/1111/out", &["first"]);
+        let again = executed("/w/target/debug/build/dep/1111/out", &["again"]);
+        assert_eq!(cfgs_after(&[first, again]), ["again"]);
     }
 }
