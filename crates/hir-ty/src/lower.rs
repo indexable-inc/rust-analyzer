@@ -387,6 +387,24 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         self
     }
 
+    /// The lifetime of a trait object written without one where `region` would be its
+    /// default. In a body a lifetime left to inference (`&dyn Trait`, `Ref<'_, dyn Trait>`)
+    /// resolves to nothing, so rustc's `resolve_object_lifetime_default` gives the object a
+    /// lifetime inferred on its own, not the reference's.
+    fn object_default(&mut self, region: Region<'db>) -> Region<'db> {
+        if self.infers_object_lifetimes() && matches!(region.kind(), RegionKind::ReVar(_)) {
+            return self.next_region_var(Span::Dummy);
+        }
+        region
+    }
+
+    /// Lowering a type written in a body with region variables, where a trait object no
+    /// enclosing type gives a lifetime (`Box<dyn Trait>`, `*const dyn Trait`) has an inferred
+    /// one, not `'static`.
+    fn infers_object_lifetimes(&self) -> bool {
+        self.elided_region_vars && matches!(self.def, ExpressionStoreOwnerId::Body(_))
+    }
+
     fn push_infer_vars_not_allowed(&mut self, span: Span) {
         if !span.is_dummy() {
             self.push_diagnostic(TyLoweringDiagnostic::InferVarsNotAllowed { source: span });
@@ -808,7 +826,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 let inner_ty = match &self.store[ref_.ty] {
                     // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
                     TypeRef::DynTrait(bounds) if !lifetime.is_error() || self.impl_header => {
-                        self.lower_dyn_trait(bounds, lifetime)
+                        let object = self.object_default(lifetime);
+                        self.lower_dyn_trait(bounds, object)
                     }
                     _ => self.lower_ty(ref_.ty),
                 };
@@ -816,7 +835,14 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             TypeRef::Placeholder => self.next_ty_var(type_ref_id.into()),
             TypeRef::Fn(fn_) => self.lower_fn_ptr(fn_),
-            TypeRef::DynTrait(bounds) => self.lower_dyn_trait(bounds, Region::new_static(interner)),
+            TypeRef::DynTrait(bounds) => {
+                let object = if self.infers_object_lifetimes() {
+                    self.next_region_var(Span::Dummy)
+                } else {
+                    Region::new_static(interner)
+                };
+                self.lower_dyn_trait(bounds, object)
+            }
             TypeRef::ImplTrait(bounds) => {
                 match self.impl_trait_mode.mode {
                     ImplTraitLoweringMode::Opaque => {

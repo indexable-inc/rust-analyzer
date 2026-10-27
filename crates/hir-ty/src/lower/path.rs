@@ -835,6 +835,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             ) -> Option<Ty<'db>> {
                 let store = self.ctx.ctx.store;
                 let TypeRef::DynTrait(bounds) = &store[type_ref] else { return None };
+                let region = self.ctx.ctx.object_default(region);
                 Some(self.ctx.ctx.lower_dyn_trait(bounds, region))
             }
 
