@@ -5120,10 +5120,11 @@ impl<'db> Type<'db> {
 
     /// Whether the trait impl may apply to the type, the type's generic parameters and the
     /// impl's as inference variables and an ambiguous answer counting: rustdoc's test of the
-    /// blanket impls a type gets.
-    pub fn may_have_impl(&self, db: &'db dyn HirDatabase, impl_: Impl) -> bool {
+    /// blanket impls a type gets. Solved in `krate`, rustdoc's local crate, whose dependencies
+    /// may reach an impl the type's own crate cannot see.
+    pub fn may_have_impl(&self, db: &'db dyn HirDatabase, impl_: Impl, krate: Crate) -> bool {
         let Ok(id) = ImplId::try_from(impl_) else { return false };
-        traits::impl_may_apply(db, self.krate(db), id, &mut |infcx| {
+        traits::impl_may_apply(db, krate.id, id, &mut |infcx| {
             Self::instantiate_many_with_infer([self], infcx).next().unwrap()
         })
     }

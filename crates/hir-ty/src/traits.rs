@@ -270,16 +270,26 @@ pub fn is_impossible_associated_item(
         // Coherence answers a trait goal only a crate upstream of `krate` could implement
         // (`io::Error: Ord`) as ambiguous, since that crate may add the impl; rust-analyzer's
         // solver takes every crate as local, so the goal is left out here instead.
-        // A higher-ranked bound (`for<'a> Self::Item: Trait<'a>`) is judged as written: the
-        // normalizer takes no bound vars.
+        // A projection is normalized as the solver constrains it, though the impl's own bounds
+        // on its inference variables leave the goal ambiguous (`Self::Item` of a
+        // `FindIter<'a, 'h, A: Automaton>` is `Match`); one under a binder (`for<'a>`) is
+        // judged as written, the normalizer taking no bound vars. Each projection has a
+        // fulfillment context of its own, so the clauses already registered are answered once,
+        // at the end, and not with it.
         if let rustc_type_ir::ClauseKind::Trait(pred) = clause.kind().skip_binder() {
-            let trait_ref = match pred.trait_ref.has_escaping_bound_vars() {
-                true => pred.trait_ref,
-                false => ocx
-                    .deeply_normalize(&ObligationCause::dummy(), ParamEnv::empty(), pred.trait_ref)
-                    .unwrap_or(pred.trait_ref),
-            };
-            if !knowable(db, krate, trait_ref) {
+            let known = knowable(db, krate, pred.trait_ref, |ty| {
+                if !matches!(ty.kind(), TyKind::Alias(..)) || ty.has_escaping_bound_vars() {
+                    return ty;
+                }
+                let mut own = crate::next_solver::fulfill::FulfillmentCtxt::new(&infcx);
+                infcx
+                    .at(&ObligationCause::dummy(), ParamEnv::empty())
+                    .structurally_normalize_ty(ty, &mut own)
+                    .ok()
+                    .filter(|it| !matches!(it.kind(), TyKind::Infer(_)))
+                    .unwrap_or(ty)
+            });
+            if !known {
                 continue;
             }
         }
@@ -296,10 +306,12 @@ pub fn is_impossible_associated_item(
 /// Whether `krate` can know every impl of `trait_ref`: the trait is its own or `#[fundamental]`,
 /// or one of the types is its own, under references and `#[fundamental]` types. rustc's
 /// `trait_ref_is_knowable` and `orphan_check_trait_ref`, leaving out where parameters may appear.
+/// Each type looked at goes through `normalize` first.
 fn knowable<'db>(
     db: &'db dyn HirDatabase,
     krate: Crate,
     trait_ref: crate::next_solver::TraitRef<'db>,
+    mut normalize: impl FnMut(Ty<'db>) -> Ty<'db>,
 ) -> bool {
     let trait_id = trait_ref.def_id.0;
     if trait_id.module(db).krate(db) == krate
@@ -309,6 +321,7 @@ fn knowable<'db>(
     }
     trait_ref.args.types().any(|mut ty| {
         loop {
+            ty = normalize(ty);
             match ty.kind() {
                 TyKind::Ref(_, inner, _) => ty = inner,
                 TyKind::Adt(adt_def, args) => {

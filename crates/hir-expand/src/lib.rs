@@ -78,8 +78,15 @@ type MacroArgResult = (tt::TopSubtree, SyntaxFixupUndoInfo, Span);
 /// If an invocation produces more tokens than this limit, it will not be stored in the database and
 /// an error will be emitted.
 ///
-/// Actual max for `analysis-stats .` at some point: 30672.
-const TOKEN_LIMIT: usize = 2_097_152;
+/// Actual max for `analysis-stats .` at some point: 30672. A process that loads once and keeps
+/// nothing, as `blaze doc` does, may lift it with [`set_token_limit`].
+static TOKEN_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2_097_152);
+
+/// Sets the limit on the tokens one macro invocation may produce, before anything expands:
+/// an expansion stored under one limit is not redone under another.
+pub fn set_token_limit(limit: usize) {
+    TOKEN_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
+}
 
 #[macro_export]
 macro_rules! impl_intern_lookup {
@@ -1037,7 +1044,8 @@ fn without_last_semicolon(tt: &tt::TopSubtree) -> Option<tt::TopSubtree> {
 fn check_tt_count(tt: &tt::TopSubtree) -> Result<(), ExpandResult<()>> {
     let tt = tt.top_subtree();
     let count = tt.count();
-    if count <= TOKEN_LIMIT {
+    let limit = TOKEN_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+    if count <= limit {
         Ok(())
     } else {
         Err(ExpandResult {
@@ -1045,7 +1053,7 @@ fn check_tt_count(tt: &tt::TopSubtree) -> Result<(), ExpandResult<()>> {
             err: Some(ExpandError::other(
                 tt.delimiter.open,
                 format!(
-                    "macro invocation exceeds token limit: produced {count} tokens, limit is {TOKEN_LIMIT}",
+                    "macro invocation exceeds token limit: produced {count} tokens, limit is {limit}",
                 ),
             )),
         })
