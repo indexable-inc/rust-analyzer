@@ -505,6 +505,41 @@ fn has_opaque(ty: Ty<'_>) -> bool {
     rustc_type_ir::TypeVisitable::visit_with(&ty, &mut Find).is_break()
 }
 
+/// The parts of `actual` where `declared`, the same type but for its `impl Trait`s, has an
+/// `impl Trait`: the types those hide.
+fn hidden_types<'db>(declared: Ty<'db>, actual: Ty<'db>, out: &mut Vec<Ty<'db>>) {
+    use rustc_type_ir::inherent::GenericArg as _;
+    let args = |declared: hir_ty::next_solver::GenericArgs<'db>,
+                actual: hir_ty::next_solver::GenericArgs<'db>,
+                out: &mut Vec<Ty<'db>>| {
+        if declared.len() == actual.len() {
+            for (declared, actual) in declared.iter().zip(actual.iter()) {
+                if let (Some(declared), Some(actual)) = (declared.as_type(), actual.as_type()) {
+                    hidden_types(declared, actual, out);
+                }
+            }
+        }
+    };
+    match (declared.kind(), actual.kind()) {
+        (TyKind::Alias(alias), _) if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind => {
+            out.push(actual)
+        }
+        (TyKind::Adt(a, declared), TyKind::Adt(b, actual)) if a == b => args(declared, actual, out),
+        (TyKind::Tuple(declared), TyKind::Tuple(actual)) if declared.len() == actual.len() => {
+            for (declared, actual) in declared.iter().zip(actual.iter()) {
+                hidden_types(declared, actual, out);
+            }
+        }
+        (TyKind::Ref(_, declared, _), TyKind::Ref(_, actual, _))
+        | (TyKind::RawPtr(declared, _), TyKind::RawPtr(actual, _))
+        | (TyKind::Slice(declared), TyKind::Slice(actual))
+        | (TyKind::Array(declared, _), TyKind::Array(actual, _)) => {
+            hidden_types(declared, actual, out)
+        }
+        _ => (),
+    }
+}
+
 /// Whether `ty` has a closure or a coroutine in it, whose signature RA does not keep
 /// higher-ranked: `|line: &String|` is `fn(&'1 String)` for one `'1`, not `for<'a>`.
 fn names_closure(ty: Ty<'_>) -> bool {
@@ -2491,6 +2526,34 @@ impl<'db> Builder<'_, '_, 'db> {
         }
         for trait_ref in trait_refs {
             self.prove(trait_ref, At { category: Category::Signature, span: MirSpan::Unknown });
+        }
+        // Computing the implied bounds of a returned `impl Trait` reveals, in its defining
+        // body, the type it hides, whose well-formedness the solver then proves, at the
+        // signature: `-> impl Sized` hiding `Outlives<'static, <T as Trait>::Assoc>` needs
+        // `<T as Trait>::Assoc: 'static`. What the type around it asks (`&'t impl Trait` that
+        // it outlives `'t`) is an implied bound, assumed.
+        if self.returns_opaque
+            && let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)) = self.ctx.owner
+        {
+            let slot = self.regions.local_tys[super::return_slot().into_raw().into_u32() as usize];
+            let declared = self
+                .ctx
+                .db
+                .callable_item_signature(CallableDefId::FunctionId(function))
+                .instantiate_identity()
+                .skip_norm_wip()
+                .skip_binder()
+                .output();
+            let mut hidden = Vec::new();
+            hidden_types(declared, slot, &mut hidden);
+            for ty in hidden {
+                use rustc_type_ir::TypeVisitableExt as _;
+                if ty.references_error() || ty.has_non_region_infer() {
+                    continue;
+                }
+                let at = At { category: Category::Signature, span: MirSpan::Unknown };
+                self.well_formed(ty, at, 0);
+            }
         }
     }
 
