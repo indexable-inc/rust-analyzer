@@ -162,6 +162,178 @@ pub fn implements_trait_unique_with_infcx<'db>(
     infcx.predicate_must_hold_modulo_regions(&obligation)
 }
 
+/// Whether two types unify once `create_tys` has replaced their generic parameters with
+/// inference variables: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
+pub fn could_unify_with_infcx<'db>(
+    db: &'db dyn HirDatabase,
+    krate: Crate,
+    create_tys: &mut dyn FnMut(&InferCtxt<'db>) -> (Ty<'db>, Ty<'db>),
+) -> bool {
+    let interner = DbInterner::new_with(db, krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let (a, b) = create_tys(&infcx);
+    infcx.at(&ObligationCause::dummy(), ParamEnv::empty()).eq(a, b).is_ok()
+}
+
+/// Whether the trait impl `impl_` may apply to the type `create_ty` makes, as rustdoc's
+/// `synthesize_blanket_impls` asks: the impl's parameters are inference variables, its self
+/// type is equated with the type, and its where-clauses and trait ref may each hold.
+pub fn impl_may_apply<'db>(
+    db: &'db dyn HirDatabase,
+    krate: Crate,
+    impl_: ImplId,
+    create_ty: &mut dyn FnMut(&InferCtxt<'db>) -> Ty<'db>,
+) -> bool {
+    let interner = DbInterner::new_with(db, krate);
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let ty = create_ty(&infcx);
+    let Some(trait_ref) = db.impl_trait(impl_) else { return false };
+    let args = infcx.fresh_args_for_item(Span::Dummy, impl_.into());
+    let trait_ref = trait_ref.instantiate(interner, args).skip_norm_wip();
+    if infcx.at(&ObligationCause::dummy(), ParamEnv::empty()).eq(trait_ref.self_ty(), ty).is_err() {
+        return false;
+    }
+    let may_hold = |obligation| infcx.predicate_may_hold(&obligation);
+    let clauses = crate::lower::GenericPredicates::query_all(db, impl_.into())
+        .iter_instantiated(interner, args.as_slice())
+        .map(crate::next_solver::Unnormalized::skip_norm_wip);
+    crate::next_solver::util::clauses_as_obligations(
+        clauses,
+        ObligationCause::dummy(),
+        ParamEnv::empty(),
+    )
+    .all(may_hold)
+        && may_hold(Obligation::new(
+            interner,
+            ObligationCause::dummy(),
+            ParamEnv::empty(),
+            trait_ref,
+        ))
+}
+
+/// Whether the trait's item `item` cannot be used through `impl_`: one of its own where-clauses
+/// that names only the trait's parameters (`Self::Item: Ord` of `Iterator::cmp`) cannot hold
+/// there. rustc's `is_impossible_associated_item` (`compiler/rustc_trait_selection/src/traits/mod.rs`
+/// at rust 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0), which rustdoc asks before it lists an item
+/// the impl leaves as the trait provides it. `krate` is the crate asking, rustc's local crate:
+/// a clause it could not know the answer to holds as far as it can tell.
+pub fn is_impossible_associated_item(
+    db: &dyn HirDatabase,
+    krate: Crate,
+    impl_: ImplId,
+    item: GenericDefId,
+) -> bool {
+    use std::ops::ControlFlow;
+
+    use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
+
+    use crate::next_solver::{Const, ConstKind, EarlyBinder, Region, RegionKind};
+
+    /// Breaks at a parameter of the item's own, numbered after the trait's.
+    struct OwnParam(u32);
+    impl<'db> TypeVisitor<DbInterner<'db>> for OwnParam {
+        type Result = ControlFlow<()>;
+        fn visit_ty(&mut self, ty: Ty<'db>) -> ControlFlow<()> {
+            match ty.kind() {
+                TyKind::Param(param) if param.index >= self.0 => ControlFlow::Break(()),
+                _ => ty.super_visit_with(self),
+            }
+        }
+        fn visit_region(&mut self, region: Region<'db>) -> ControlFlow<()> {
+            match region.kind() {
+                RegionKind::ReEarlyParam(param) if param.index >= self.0 => ControlFlow::Break(()),
+                _ => ControlFlow::Continue(()),
+            }
+        }
+        fn visit_const(&mut self, konst: Const<'db>) -> ControlFlow<()> {
+            match konst.kind() {
+                ConstKind::Param(param) if param.index >= self.0 => ControlFlow::Break(()),
+                _ => konst.super_visit_with(self),
+            }
+        }
+    }
+
+    let Some(trait_ref) = db.impl_trait(impl_) else { return false };
+    let interner = DbInterner::new_with(db, impl_.krate(db));
+    // As coherence asks: the impl's parameters are inference variables, so a clause that holds
+    // for some of their values (`T: Ord` of an `IntoIter<T>`) is ambiguous, not an error.
+    let infcx = interner.infer_ctxt().build(TypingMode::Coherence);
+    let fresh = infcx.fresh_args_for_item(Span::Dummy, impl_.into());
+    let args = trait_ref.instantiate(interner, fresh).skip_norm_wip().args;
+    let parent = crate::generics::generics(db, item).len_parent() as u32;
+    let mut ocx = ObligationCtxt::new(&infcx);
+    for clause in crate::lower::GenericPredicates::query_own_explicit(db, item)
+        .skip_binder()
+        .filter(|clause| clause.visit_with(&mut OwnParam(parent)).is_continue())
+    {
+        let clause = EarlyBinder::bind(clause).instantiate(interner, args).skip_norm_wip();
+        // Coherence answers a trait goal only a crate upstream of `krate` could implement
+        // (`io::Error: Ord`) as ambiguous, since that crate may add the impl; rust-analyzer's
+        // solver takes every crate as local, so the goal is left out here instead.
+        // A higher-ranked bound (`for<'a> Self::Item: Trait<'a>`) is judged as written: the
+        // normalizer takes no bound vars.
+        if let rustc_type_ir::ClauseKind::Trait(pred) = clause.kind().skip_binder() {
+            let trait_ref = match pred.trait_ref.has_escaping_bound_vars() {
+                true => pred.trait_ref,
+                false => ocx
+                    .deeply_normalize(&ObligationCause::dummy(), ParamEnv::empty(), pred.trait_ref)
+                    .unwrap_or(pred.trait_ref),
+            };
+            if !knowable(db, krate, trait_ref) {
+                continue;
+            }
+        }
+        ocx.register_obligation(Obligation::new(
+            interner,
+            ObligationCause::dummy(),
+            ParamEnv::empty(),
+            clause,
+        ));
+    }
+    !ocx.try_evaluate_obligations().is_empty()
+}
+
+/// Whether `krate` can know every impl of `trait_ref`: the trait is its own or `#[fundamental]`,
+/// or one of the types is its own, under references and `#[fundamental]` types. rustc's
+/// `trait_ref_is_knowable` and `orphan_check_trait_ref`, leaving out where parameters may appear.
+fn knowable<'db>(
+    db: &'db dyn HirDatabase,
+    krate: Crate,
+    trait_ref: crate::next_solver::TraitRef<'db>,
+) -> bool {
+    let trait_id = trait_ref.def_id.0;
+    if trait_id.module(db).krate(db) == krate
+        || TraitSignature::of(db, trait_id).flags.contains(TraitFlags::FUNDAMENTAL)
+    {
+        return true;
+    }
+    trait_ref.args.types().any(|mut ty| {
+        loop {
+            match ty.kind() {
+                TyKind::Ref(_, inner, _) => ty = inner,
+                TyKind::Adt(adt_def, args) => {
+                    let fundamental = match adt_def.def_id() {
+                        AdtId::StructId(id) => {
+                            StructSignature::of(db, id).flags.contains(StructFlags::FUNDAMENTAL)
+                        }
+                        _ => false,
+                    };
+                    match args.types().next() {
+                        Some(inner) if fundamental => ty = inner,
+                        _ => break adt_def.def_id().module(db).krate(db) == krate,
+                    }
+                }
+                TyKind::Dynamic(bounds, _) => {
+                    break bounds
+                        .principal_def_id()
+                        .is_some_and(|it| it.0.module(db).krate(db) == krate);
+                }
+                _ => break false,
+            }
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WherePredicateEvaluation {
     Holds,

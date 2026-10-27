@@ -1529,6 +1529,20 @@ impl Function {
         }
     }
 
+    /// Whether this function of a trait cannot be used through `impl_`: one of its where-clauses
+    /// that names only the trait's parameters cannot hold there, as `Self: DoubleEndedIterator`
+    /// of `Iterator::rev` for an iterator that is not, as far as `krate` can know.
+    pub fn is_impossible_in(self, db: &dyn HirDatabase, impl_: Impl, krate: Crate) -> bool {
+        let (AnyFunctionId::FunctionId(id), Ok(impl_id)) = (self.id, ImplId::try_from(impl_))
+        else {
+            return false;
+        };
+        if !matches!(id.lookup(db).container, ItemContainerId::TraitId(_)) {
+            return false;
+        }
+        traits::is_impossible_associated_item(db, krate.id, impl_id, id.into())
+    }
+
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         match self.id {
             AnyFunctionId::FunctionId(id) => id.module(db).into(),
@@ -4613,6 +4627,30 @@ impl<'db> Type<'db> {
         Type { owner, ty: EarlyBinder::bind(self.ty.instantiate(interner, args).skip_norm_wip()) }
     }
 
+    /// The type with its type parameters filled from `args`, in order, and its lifetime and const
+    /// parameters left as its own: `Foo<'a, i32, N>` of `Foo<'a, T, const N: usize>`. Unlike
+    /// [`Type::instantiate`], which fills those with errors that every trait goal takes to hold,
+    /// trait goals on the result are solved as in the type's own crate and environment.
+    pub fn instantiate_type_params(
+        &self,
+        args: impl IntoIterator<Item: Borrow<Type<'db>>>,
+    ) -> Type<'db> {
+        let TypeOwnerId::GenericDefId(def) = self.owner else { return self.clone() };
+        let interner = DbInterner::conjure();
+        let mut args = args.into_iter();
+        let args = GenericArgs::for_item(interner, def.into(), |index, id, _, _| match id {
+            GenericParamId::TypeParamId(_) => match args.next() {
+                Some(arg) => arg.borrow().ty.skip_binder().into(),
+                None => hir_ide::next_solver::mk_param(interner, index, id),
+            },
+            _ => hir_ide::next_solver::mk_param(interner, index, id),
+        });
+        Type {
+            owner: self.owner,
+            ty: EarlyBinder::bind(self.ty.instantiate(interner, args).skip_norm_wip()),
+        }
+    }
+
     /// Instantiates multiple types with infer vars, keeping the same infer vars for the same owners.
     fn instantiate_many_with_infer(
         tys: impl IntoIterator<Item: Borrow<Type<'db>>>,
@@ -5067,6 +5105,26 @@ impl<'db> Type<'db> {
                     infcx.var_for_def(param, hir_ide::Span::Dummy)
                 }
             })
+        })
+    }
+
+    /// Whether the two types unify with each one's generic parameters as inference variables,
+    /// whatever owns them: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
+    pub fn unifies_with_any_params(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
+        traits::could_unify_with_infcx(db, self.krate(db), &mut |infcx| {
+            let a = Self::instantiate_many_with_infer([self], infcx).next().unwrap();
+            let b = Self::instantiate_many_with_infer([other], infcx).next().unwrap();
+            (a, b)
+        })
+    }
+
+    /// Whether the trait impl may apply to the type, the type's generic parameters and the
+    /// impl's as inference variables and an ambiguous answer counting: rustdoc's test of the
+    /// blanket impls a type gets.
+    pub fn may_have_impl(&self, db: &'db dyn HirDatabase, impl_: Impl) -> bool {
+        let Ok(id) = ImplId::try_from(impl_) else { return false };
+        traits::impl_may_apply(db, self.krate(db), id, &mut |infcx| {
+            Self::instantiate_many_with_infer([self], infcx).next().unwrap()
         })
     }
 
