@@ -248,7 +248,8 @@ impl Sysroot {
 
     /// The library's workspace read; an error only when the embedder reads it in place of
     /// cargo (`CargoMetadataConfig::own_metadata`) and could not, which is not hidden by
-    /// stitching the library together instead.
+    /// stitching the library together instead. A library with no `Cargo.toml` is stitched
+    /// either way: a toolchain without `rust-src` then has an empty one, which says so.
     pub fn load_workspace(
         &self,
         sysroot_source_config: &RustSourceWorkspaceConfig,
@@ -262,7 +263,10 @@ impl Sysroot {
         };
         if let RustSourceWorkspaceConfig::CargoMetadata(cargo_config) = sysroot_source_config {
             let library_manifest = ManifestPath::try_from(src_root.join("Cargo.toml")).unwrap();
-            if let Some(own) = &cargo_config.own_metadata {
+            let manifest_there = fs::metadata(&library_manifest).is_ok();
+            if let Some(own) = &cargo_config.own_metadata
+                && manifest_there
+            {
                 return self
                     .load_library_own(own, &library_manifest, cargo_config, no_deps)
                     .map(Some)
@@ -270,7 +274,7 @@ impl Sysroot {
                         format!("blaze could not read the standard library's workspace {library_manifest}")
                     });
             }
-            if fs::metadata(&library_manifest).is_ok() {
+            if manifest_there {
                 match self.load_library_via_cargo(
                     &library_manifest,
                     src_root,
