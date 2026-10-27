@@ -754,12 +754,23 @@ pub fn pretty(tkns: TokenTreesView<'_>) -> String {
 ///
 /// One difference from rustc is left: what an `ident` or `lifetime` fragment matched counts as
 /// followed by a space there, and here it is treated like a `tt` fragment.
+///
+/// `through_proc_macro`: the tokens of the root context came out of a proc macro, and so have
+/// the spacing rustc's proc macro server gives them back: `Joint` for a punctuation the macro
+/// said is joint, `Alone` for everything else, whatever the source they are from had. That is
+/// what rustc does with tokens the macro took apart and made again, as syn and quote do; a
+/// stream it hands on whole keeps the spacing of its source there, and is spaced here.
 pub fn stringify(
     tkns: TokenTreesView<'_>,
     source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+    through_proc_macro: bool,
 ) -> String {
     let mut text = String::new();
-    write_stringified(tkns.iter(), source_joined, &mut text);
+    let given = |span, text: &str| match through_proc_macro {
+        true => Some(false),
+        false => source_joined(span, text),
+    };
+    write_stringified(tkns.iter(), &given, through_proc_macro, &mut text);
     return text;
 
     /// The operators that are one token to rustc and several here.
@@ -804,6 +815,7 @@ pub fn stringify(
         next: &TtElement<'_>,
         operator: &str,
         source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+        through_proc_macro: bool,
     ) -> bool {
         // A lifetime is one token to rustc.
         if punct(prev) == Some('\'') && matches!(next, TtElement::Leaf(Leaf::Ident(_))) {
@@ -820,6 +832,11 @@ pub fn stringify(
                     });
             }
             TtElement::Leaf(leaf) if !leaf.span().ctx.is_root() => return false,
+            // A lifetime is one token to rustc, so what comes before it is no part of an
+            // operator with it.
+            TtElement::Leaf(Leaf::Punct(it)) if through_proc_macro => {
+                return matches!(it.spacing, Spacing::Joint) && punct(next) != Some('\'');
+            }
             TtElement::Leaf(leaf) => source_joined(*leaf.span(), &leaf.to_string()),
             TtElement::Subtree(subtree, _) => {
                 let close = match subtree.delimiter.kind {
@@ -884,6 +901,7 @@ pub fn stringify(
     fn write_stringified(
         tkns: TtIter<'_>,
         source_joined: &dyn Fn(Span, &str) -> Option<bool>,
+        through_proc_macro: bool,
         text: &mut String,
     ) {
         let mut tkns = tkns.peekable();
@@ -922,12 +940,12 @@ pub fn stringify(
                         DelimiterKind::Invisible => ("", ""),
                     };
                     text.push_str(open);
-                    write_stringified(content.clone(), source_joined, text);
+                    write_stringified(content.clone(), source_joined, through_proc_macro, text);
                     text.push_str(close);
                 }
             }
             let Some(next) = tkns.peek() else { break };
-            let is_joined = joined(&tkn, next, &operator, source_joined);
+            let is_joined = joined(&tkn, next, &operator, source_joined, through_proc_macro);
             if !is_joined || punct(&tkn).is_none() {
                 operator.clear();
             }

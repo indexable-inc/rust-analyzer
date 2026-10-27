@@ -17,7 +17,7 @@ use syntax::{
 use syntax_bridge::syntax_node_to_token_tree;
 
 use crate::{
-    EditionedFileId, ExpandError, ExpandResult, MacroCallId,
+    EditionedFileId, ExpandError, ExpandResult, HirFileId, MacroCallId,
     builtin::quote::{WithDelimiter, dollar_crate},
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
     name,
@@ -209,13 +209,30 @@ fn source_joined(db: &dyn SourceDatabase, span: Span, text: &str) -> Option<bool
     Some(!is_trivia)
 }
 
+/// Whether the tokens of the source a call of `id` is given came out of a proc macro on their
+/// way there: some expansion it is in is a proc macro's.
+fn through_proc_macro(db: &dyn SourceDatabase, id: MacroCallId) -> bool {
+    let mut file = id.parent(db);
+    while let HirFileId::MacroFile(call) = file {
+        if call.loc(db).def.is_proc_macro() {
+            return true;
+        }
+        file = call.parent(db);
+    }
+    false
+}
+
 fn stringify_expand(
     db: &dyn SourceDatabase,
-    _id: MacroCallId,
+    id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let pretty = ::tt::stringify(tt.token_trees(), &|span, text| source_joined(db, span, text));
+    let pretty = ::tt::stringify(
+        tt.token_trees(),
+        &|span, text| source_joined(db, span, text),
+        through_proc_macro(db, id),
+    );
 
     let expanded = quote! {span =>
         #pretty
@@ -249,7 +266,11 @@ fn assert_expand(
         // Without a message of its own, the assertion reports the condition.
         let message = format!(
             "assertion failed: {}",
-            ::tt::stringify(cond.value, &|span, text| source_joined(db, span, text))
+            ::tt::stringify(
+                cond.value,
+                &|span, text| source_joined(db, span, text),
+                through_proc_macro(db, id),
+            )
         );
         quote! {call_site_span => #dollar_crate::panicking::panic(#message) }
     } else if use_panic_2021(db, span) {
