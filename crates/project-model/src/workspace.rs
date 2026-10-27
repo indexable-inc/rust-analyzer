@@ -692,6 +692,21 @@ impl ProjectWorkspace {
         match &self.kind {
             ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _, None)), .. }
             | ProjectWorkspaceKind::Cargo { cargo, error: None, .. } => {
+                if let Some(own) = &config.own_build_scripts {
+                    let asked = crate::OwnBuildAsked {
+                        sysroot: &self.sysroot,
+                        rustc_cfg: &self.rustc_cfg,
+                        config,
+                    };
+                    return (own.0)(cargo, &asked)
+                        .and_then(|outputs| WorkspaceBuildScripts::of_own(cargo, outputs))
+                        .with_context(|| {
+                            format!(
+                                "Failed to build the build scripts of {}",
+                                cargo.workspace_root()
+                            )
+                        });
+                }
                 WorkspaceBuildScripts::run_for_workspace(
                     config,
                     cargo,

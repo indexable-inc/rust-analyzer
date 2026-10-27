@@ -180,6 +180,21 @@ impl WorkspaceBuildScripts {
         self.outputs.get(package)?.out_dir.as_deref()
     }
 
+    /// What a load reads of `package`, for an embedder to show: its script's cfgs and
+    /// variables, where it wrote, and its proc macro's library when it has one built.
+    pub fn read_of(&self, package: Package) -> Option<crate::OwnBuildOutput> {
+        let output = self.outputs.get(package)?;
+        Some(crate::OwnBuildOutput {
+            cfgs: output.cfgs.iter().map(ToString::to_string).collect(),
+            envs: output.envs.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
+            out_dir: output.out_dir.clone(),
+            proc_macro_dylib: match &output.proc_macro_dylib_path {
+                ProcMacroDylibPath::Path(path) => Some(path.clone()),
+                _ => None,
+            },
+        })
+    }
+
     pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
         self.outputs.get(idx)
     }
@@ -327,6 +342,45 @@ impl WorkspaceBuildScripts {
             }
         }
 
+        Ok(res)
+    }
+
+    /// What an embedder's own build said of the scripts and the proc macros of `workspace`
+    /// (`CargoConfig::own_build_scripts`), as `cargo check --compile-time-deps` would.
+    pub fn of_own(
+        workspace: &CargoWorkspace,
+        outputs: Vec<(Package, crate::OwnBuildOutput)>,
+    ) -> anyhow::Result<WorkspaceBuildScripts> {
+        let mut res = WorkspaceBuildScripts::default();
+        for package in workspace.packages() {
+            let is_proc_macro = workspace[package].targets.iter().any(|&it| {
+                matches!(workspace[it].kind, TargetKind::Lib { is_proc_macro: true })
+            });
+            let data = BuildScriptOutput {
+                proc_macro_dylib_path: match is_proc_macro {
+                    true => ProcMacroDylibPath::NotBuilt,
+                    false => ProcMacroDylibPath::NotProcMacro,
+                },
+                ..BuildScriptOutput::default()
+            };
+            res.outputs.insert(package, data);
+        }
+        for (package, own) in outputs {
+            let data = &mut res.outputs[package];
+            if let Some(out_dir) = own.out_dir {
+                data.cfgs = own
+                    .cfgs
+                    .iter()
+                    .map(|it| crate::parse_cfg(it).map_err(|err| anyhow::format_err!("{err}")))
+                    .collect::<anyhow::Result<_>>()?;
+                data.envs.extend(own.envs);
+                data.envs.insert("OUT_DIR", out_dir.as_str());
+                data.out_dir = Some(out_dir);
+            }
+            if let Some(dylib) = own.proc_macro_dylib {
+                data.proc_macro_dylib_path = ProcMacroDylibPath::Path(dylib);
+            }
+        }
         Ok(res)
     }
 

@@ -158,6 +158,9 @@ pub struct CargoConfig {
     /// Where the workspace and its `cargo metadata` come from instead of cargo. When it fails,
     /// so does the load: cargo is not asked instead.
     pub own_metadata: Option<OwnMetadata>,
+    /// What builds and runs the build scripts and proc macros of a workspace in place of
+    /// `cargo check --compile-time-deps`.
+    pub own_build_scripts: Option<OwnBuildScripts>,
 }
 
 /// The root manifest of the workspace a manifest is in, and `cargo metadata` of it for the
@@ -208,6 +211,51 @@ impl Eq for OwnMetadata {}
 impl fmt::Debug for OwnMetadata {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OwnMetadata")
+    }
+}
+
+/// What a load is asked to build its build scripts and proc macros for: the toolchain and
+/// what `rustc --print cfg` says of the target.
+pub struct OwnBuildAsked<'a> {
+    pub sysroot: &'a crate::Sysroot,
+    pub rustc_cfg: &'a [cfg::CfgAtom],
+    pub config: &'a CargoConfig,
+}
+
+/// What the build script of a package said and where it wrote, and the proc macro the
+/// package has, as a build of `cargo check --compile-time-deps` has them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnBuildOutput {
+    /// `cargo::rustc-cfg`, as cargo prints them in `build-script-executed`.
+    pub cfgs: Vec<String>,
+    /// `cargo::rustc-env`.
+    pub envs: Vec<(String, String)>,
+    /// `OUT_DIR`, when the package has a build script that ran.
+    pub out_dir: Option<AbsPathBuf>,
+    /// The library of the package's proc macro.
+    pub proc_macro_dylib: Option<AbsPathBuf>,
+}
+
+type BuildScripts = dyn Fn(&CargoWorkspace, &OwnBuildAsked<'_>) -> anyhow::Result<Vec<(Package, OwnBuildOutput)>>
+    + Send
+    + Sync;
+
+/// What builds and runs the build scripts and proc macros of a workspace in place of cargo.
+/// A failure is the load's: cargo is not asked instead.
+#[derive(Clone)]
+pub struct OwnBuildScripts(pub std::sync::Arc<BuildScripts>);
+
+impl PartialEq for OwnBuildScripts {
+    fn eq(&self, other: &OwnBuildScripts) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for OwnBuildScripts {}
+
+impl fmt::Debug for OwnBuildScripts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OwnBuildScripts")
     }
 }
 
@@ -262,6 +310,8 @@ pub struct PackageData {
     pub readme: Option<Utf8PathBuf>,
     /// Rust version as given in the `Cargo.toml`
     pub rust_version: Option<semver::Version>,
+    /// `links` as given in the `Cargo.toml`: the native library its build script links.
+    pub links: Option<String>,
     /// The contents of [package.metadata.rust-analyzer]
     pub metadata: RustAnalyzerPackageMetaData,
     /// If this package is a member of the workspace, store all direct and transitive
@@ -426,6 +476,7 @@ impl CargoWorkspace {
                 readme,
                 rust_version,
                 dependencies: declared,
+                links,
                 ..
             } = meta_pkg;
             let id = Arc::new(id);
@@ -475,6 +526,7 @@ impl CargoWorkspace {
                 license_file,
                 readme,
                 rust_version,
+                links,
                 dependencies: Vec::new(),
                 features: features.into_iter().collect(),
                 active_features: Vec::new(),
@@ -997,7 +1049,7 @@ impl PackageData {
 
     /// `rust-version` as the manifest has it, which is what cargo hands to `env!`: cargo's
     /// metadata, and so `rust_version`, has `1.70` as `1.70.0`.
-    pub(crate) fn rust_version_as_written(&self) -> Option<String> {
+    pub fn rust_version_as_written(&self) -> Option<String> {
         let parsed = self.rust_version.as_ref()?.to_string();
         let written = |manifest: &Utf8Path, tables: &[&str]| {
             let manifest: toml::Table = std::fs::read_to_string(manifest).ok()?.parse().ok()?;
