@@ -3845,6 +3845,14 @@ impl<'db> Builder<'_, '_, 'db> {
 
     fn statement(&mut self, kind: &StatementKind, span: MirSpan) {
         kind.for_each_operand(&mut |operand| self.copy_bound(operand, span));
+        if let StatementKind::InlineAsm(asm) = kind {
+            for operand in asm.operands.iter() {
+                if let hir_ty::mir::AsmOperand::Sym(operand) = operand {
+                    self.asm_sym(operand, span);
+                }
+            }
+            return;
+        }
         let StatementKind::Assign(place, rvalue) = kind else { return };
         let projection = place.projection.as_slice();
         let dest = self.place_ty(place.local, projection).ty;
@@ -4083,6 +4091,24 @@ impl<'db> Builder<'_, '_, 'db> {
             let written = self.written(written);
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(self_ty, written, Variance::Invariant, at);
+        }
+    }
+
+    /// A function an inline `asm!` names by `sym`, with the generic arguments its path spells
+    /// out: rustc type checks the path as a value, with its user type annotation, so its where
+    /// clauses hold of the lifetimes written there (`sym dep::<'a, T>` needs `T: 'a`).
+    fn asm_sym(&mut self, operand: &Operand, span: MirSpan) {
+        let ty = match &operand.kind {
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            _ => return,
+        };
+        let ty = self.written(ty);
+        if let TyKind::FnDef(def, args) = ty.kind() {
+            self.callee_predicates(def.0, args, span);
+            for ty in args.types() {
+                self.well_formed(ty, At { category: Category::Boring, span }, 0);
+            }
         }
     }
 
