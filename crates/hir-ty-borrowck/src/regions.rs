@@ -1029,6 +1029,7 @@ impl<'db> Builder<'_, '_, 'db> {
             // The declared signature, as the parameters' local types have their lifetimes
             // erased.
             let mut self_free: Vec<Option<Ty<'db>>> = Vec::new();
+            let mut elided_input = None;
             let signature = match owner {
                 InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)) => {
                     let sig = self
@@ -1124,8 +1125,11 @@ impl<'db> Builder<'_, '_, 'db> {
                     // What an `impl Trait` it returns has for the lifetimes its parameters
                     // leave out.
                     if aligned {
-                        let regions =
-                            hir_ty::elided_lifetimes(self.ctx.db, function).regions(&errors);
+                        let elided = hir_ty::elided_lifetimes(self.ctx.db, function);
+                        let regions = elided.regions(&errors);
+                        if let Some(hir_ty::ElidedOutput::Elided(index)) = elided.output {
+                            elided_input = regions.get(index as usize).copied().flatten();
+                        }
                         output =
                             hir_ty::with_elided_regions(self.ctx.db, output, function, &regions);
                     }
@@ -1241,8 +1245,13 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
             }
             inputs.dedup();
+            // Where the written signature has the one lifetime the parameters leave out, that
+            // is it: rustc counts the lifetimes the parameters' types write or elide, not those
+            // of a type alias's expansion (`module: ModuleId` of
+            // `type ModuleId = ModuleIdLt<'static>`).
             let elided = match (inputs.as_slice(), self_region) {
                 (_, Some(region)) => Some(region),
+                _ if signature.is_some() && elided_input.is_some() => elided_input,
                 ([only], None) => Some(*only),
                 _ => None,
             };
