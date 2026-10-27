@@ -40,61 +40,82 @@ pub(super) fn check<'db>(
     out: &mut Vec<BorrowckDiagnostic>,
     moved: &mut Vec<UseOfMoved>,
 ) -> (usize, Vec<regions::Requirement<'db>>, Vec<usize>) {
-    let cfg = Cfg::new(body);
-    let moves = MoveData::gather(ctx, body, &cfg);
-    let rustc_moves = rustc_move_indices(ctx, body, &moves);
-    let upvar_sources = upvar_sources(ctx, body);
-    let flow = InitFlow::compute(body, &cfg, &moves);
-    let dominators = Dominators::new(&cfg);
-    let capture_temps = capture_temps(body);
-    let index_spans = index_spans(body);
-    let mut regions = regions::build(ctx, body, &cfg, requirements);
+    use crate::timings::{Phase, phase};
+    let (cfg, moves, rustc_moves, upvar_sources, flow, dominators, capture_temps, index_spans) =
+        phase(Phase::Moves, || {
+            let cfg = Cfg::new(body);
+            let moves = MoveData::gather(ctx, body, &cfg);
+            let rustc_moves = rustc_move_indices(ctx, body, &moves);
+            let upvar_sources = upvar_sources(ctx, body);
+            let flow = InitFlow::compute(body, &cfg, &moves);
+            let dominators = Dominators::new(&cfg);
+            let capture_temps = capture_temps(body);
+            let index_spans = index_spans(body);
+            (cfg, moves, rustc_moves, upvar_sources, flow, dominators, capture_temps, index_spans)
+        });
+    let mut regions = phase(Phase::Constraints, || regions::build(ctx, body, &cfg, requirements));
     let count = ctx.infcx.num_region_vars();
-    let live = liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count);
+    let live = phase(Phase::Liveness, || {
+        liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count)
+    });
     let live_loans_input = (ctx.mode == Mode::Polonius).then(|| live.clone());
     let again = (!regions.members.is_empty()).then(|| live.clone());
-    let mut values = regions::infer(&regions, count, cfg.points, live);
-    // rustc's member constraints: a region of a returned `impl Trait`'s hidden type that can
-    // be none of the lifetimes it captures is an error, reported only when the body has no
-    // other region error. One that can is made to outlive the least it can be, as rustc's
-    // `apply_member_constraint`, which what it must outlive in turn may not.
-    let chosen = member_choices(&regions, &values, count);
-    let unnamed = chosen.iter().any(|(_, it)| it.is_none());
-    let applied: Vec<regions::Outlives> = chosen
-        .iter()
-        .filter_map(|&(member, choice)| {
-            let choice = choice?;
-            (member != choice
-                && !values.universals_of(member).any(|it| regions.universals[it].0 == choice))
-            .then_some(regions::Outlives {
-                sup: member,
-                sub: choice,
-                location: None,
-                category: Category::Opaque,
-                span: MirSpan::Unknown,
-                from_closure: false,
+    let (values, unnamed) = phase(Phase::Infer, || {
+        let mut values = regions::infer(&regions, count, cfg.points, live);
+        // rustc's member constraints: a region of a returned `impl Trait`'s hidden type that can
+        // be none of the lifetimes it captures is an error, reported only when the body has no
+        // other region error. One that can is made to outlive the least it can be, as rustc's
+        // `apply_member_constraint`, which what it must outlive in turn may not.
+        let chosen = member_choices(&regions, &values, count);
+        let unnamed = chosen.iter().any(|(_, it)| it.is_none());
+        let applied: Vec<regions::Outlives> = chosen
+            .iter()
+            .filter_map(|&(member, choice)| {
+                let choice = choice?;
+                (member != choice
+                    && !values.universals_of(member).any(|it| regions.universals[it].0 == choice))
+                .then_some(regions::Outlives {
+                    sup: member,
+                    sub: choice,
+                    location: None,
+                    category: Category::Opaque,
+                    span: MirSpan::Unknown,
+                    from_closure: false,
+                })
             })
-        })
-        .collect();
-    if let Some(live) = again
-        && !applied.is_empty()
-    {
-        regions.outlives.extend(applied);
-        values = regions::infer(&regions, count, cfg.points, live);
-    }
+            .collect();
+        if let Some(live) = again
+            && !applied.is_empty()
+        {
+            regions.outlives.extend(applied);
+            values = regions::infer(&regions, count, cfg.points, live);
+        }
+        (values, unnamed)
+    });
     let unique = |assigned: LocalId, local: LocalId, projection: &[PlaceElem]| {
         capture_temps.contains_key(&assigned)
             && is_immutable_root(ctx, PlaceRef { local, projection })
     };
-    let mut loans = Loans::gather(ctx, body, &cfg, &regions, unique);
-    match live_loans_input {
+    let mut loans = phase(Phase::Loans, || Loans::gather(ctx, body, &cfg, &regions, unique));
+    phase(Phase::Scopes, || match live_loans_input {
         Some(liveness) => {
             let live = polonius::live_loans(ctx, body, &cfg, &regions, count, &liveness, &loans);
             loans.compute_polonius_scopes(body, &cfg, &live);
         }
         None => loans.compute_scopes(body, &cfg, &values),
-    }
-    let borrows_entry = loans.entry_sets(ctx, body, &cfg);
+    });
+    let borrows_entry = phase(Phase::EntrySets, || loans.entry_sets(ctx, body, &cfg));
+    crate::timings::count(|it| {
+        it.bodies += 1;
+        it.blocks += body.basic_blocks.len();
+        it.points += cfg.points;
+        it.locals += body.locals.len();
+        it.regions += count;
+        it.universals += regions.universals.len();
+        it.constraints += regions.outlives.len();
+        it.localized += regions.outlives.iter().filter(|it| it.location.is_some()).count();
+        it.loans += loans.loans.len();
+    });
     if crate::debugging(ctx.db, ctx.owner) {
         for (local, ty) in regions.local_tys.iter().enumerate() {
             eprintln!("_{local}: {ty:?}");
@@ -159,6 +180,7 @@ pub(super) fn check<'db>(
         used_mut: FxHashSet::default(),
         used_mut_upvars: Vec::new(),
     };
+    let walk = crate::timings::start();
     let guard_borrows = guard_borrows(ctx, body);
     let index_borrows = index_borrows(ctx, body);
     let tested_at = tested_at(ctx);
@@ -229,6 +251,8 @@ pub(super) fn check<'db>(
             checker.terminator(location, &terminator.kind, span);
         }
     }
+    crate::timings::finish(Phase::Walk, walk);
+    let errors = crate::timings::start();
     checker.report_move_errors();
     let before = checker.errors.len();
     checker.report_region_errors();
@@ -243,6 +267,7 @@ pub(super) fn check<'db>(
         }));
     }
     let unused_mut = checker.unused_mut();
+    crate::timings::finish(Phase::Errors, errors);
     out.extend(checker.errors.into_iter().flatten());
     for (_, (_, mut error)) in checker.move_reported {
         error.at = out.len();

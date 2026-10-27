@@ -17,6 +17,7 @@ mod moves;
 mod names;
 mod polonius;
 mod regions;
+pub mod timings;
 
 use std::sync::LazyLock;
 
@@ -97,7 +98,11 @@ pub struct BorrowckResult {
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
 #[salsa::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckResult {
-    let mode = mode();
+    borrowck_in_mode(db, def, mode())
+}
+
+/// [`borrowck`] in `mode`, not cached: for measuring the checker in each mode.
+pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         return result;
@@ -109,7 +114,9 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     }
     // rustc borrow checks no body its lowering or type check found an error in, which an
     // error of either taints: a cast that is not one, `..base` in a destructuring assignment.
-    let (_, source_map) = hir_def::expr_store::Body::with_source_map(db, def);
+    // The source map that stays the same while edits elsewhere move the body, so such an
+    // edit checks it again only if it changes it.
+    let source_map = hir_def::expr_store::Body::unmoved_source_map(db, def);
     if source_map.diagnostics().iter().any(|it| {
         !matches!(it, hir_def::expr_store::ExpressionStoreDiagnostics::InactiveCode { .. })
     }) {
@@ -130,7 +137,7 @@ pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckRe
     {
         return result;
     }
-    check_owner(db, owner, Some(def))
+    check_owner(db, owner, Some(def), mode)
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -148,7 +155,7 @@ pub fn borrowck_anon_const<'db>(
     if infer.has_type_mismatches() || infer.is_erroneous() {
         return BorrowckResult::default();
     }
-    check_owner(db, owner, None)
+    check_owner(db, owner, None, mode())
 }
 
 /// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
@@ -157,11 +164,11 @@ fn check_owner<'db>(
     db: &'db dyn HirDatabase,
     owner: InferBodyId<'db>,
     def: Option<DefWithBodyId>,
+    mode: Mode,
 ) -> BorrowckResult {
-    let mode = mode();
     let mut result = BorrowckResult::default();
     let infer = InferenceResult::of(db, owner);
-    let body = match db.mir_body(owner) {
+    let body = match timings::phase(timings::Phase::Mir, || db.mir_body(owner)) {
         Ok(body) => body,
         Err(error) => {
             result.skipped = Some(format!("{error:?}"));
@@ -193,7 +200,7 @@ fn check_owner<'db>(
             if !seen.insert(it) {
                 continue;
             }
-            let (lowered, what) = match it {
+            let (lowered, what) = timings::phase(timings::Phase::Mir, || match it {
                 Nested::Closure(closure) => (
                     db.mir_body_for_closure(closure)
                         .map(|body| (body, Some(closure.loc(db).expr), None)),
@@ -209,7 +216,7 @@ fn check_owner<'db>(
                         .map(|body| (body, None, Some(konst.loc(db).expr))),
                     "inline const",
                 ),
-            };
+            });
             match lowered {
                 Ok(it) => {
                     written.push(it.1.or(it.2));
@@ -231,7 +238,9 @@ fn check_owner<'db>(
     let mut move_errors: FxHashMap<Vec<usize>, (usize, (LocalId, Vec<PlaceElem>), usize)> =
         FxHashMap::default();
     for (body, closure, inline_const) in bodies.into_iter().rev() {
-        let mut ctx = Ctx::new(db, owner, store, infer, body, closure, mode);
+        let mut ctx = timings::phase(timings::Phase::Setup, || {
+            Ctx::new(db, owner, store, infer, body, closure, mode)
+        });
         ctx.inline_const = inline_const.is_some();
         if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
             return result;

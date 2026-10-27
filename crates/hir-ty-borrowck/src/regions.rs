@@ -766,7 +766,7 @@ struct Builder<'c, 'a, 'db> {
 
 fn synthesized(ctx: &Ctx<'_, '_>) -> FxHashSet<hir_def::hir::ExprId> {
     let InferBodyId::DefWithBodyId(def) = ctx.owner else { return FxHashSet::default() };
-    let (_, source_map) = hir_def::expr_store::Body::with_source_map(ctx.db, def);
+    let source_map = hir_def::expr_store::Body::unmoved_source_map(ctx.db, def);
     ctx.store
         .exprs()
         .map(|(expr, _)| expr)

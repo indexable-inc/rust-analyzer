@@ -74,7 +74,7 @@ impl<'db> Ctx<'_, 'db> {
     /// messages call temporaries.
     fn from_external_macro(&self, binding: BindingId) -> bool {
         let InferBodyId::DefWithBodyId(def) = self.owner else { return false };
-        let (_, source_map) = Body::with_source_map(self.db, def);
+        let source_map = Body::unmoved_source_map(self.db, def);
         let Some(&pat) = source_map.patterns_for_binding(binding).first() else { return false };
         let Ok(source) = source_map.pat_syntax(pat) else { return false };
         let Some(call) = source.file_id.macro_file() else { return false };
