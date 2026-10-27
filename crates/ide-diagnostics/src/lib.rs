@@ -32,11 +32,13 @@ mod handlers {
     pub(crate) mod array_pattern_without_fixed_length;
     pub(crate) mod await_outside_of_async;
     pub(crate) mod bad_rtn;
+    pub(crate) mod binary_operator_cannot_be_applied;
     pub(crate) mod borrowck;
     pub(crate) mod break_outside_of_loop;
     pub(crate) mod cannot_be_dereferenced;
     pub(crate) mod cannot_implicitly_deref_trait_object;
     pub(crate) mod cannot_index_into;
+    pub(crate) mod closure_kind_mismatch;
     pub(crate) mod duplicate_field;
     pub(crate) mod elided_lifetimes_in_path;
     pub(crate) mod expected_array_or_slice_pat;
@@ -486,6 +488,7 @@ fn semantic_diagnostics_asked(
             AnyDiagnostic::AwaitOutsideOfAsync(d) => handlers::await_outside_of_async::await_outside_of_async(&ctx, &d),
             AnyDiagnostic::CannotBeDereferenced(d) => handlers::cannot_be_dereferenced::cannot_be_dereferenced(&ctx, &d),
             AnyDiagnostic::UnaryOperatorCannotBeApplied(d) => handlers::unary_operator_cannot_be_applied::unary_operator_cannot_be_applied(&ctx, &d),
+            AnyDiagnostic::BinaryOperatorCannotBeApplied(d) => handlers::binary_operator_cannot_be_applied::binary_operator_cannot_be_applied(&ctx, &d),
             AnyDiagnostic::CannotImplicitlyDerefTraitObject(d) => handlers::cannot_implicitly_deref_trait_object::cannot_implicitly_deref_trait_object(&ctx, &d),
             AnyDiagnostic::CannotIndexInto(d) => handlers::cannot_index_into::cannot_index_into(&ctx, &d),
             AnyDiagnostic::CastToUnsized(d) => handlers::invalid_cast::cast_to_unsized(&ctx, &d),
@@ -591,6 +594,7 @@ fn semantic_diagnostics_asked(
                 handlers::union_pat_has_rest::union_pat_has_rest(&ctx, &d)
             }
             AnyDiagnostic::UnimplementedTrait(d) => handlers::unimplemented_trait::unimplemented_trait(&ctx, &d),
+            AnyDiagnostic::ClosureKindMismatch(d) => handlers::closure_kind_mismatch::closure_kind_mismatch(&ctx, &d),
             AnyDiagnostic::FruInDestructuringAssignment(d) => handlers::fru_in_destructuring_assignment::fru_in_destructuring_assignment(&ctx, &d),
             AnyDiagnostic::MissingBody(d) => handlers::missing_body::missing_body(&ctx, &d),
             AnyDiagnostic::BorrowckError(d) => handlers::borrowck::borrowck_error(&ctx, &d),

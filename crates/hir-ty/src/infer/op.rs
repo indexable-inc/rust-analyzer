@@ -251,7 +251,27 @@ impl<'db> InferenceContext<'db> {
                 method.sig.output()
             }
             Err(_errors) => {
-                // FIXME: Report diagnostic.
+                // Core implements the operator's trait for every builtin operation on scalars.
+                let is_builtin = !lhs_ty.is_ty_var()
+                    && !rhs_ty.is_ty_var()
+                    && is_builtin_binop(lhs_ty, rhs_ty, BinOpCategory::from(op));
+                let trait_exists = self.lang_item_for_bin_op(op).1.is_some();
+                // An expression with an error is typed as a fresh variable, so an unknown right
+                // side in a body with an error may be that error, which rustc does not report on.
+                let rhs_may_be_error = rhs_ty.is_ty_var() && self.tainted_by_errors();
+                if trait_exists
+                    && !is_builtin
+                    && !rhs_may_be_error
+                    && !lhs_ty.references_non_lt_error()
+                    && !rhs_ty.references_non_lt_error()
+                {
+                    self.push_diagnostic(InferenceDiagnostic::BinaryOperatorCannotBeApplied {
+                        expr,
+                        op,
+                        lhs: lhs_ty.store(),
+                        rhs: rhs_ty.store(),
+                    });
+                }
                 self.types.types.error
             }
         };

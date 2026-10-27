@@ -52,6 +52,10 @@ impl Diagnostics {
             .extend(diagnostics.into_iter().map(|diag| InferenceDiagnostic::TyDiagnostic { diag }));
     }
 
+    pub(super) fn any(&self, f: impl FnMut(&InferenceDiagnostic) -> bool) -> bool {
+        self.0.borrow().iter().any(f)
+    }
+
     pub(super) fn finish(self) -> ThinVec<InferenceDiagnostic> {
         self.0.into_inner()
     }

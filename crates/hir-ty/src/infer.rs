@@ -48,7 +48,9 @@ use hir_def::{
     VariantId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
-    hir::{BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp},
+    hir::{
+        BinaryOp, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp,
+    },
     lang_item::LangItems,
     layout::Integer,
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
@@ -430,6 +432,14 @@ pub enum InferenceDiagnostic {
         op: UnaryOp,
         found: StoredTy,
     },
+    BinaryOperatorCannotBeApplied {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        op: BinaryOp,
+        lhs: StoredTy,
+        rhs: StoredTy,
+    },
     MutRefInImmRefPat {
         #[type_visitable(ignore)]
         pat: PatId,
@@ -545,6 +555,24 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         missed_fields: Vec<LocalFieldId>,
     },
+}
+
+impl InferenceDiagnostic {
+    /// Whether this is an error that leaves the body tainted by errors, like rustc's
+    /// `InferCtxt::tainted_by_errors`: once it is, "type annotations needed" is not reported.
+    pub(crate) fn taints_body(&self) -> bool {
+        let is_lint = |diag: &PathLoweringDiagnostic| {
+            matches!(diag, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
+        };
+        match self {
+            InferenceDiagnostic::TypeMustBeKnown { .. } => false,
+            InferenceDiagnostic::PathDiagnostic { diag, .. }
+            | InferenceDiagnostic::TyDiagnostic {
+                diag: TyLoweringDiagnostic::PathDiagnostic { diag, .. },
+            } => !is_lint(diag),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -1959,6 +1987,11 @@ impl<'db> InferenceContext<'db> {
         self.diagnostics.push(diagnostic);
     }
 
+    /// Whether an error has been reported in this body so far.
+    fn tainted_by_errors(&self) -> bool {
+        self.diagnostics.any(InferenceDiagnostic::taints_body) || self.table.has_trait_errors()
+    }
+
     fn record_deferred_call_resolution(
         &mut self,
         closure_def_id: ExprId,
@@ -2244,7 +2277,7 @@ impl<'db> InferenceContext<'db> {
         node: ExprOrPatIdPacked,
         ty: Ty<'db>,
     ) -> Ty<'db> {
-        if self.vars_emitted_type_must_be_known_for.insert(ty.into()) {
+        if self.vars_emitted_type_must_be_known_for.insert(ty.into()) && !self.tainted_by_errors() {
             self.push_diagnostic(InferenceDiagnostic::TypeMustBeKnown {
                 at_point: node.into(),
                 top_term: None,

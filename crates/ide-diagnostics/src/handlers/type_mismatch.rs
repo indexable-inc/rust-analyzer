@@ -1957,7 +1957,6 @@ pub fn foo<T: Foo>(_: T) -> (T::Out,) { loop { } }
 
 fn main() {
     let _x = foo(2);
-     // ^^ error: type annotations needed
           // ^^^ error: the trait bound `i32: Foo` is not satisfied
 }
 "#,

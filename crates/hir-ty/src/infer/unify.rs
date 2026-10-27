@@ -537,11 +537,22 @@ impl<'db> InferenceTable<'db> {
         self.resolve_vars_with_obligations(ty)
     }
 
+    /// Whether a trait error that `emit_trait_errors` reports has been found so far.
+    pub(super) fn has_trait_errors(&self) -> bool {
+        self.trait_errors.iter().any(|error| {
+            SolverDiagnostic::from_fulfillment_error(
+                &self.infer_ctxt,
+                &error.clone().into_fulfillment_error(&self.infer_ctxt),
+            )
+            .is_some()
+        })
+    }
+
     fn emit_trait_errors(&mut self, diagnostics: &mut ThinVec<InferenceDiagnostic>) {
         diagnostics.extend(std::mem::take(&mut self.trait_errors).into_iter().filter_map(
             |error| {
                 let error = error.into_fulfillment_error(&self.infer_ctxt);
-                SolverDiagnostic::from_fulfillment_error(&error)
+                SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, &error)
                     .map(InferenceDiagnostic::SolverDiagnostic)
             },
         ));
@@ -580,6 +591,9 @@ pub(super) mod resolve_completely {
     pub(crate) struct WriteBackCtxt<'db> {
         table: InferenceTable<'db>,
         diagnostics: ThinVec<InferenceDiagnostic>,
+        /// "type annotations needed" for the variables left unresolved, reported only if the
+        /// body has no other error.
+        unresolved_vars: ThinVec<InferenceDiagnostic>,
         has_errors: bool,
         spans_emitted_type_must_be_known_for: FxHashSet<Span>,
         types: &'db DefaultAny<'db>,
@@ -613,6 +627,7 @@ pub(super) mod resolve_completely {
                 types: table.interner().default_types(),
                 table,
                 diagnostics,
+                unresolved_vars: ThinVec::new(),
                 has_errors: false,
                 spans_emitted_type_must_be_known_for,
             }
@@ -646,6 +661,7 @@ pub(super) mod resolve_completely {
             self.table.emit_trait_errors(&mut self.diagnostics);
 
             // Ignore diagnostics made from resolving diagnostics.
+            let unresolved_vars = std::mem::take(&mut self.unresolved_vars);
             let mut diagnostics = std::mem::take(&mut self.diagnostics);
             diagnostics.retain_mut(|diagnostic| {
                 self.resolve_completely(diagnostic);
@@ -665,6 +681,9 @@ pub(super) mod resolve_completely {
                     true
                 }
             });
+            if !diagnostics.iter().any(InferenceDiagnostic::taints_body) {
+                diagnostics.extend(unresolved_vars);
+            }
             diagnostics.shrink_to_fit();
 
             (diagnostics, has_errors)
@@ -691,7 +710,7 @@ pub(super) mod resolve_completely {
 
             // We have to be careful not to insert infer vars here, as we won't resolve this new diagnostic.
             let top_term = self.top_term.fold_with(&mut ReplaceInferWithError::new(self.cx()));
-            self.ctx.diagnostics.push(InferenceDiagnostic::TypeMustBeKnown {
+            self.ctx.unresolved_vars.push(InferenceDiagnostic::TypeMustBeKnown {
                 at_point: span,
                 top_term: Some(GenericArg::from(top_term).store()),
             });
