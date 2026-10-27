@@ -6415,7 +6415,10 @@ enum Proven {
     Here,
     /// It does not hold; whether that is a true error.
     Error(bool),
-    Gives { pairs: Vec<(StoredRegion, StoredRegion)>, obligations: Vec<(StoredTy, StoredRegion)> },
+    Gives {
+        pairs: Vec<(StoredRegion, StoredRegion)>,
+        obligations: Vec<(StoredTy, StoredRegion)>,
+    },
 }
 
 /// `a <= b` for each of `constraints`: `b` outlives `a`.
@@ -6496,7 +6499,10 @@ fn prove_query(
     }
     Proven::Gives {
         pairs: pairs.into_iter().map(|(a, b)| (a.store(), b.store())).collect(),
-        obligations: obligations.into_iter().map(|(ty, region)| (ty.store(), region.store())).collect(),
+        obligations: obligations
+            .into_iter()
+            .map(|(ty, region)| (ty.store(), region.store()))
+            .collect(),
     }
 }
 
