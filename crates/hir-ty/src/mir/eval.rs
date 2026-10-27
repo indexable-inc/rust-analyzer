@@ -24,8 +24,8 @@ use la_arena::ArenaMap;
 use macros::GenericTypeVisitable;
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_apfloat::{
-    Float,
-    ieee::{Half as f16, Quad as f128},
+    Float, FloatConvert,
+    ieee::{Double, Half as f16, Quad as f128, Single},
 };
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -87,6 +87,30 @@ macro_rules! from_bytes {
     };
 }
 use from_bytes;
+
+/// A float as an integer of `bits` bits, as `as` makes it and rustc's evaluation computes it
+/// with rustc_apfloat: rounded toward zero, saturating, and NaN as zero.
+fn apfloat_to_int<F: Float>(value: F, bits: usize, signed: bool) -> u128 {
+    if signed { value.to_i128(bits).value as u128 } else { value.to_u128(bits).value }
+}
+
+/// The bytes of a float converted to the float type `to` as rustc's evaluation does: rounded
+/// to nearest, ties to even, and a NaN made the positive quiet NaN without a payload.
+fn convert_apfloat<F>(value: F, to: rustc_type_ir::FloatTy) -> Vec<u8>
+where
+    F: FloatConvert<f16> + FloatConvert<Single> + FloatConvert<Double> + FloatConvert<f128>,
+{
+    fn to_float<F: FloatConvert<T>, T: Float>(value: F, bytes: usize) -> Vec<u8> {
+        let converted = if value.is_nan() { T::NAN } else { value.convert(&mut false).value };
+        converted.to_bits().to_le_bytes()[0..bytes].to_vec()
+    }
+    match to {
+        rustc_type_ir::FloatTy::F16 => to_float::<F, f16>(value, 2),
+        rustc_type_ir::FloatTy::F32 => to_float::<F, Single>(value, 4),
+        rustc_type_ir::FloatTy::F64 => to_float::<F, Double>(value, 8),
+        rustc_type_ir::FloatTy::F128 => to_float::<F, f128>(value, 16),
+    }
+}
 
 macro_rules! not_supported {
     ($it: expr) => {
@@ -1578,6 +1602,28 @@ impl<'db> Evaluator<'db> {
                         not_supported!("invalid float to int cast");
                     };
                     let value = self.eval_operand(operand, locals)?.get(self)?;
+                    let is_signed = matches!(target_ty.as_ref().kind(), TyKind::Int(_));
+                    let dest_size = self.size_of_sized(
+                        target_ty.as_ref(),
+                        locals,
+                        "destination of float to int cast",
+                    )?;
+                    let soft = match ty {
+                        rustc_type_ir::FloatTy::F16 => Some(apfloat_to_int(
+                            from_bytes!(f16, u16, value),
+                            dest_size * 8,
+                            is_signed,
+                        )),
+                        rustc_type_ir::FloatTy::F128 => Some(apfloat_to_int(
+                            from_bytes!(f128, u128, value),
+                            dest_size * 8,
+                            is_signed,
+                        )),
+                        _ => None,
+                    };
+                    if let Some(bits) = soft {
+                        return Ok(Owned(bits.to_le_bytes()[0..dest_size].to_vec()));
+                    }
                     let value = match ty {
                         rustc_type_ir::FloatTy::F32 => {
                             let value = value.try_into().unwrap();
@@ -1588,15 +1634,9 @@ impl<'db> Evaluator<'db> {
                             f64::from_le_bytes(value)
                         }
                         rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
-                            not_supported!("unstable floating point type f16 and f128");
+                            unreachable!("converted above")
                         }
                     };
-                    let is_signed = matches!(target_ty.as_ref().kind(), TyKind::Int(_));
-                    let dest_size = self.size_of_sized(
-                        target_ty.as_ref(),
-                        locals,
-                        "destination of float to int cast",
-                    )?;
                     let dest_bits = dest_size * 8;
                     let (max, min) = if dest_bits == 128 {
                         (i128::MAX, i128::MIN)
@@ -1619,6 +1659,18 @@ impl<'db> Evaluator<'db> {
                         not_supported!("invalid float to int cast");
                     };
                     let value = self.eval_operand(operand, locals)?.get(self)?;
+                    let TyKind::Float(target_ty) = target_ty.as_ref().kind() else {
+                        not_supported!("invalid float to float cast");
+                    };
+                    use rustc_type_ir::FloatTy::{F16, F32, F64, F128};
+                    if matches!(ty, F16 | F128) || matches!(target_ty, F16 | F128) {
+                        return Ok(Owned(match ty {
+                            F16 => convert_apfloat(from_bytes!(f16, u16, value), target_ty),
+                            F32 => convert_apfloat(from_bytes!(Single, u32, value), target_ty),
+                            F64 => convert_apfloat(from_bytes!(Double, u64, value), target_ty),
+                            F128 => convert_apfloat(from_bytes!(f128, u128, value), target_ty),
+                        }));
+                    }
                     let value = match ty {
                         rustc_type_ir::FloatTy::F32 => {
                             let value = value.try_into().unwrap();
@@ -1629,17 +1681,14 @@ impl<'db> Evaluator<'db> {
                             f64::from_le_bytes(value)
                         }
                         rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
-                            not_supported!("unstable floating point type f16 and f128");
+                            unreachable!("converted above")
                         }
-                    };
-                    let TyKind::Float(target_ty) = target_ty.as_ref().kind() else {
-                        not_supported!("invalid float to float cast");
                     };
                     match target_ty {
                         rustc_type_ir::FloatTy::F32 => Owned((value as f32).to_le_bytes().to_vec()),
                         rustc_type_ir::FloatTy::F64 => Owned(value.to_le_bytes().to_vec()),
                         rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
-                            not_supported!("unstable floating point type f16 and f128");
+                            unreachable!("converted above")
                         }
                     }
                 }
@@ -1656,11 +1705,23 @@ impl<'db> Evaluator<'db> {
                         TyKind::Int(_) => (value as f32, value as f64),
                         _ => (value as u128 as f32, value as u128 as f64),
                     };
+                    // rustc_apfloat rounds to nearest, ties to even, as rustc's evaluation does.
+                    fn of<F: Float>(value: i128, signed: bool) -> u128 {
+                        let float = match signed {
+                            true => F::from_i128(value),
+                            false => F::from_u128(value as u128),
+                        };
+                        float.value.to_bits()
+                    }
+                    let signed = matches!(current_ty.kind(), TyKind::Int(_));
                     match target_ty {
                         rustc_type_ir::FloatTy::F32 => Owned(single.to_le_bytes().to_vec()),
                         rustc_type_ir::FloatTy::F64 => Owned(double.to_le_bytes().to_vec()),
-                        rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
-                            not_supported!("unstable floating point type f16 and f128");
+                        rustc_type_ir::FloatTy::F16 => {
+                            Owned((of::<f16>(value, signed) as u16).to_le_bytes().to_vec())
+                        }
+                        rustc_type_ir::FloatTy::F128 => {
+                            Owned(of::<f128>(value, signed).to_le_bytes().to_vec())
                         }
                     }
                 }
