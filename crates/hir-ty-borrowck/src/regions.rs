@@ -3701,12 +3701,18 @@ impl<'db> Builder<'_, '_, 'db> {
         span: MirSpan,
     ) {
         let projection = place.projection.as_slice();
+        // rustc's user type annotation on a cast is the type written, its `_`s inference
+        // variables: `ptr as _` relates no lifetime, though `_` is inferred `'static` from
+        // where the value goes.
         if let MirSpan::ExprId(expr) = span
-            && let hir_def::hir::Expr::Cast { .. } = self.ctx.store[expr]
+            && let hir_def::hir::Expr::Cast { type_ref, .. } = self.ctx.store[expr]
             && matches!(rvalue, Rvalue::Use(_) | Rvalue::Cast(..))
-            && let Some(written) = self.ctx.infer.type_of_expr.get(expr)
+            && let Some(inferred) = self.ctx.infer.type_of_expr.get(expr)
         {
-            let written = self.written(written.as_ref());
+            let inferred = inferred.as_ref();
+            let lowered = self.lower_annotation(type_ref, span);
+            let ty = self.zip_annotation(lowered, inferred, &mut FxHashMap::default(), 0);
+            let written = self.written(ty.unwrap_or(inferred));
             let at = At { category: Category::TypeAnnotation, span };
             self.relate(dest, written, Variance::Invariant, at);
         }
