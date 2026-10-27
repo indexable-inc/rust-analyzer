@@ -4,7 +4,7 @@
 //! live, forwards for a covariant one, backwards for a contravariant one and both ways for an
 //! invariant one. A loan is in scope until the first point it is not live at.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use rustc_type_ir::{Variance, inherent::IntoKind};
 use smallvec::SmallVec;
 
@@ -15,8 +15,8 @@ use hir_ty::{
 
 use super::{
     Ctx,
-    bitset::BitSet,
     cfg::{Cfg, Location, index},
+    intervals::IntervalSet,
     loans::Loans,
     regions::{Regions, Rv, rv_of},
 };
@@ -35,9 +35,9 @@ pub(super) fn live_loans<'db>(
     cfg: &Cfg,
     regions: &Regions<'db>,
     count: usize,
-    liveness: &[BitSet],
+    liveness: &[IntervalSet],
     loans: &Loans,
-) -> Vec<BitSet> {
+) -> Vec<IntervalSet> {
     let mut directions: Vec<Option<Direction>> = vec![None; count];
     for &ty in &regions.local_tys {
         record_variances(ctx, ty, Variance::Covariant, &mut directions);
@@ -68,69 +68,109 @@ pub(super) fn live_loans<'db>(
             directions.get(rv).copied().flatten().unwrap_or(Direction::Both)
         }
     };
-    let is_live = |rv: Rv, point: usize| {
-        universal.contains(&rv) || liveness.get(rv).is_some_and(|it| it.contains(point))
+    // The points each region is live at; a universal region is live everywhere.
+    let all = {
+        let mut all = IntervalSet::default();
+        if cfg.points > 0 {
+            all.insert_range(0, cfg.points - 1);
+        }
+        all
     };
-    let mut localized: FxHashMap<(Rv, usize), SmallVec<[Rv; 4]>> = FxHashMap::default();
+    let empty = IntervalSet::default();
+    let live_at =
+        |rv: Rv| if universal.contains(&rv) { &all } else { liveness.get(rv).unwrap_or(&empty) };
+    // The localized edges out of each region, by point.
+    let mut localized: Vec<Vec<(usize, Rv)>> = vec![Vec::new(); count];
     let mut logical: Vec<SmallVec<[Rv; 4]>> = vec![SmallVec::new(); count];
     for constraint in &regions.outlives {
         if constraint.sup >= count || constraint.sub >= count {
             continue;
         }
-        let edges = match constraint.location {
-            Some(location) => localized.entry((constraint.sup, cfg.point(location))).or_default(),
-            None => &mut logical[constraint.sup],
-        };
-        if !edges.contains(&constraint.sub) {
-            edges.push(constraint.sub);
+        match constraint.location {
+            Some(location) => localized[constraint.sup].push((cfg.point(location), constraint.sub)),
+            None => {
+                if !logical[constraint.sup].contains(&constraint.sub) {
+                    logical[constraint.sup].push(constraint.sub);
+                }
+            }
         }
     }
+    for edges in &mut localized {
+        edges.sort_unstable();
+        edges.dedup();
+    }
+    let last_of = |block| cfg.point(Location {
+        block,
+        statement: body.basic_blocks[block].statements.len(),
+    });
 
+    // The graph's nodes are a region at a point, but it is walked a run of points of one block
+    // at a time: what reaches a region at a run of points reaches its subregions at all of
+    // them, and a region live at a run of points flows along it.
     let mut live = Vec::with_capacity(loans.loans.len());
-    let mut visited: FxHashSet<(Rv, usize)> = FxHashSet::default();
-    let mut stack: Vec<(Rv, usize)> = Vec::new();
+    let mut visited: Vec<IntervalSet> = vec![IntervalSet::default(); count];
+    let mut touched: Vec<Rv> = Vec::new();
+    let mut stack: Vec<(Rv, usize, usize)> = Vec::new();
     for loan in &loans.loans {
-        let mut points = BitSet::new(cfg.points);
-        visited.clear();
-        let start = (loan.region, cfg.point(loan.location));
-        visited.insert(start);
-        stack.push(start);
-        while let Some((region, point)) = stack.pop() {
-            let live_here = is_live(region, point);
-            if live_here {
-                points.insert(point);
+        let mut points = IntervalSet::default();
+        for rv in touched.drain(..) {
+            visited[rv].clear();
+        }
+        let issued = cfg.point(loan.location);
+        stack.push((loan.region, issued, issued));
+        while let Some((region, start, end)) = stack.pop() {
+            if region >= count {
+                continue;
             }
-            let mut found = |node: (Rv, usize)| {
-                if visited.insert(node) {
-                    stack.push(node);
-                }
-            };
-            for &sub in localized.get(&(region, point)).into_iter().flatten() {
-                found((sub, point));
+            if visited[region].is_empty() {
+                touched.push(region);
             }
-            let location = cfg.location(point);
+            let block = cfg.location(start).block;
+            let (first, last) = (cfg.point(Location { block, statement: 0 }), last_of(block));
+            let region_live = live_at(region);
             let direction = direction(region);
-            if matches!(direction, Direction::Forward | Direction::Both) {
-                if location.statement < body.basic_blocks[location.block].statements.len() {
-                    if is_live(region, point + 1) {
-                        found((region, point + 1));
-                    }
-                } else {
-                    for &successor in &cfg.successors[index(location.block)] {
-                        let next = cfg.point(Location { block: successor, statement: 0 });
-                        if is_live(region, next) {
-                            found((region, next));
+            for (start, end) in visited[region].insert_new(start, end) {
+                for &sub in &logical[region] {
+                    stack.push((sub, start, end));
+                }
+                let edges = &localized[region];
+                let from = edges.partition_point(|&(point, _)| point < start);
+                for &(point, sub) in edges[from..].iter().take_while(|&&(point, _)| point <= end) {
+                    stack.push((sub, point, point));
+                }
+                for (s, e) in region_live.runs_in(start, end) {
+                    points.insert_range(s, e);
+                    if matches!(direction, Direction::Backward | Direction::Both) {
+                        if s > first {
+                            stack.push((region, s - 1, e - 1));
+                        } else {
+                            if e > s {
+                                stack.push((region, s, e - 1));
+                            }
+                            let location = Location { block, statement: 0 };
+                            for previous in cfg.predecessor_locations(body, location) {
+                                let point = cfg.point(previous);
+                                stack.push((region, point, point));
+                            }
                         }
                     }
                 }
-            }
-            if matches!(direction, Direction::Backward | Direction::Both) && live_here {
-                for previous in cfg.predecessor_locations(body, location) {
-                    found((region, cfg.point(previous)));
+                if matches!(direction, Direction::Forward | Direction::Both) {
+                    // Past the end of the run, the region flows on while it is live.
+                    let mut follow = |next: usize, last: usize| {
+                        if region_live.contains(next) {
+                            let to = region_live.first_absent_in(next, last).map_or(last, |it| it - 1);
+                            stack.push((region, next, to));
+                        }
+                    };
+                    if end < last {
+                        follow(end + 1, last);
+                    } else {
+                        for &successor in &cfg.successors[index(block)] {
+                            follow(cfg.point(Location { block: successor, statement: 0 }), last_of(successor));
+                        }
+                    }
                 }
-            }
-            for &sub in &logical[region] {
-                found((sub, point));
             }
         }
         live.push(points);

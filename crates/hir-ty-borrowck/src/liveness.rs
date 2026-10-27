@@ -24,6 +24,7 @@ use super::{
     Ctx,
     bitset::BitSet,
     cfg::{Cfg, Location, index},
+    intervals::IntervalSet,
     moves::{InitKind, MoveData},
     regions::{Regions, Rv, regions_of, rv_of},
 };
@@ -167,16 +168,15 @@ fn effects_at<'db>(
     effects
 }
 
-/// Which locals are live at the start of each point, by a backward analysis where `uses`
-/// says which locals a point uses; `visit` sees each point once.
-fn live_points(
+/// The points each local is live at, by a backward analysis where `uses` says which locals a
+/// point uses, as ranges: what liveness gives a region is the points of the locals it is in.
+fn live_ranges(
     body: &MirBody<'_>,
     cfg: &Cfg,
     effects: &[Effects],
     uses: impl Fn(&Effects) -> &[LocalId],
     edge: impl Fn(BasicBlockId, BasicBlockId, &mut BitSet),
-    mut visit: impl FnMut(usize, &BitSet),
-) {
+) -> Vec<IntervalSet> {
     let locals = body.locals.len();
     let blocks = body.basic_blocks.len();
     let mut entry = vec![BitSet::new(locals); blocks];
@@ -207,6 +207,9 @@ fn live_points(
             }
         }
     }
+    let mut ranges = vec![IntervalSet::default(); locals];
+    // Where the run of points each live local is live at ends, walking backwards.
+    let mut run_end = vec![0usize; locals];
     for &block in &cfg.order {
         let mut live = BitSet::new(locals);
         for &successor in &cfg.successors[index(block)] {
@@ -216,28 +219,36 @@ fn live_points(
         }
         let start = cfg.block_start(block);
         let end = cfg.block_end(body, block);
+        for local in live.iter() {
+            run_end[local] = end;
+        }
         for point in (start..=end).rev() {
             let it = &effects[point];
-            // A local is live where it is assigned if it is live after, as rustc's
-            // `compute_use_live_points_for` has it.
-            let mut assigned: SmallVec<[usize; 2]> = SmallVec::new();
+            // A local is live at a point that uses it, and where it is assigned if it is live
+            // after, as rustc's `compute_use_live_points_for` has it; it is not live before
+            // the assignment.
+            for local in uses(it) {
+                let local = local.into_raw().into_u32() as usize;
+                if live.insert(local) {
+                    run_end[local] = point;
+                }
+            }
             for local in &it.defs {
                 let local = local.into_raw().into_u32() as usize;
-                if live.contains(local) {
-                    assigned.push(local);
+                if uses(it).iter().any(|it| it.into_raw().into_u32() as usize == local) {
+                    continue;
                 }
-                live.remove(local);
-            }
-            for local in uses(it) {
-                live.insert(local.into_raw().into_u32() as usize);
-            }
-            assigned.retain(|it| live.insert(*it));
-            visit(point, &live);
-            for local in assigned {
-                live.remove(local);
+                if live.contains(local) {
+                    live.remove(local);
+                    ranges[local].insert_range(point, run_end[local]);
+                }
             }
         }
+        for local in live.iter() {
+            ranges[local].insert_range(start, run_end[local]);
+        }
     }
+    ranges
 }
 
 /// The value of each region from liveness alone.
@@ -248,9 +259,8 @@ pub(super) fn region_liveness<'db>(
     moves: &MoveData,
     regions: &Regions<'db>,
     count: usize,
-) -> Vec<BitSet> {
-    let size = cfg.points + regions.universals.len();
-    let mut values = vec![BitSet::new(size); count];
+) -> Vec<IntervalSet> {
+    let mut values = vec![IntervalSet::default(); count];
     let mut effects: Vec<Effects> = (0..cfg.points).map(|_| Effects::default()).collect();
     let statement_values = statement_values(ctx);
     for &block in &cfg.order {
@@ -275,27 +285,18 @@ pub(super) fn region_liveness<'db>(
             out
         })
         .collect();
-    let mut use_live: Vec<BitSet> = vec![BitSet::new(0); cfg.points];
-    live_points(
-        body,
-        cfg,
-        &effects,
-        |it| &it.uses,
-        |_, _, _| (),
-        |point, live| {
-            use_live[point] = live.clone();
-            for local in live.iter() {
-                for &rv in &local_regions[local] {
-                    if rv < count {
-                        values[rv].insert(point);
-                    }
-                }
+    let use_live = live_ranges(body, cfg, &effects, |it| &it.uses, |_, _, _| ());
+    for (local, points) in use_live.iter().enumerate() {
+        if points.is_empty() {
+            continue;
+        }
+        for &rv in &local_regions[local] {
+            if rv < count {
+                values[rv].union(points);
             }
-        },
-    );
-    let mut drop_regions: FxHashMap<usize, Vec<Rv>> = FxHashMap::default();
-    let mut cache = FxHashMap::default();
-    live_points(
+        }
+    }
+    let mut drop_live = live_ranges(
         body,
         cfg,
         &effects,
@@ -303,31 +304,42 @@ pub(super) fn region_liveness<'db>(
         // Dropping a local makes it live back to where it may be initialized only, as
         // rustc's `compute_drop_live_points_for` has it.
         |block, successor, live| live.intersect(init_at_exit.at(block, successor)),
-        |point, live| {
-            for local in live.iter() {
-                if use_live[point].contains(local) {
-                    continue;
-                }
-                let rvs = drop_regions.entry(local).or_insert_with(|| {
-                    let mut out = Vec::new();
-                    drop_components(
-                        ctx,
-                        regions,
-                        regions.local_tys[local],
-                        &mut out,
-                        &mut cache,
-                        0,
-                    );
-                    out
-                });
-                for &rv in rvs.iter() {
-                    if rv < count {
-                        values[rv].insert(point);
-                    }
-                }
-            }
-        },
     );
+    // Where a local is use live, what dropping it uses is live already.
+    let mut dropped = Vec::new();
+    for (local, points) in drop_live.iter_mut().enumerate() {
+        points.subtract(&use_live[local]);
+        if !points.is_empty() {
+            dropped.push(local);
+        }
+    }
+    if dropped.is_empty() {
+        return values;
+    }
+    // What dropping each local uses, found in the order a walk of the blocks in reverse
+    // postorder, each from its end, first meets the local at a point it is drop live at only:
+    // finding it may normalize, which makes region variables.
+    let mut rank = vec![usize::MAX; cfg.points];
+    let mut next = 0;
+    for &block in &cfg.order {
+        for point in (cfg.block_start(block)..=cfg.block_end(body, block)).rev() {
+            rank[point] = next;
+            next += 1;
+        }
+    }
+    dropped.sort_by_key(|&local| {
+        (drop_live[local].iter().map(|point| rank[point]).min().unwrap_or(usize::MAX), local)
+    });
+    let mut cache = FxHashMap::default();
+    for local in dropped {
+        let mut rvs = Vec::new();
+        drop_components(ctx, regions, regions.local_tys[local], &mut rvs, &mut cache, 0);
+        for &rv in rvs.iter() {
+            if rv < count {
+                values[rv].union(&drop_live[local]);
+            }
+        }
+    }
     values
 }
 

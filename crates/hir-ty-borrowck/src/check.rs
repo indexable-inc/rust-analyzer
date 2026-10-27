@@ -5,6 +5,7 @@
 
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use rustc_type_ir::{
     ClauseKind, OutlivesPredicate, RegionKind,
     inherent::{GenericArgs as _, IntoKind, Region as _},
@@ -132,7 +133,7 @@ pub(super) fn check<'db>(
         }
         for loan in &loans.loans {
             let points: Vec<usize> =
-                values.values[loan.region].iter().filter(|&it| it < cfg.points).collect();
+                values.points_of(loan.region).iter().filter(|&it| it < cfg.points).collect();
             eprintln!(
                 "loan {:?} {:?} at {:?} region {} points {points:?}",
                 loan.local, loan.projection, loan.location, loan.region
@@ -1316,7 +1317,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         access: Access,
         depth: Depth,
     ) -> bool {
-        let in_scope: Vec<usize> = self.in_scope.iter().collect();
+        // Only a loan of the place's local can conflict with it; `of_local` lists them in the
+        // order they were made, the order of `in_scope`.
+        let Some(of_local) = self.loans.of_local.get(&place.local) else { return false };
+        let in_scope: SmallVec<[usize; 4]> =
+            of_local.iter().copied().filter(|&id| self.in_scope.contains(id)).collect();
         for id in in_scope {
             let loan = &self.loans.loans[id];
             if !places_conflict(

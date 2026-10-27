@@ -11,6 +11,8 @@ extern crate ra_ap_rustc_type_ir as rustc_type_ir;
 mod bitset;
 mod cfg;
 mod check;
+mod inference;
+mod intervals;
 mod liveness;
 mod loans;
 mod moves;

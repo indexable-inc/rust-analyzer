@@ -32,6 +32,7 @@ use hir_ty::{
     next_solver::{Clause, ConstKind, GenericArgKind, GenericArgs, Region, Ty, TyKind},
 };
 
+pub(super) use super::inference::{RegionValues, infer};
 use super::{
     Ctx,
     bitset::BitSet,
@@ -6537,64 +6538,6 @@ fn args_components<'db>(args: GenericArgs<'db>, regions: &mut Vec<Rv>, params: &
             GenericArgKind::Const(_) => (),
         }
     }
-}
-
-/// The points each region holds at, and past them the universal regions it outlives.
-pub(super) struct RegionValues {
-    pub(super) points: usize,
-    pub(super) values: Vec<BitSet>,
-}
-
-impl RegionValues {
-    pub(super) fn contains_point(&self, rv: Rv, point: usize) -> bool {
-        self.values[rv].contains(point)
-    }
-
-    pub(super) fn universals_of(&self, rv: Rv) -> impl Iterator<Item = usize> + '_ {
-        let points = self.points;
-        self.values[rv].iter().filter(move |&it| it >= points).map(move |it| it - points)
-    }
-}
-
-/// Region inference: the values liveness gives grown along the outlives constraints until
-/// each region holds wherever a region it outlives does.
-pub(super) fn infer(
-    regions: &Regions<'_>,
-    count: usize,
-    points: usize,
-    mut values: Vec<BitSet>,
-) -> RegionValues {
-    let size = points + regions.universals.len();
-    values.resize(count, BitSet::new(size));
-    for (index, &(rv, _)) in regions.universals.iter().enumerate() {
-        let value = &mut values[rv];
-        for point in 0..points {
-            value.insert(point);
-        }
-        value.insert(points + index);
-    }
-    let mut successors: Vec<Vec<Rv>> = vec![Vec::new(); count];
-    for constraint in &regions.outlives {
-        if constraint.sup < count && constraint.sub < count {
-            successors[constraint.sub].push(constraint.sup);
-        }
-    }
-    let mut queued = vec![true; count];
-    let mut work: Vec<Rv> = (0..count).collect();
-    while let Some(sub) = work.pop() {
-        queued[sub] = false;
-        if successors[sub].is_empty() {
-            continue;
-        }
-        let value = values[sub].clone();
-        for &sup in &successors[sub] {
-            if values[sup].union(&value) && !queued[sup] {
-                queued[sup] = true;
-                work.push(sup);
-            }
-        }
-    }
-    RegionValues { points, values }
 }
 
 /// The constraints from `from` down to `to`, the shortest way, for the error that blames one

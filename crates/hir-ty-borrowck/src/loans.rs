@@ -9,11 +9,12 @@ use hir_def::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
+use smallvec::SmallVec;
 
 use hir_ty::{
     InferBodyId,
     mir::{
-        BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, OperandKind, PlaceElem,
+        BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, OperandKind, PlaceElem,
         ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     },
     next_solver::TyKind,
@@ -23,6 +24,7 @@ use super::{
     Ctx,
     bitset::BitSet,
     cfg::{Cfg, Location, index},
+    intervals::IntervalSet,
     regions::{RegionValues, Regions, Rv},
 };
 
@@ -690,18 +692,13 @@ impl Loans {
     /// Where each loan goes out of scope: the first points past it its region does not hold
     /// at, as rustc's `OutOfScopePrecomputer`.
     pub(super) fn compute_scopes(&mut self, body: &MirBody<'_>, cfg: &Cfg, values: &RegionValues) {
-        for (id, loan) in self.loans.iter().enumerate() {
-            let mut seen = BitSet::new(cfg.points);
-            let mut work = successors_of(body, cfg, loan.location);
-            while let Some(point) = work.pop() {
-                if !seen.insert(point) {
-                    continue;
-                }
-                if !values.contains_point(loan.region, point) {
-                    self.out_of_scope.entry(point).or_default().push(id);
-                    continue;
-                }
-                work.extend(successors_of(body, cfg, cfg.location(point)));
+        for id in 0..self.loans.len() {
+            let points = values.points_of(self.loans[id].region);
+            let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
+                points.first_absent_in(start, end)
+            });
+            for point in ends {
+                self.out_of_scope.entry(point).or_default().push(id);
             }
         }
     }
@@ -712,21 +709,21 @@ impl Loans {
         &mut self,
         body: &MirBody<'_>,
         cfg: &Cfg,
-        live: &[BitSet],
+        live: &[IntervalSet],
     ) {
-        for (id, loan) in self.loans.iter().enumerate() {
-            let issued = cfg.point(loan.location);
-            let mut seen = BitSet::new(cfg.points);
-            let mut work = successors_of(body, cfg, loan.location);
-            while let Some(point) = work.pop() {
-                if !seen.insert(point) {
-                    continue;
+        for id in 0..self.loans.len() {
+            let issued = cfg.point(self.loans[id].location);
+            // The loan is in scope where it is made, live there or not.
+            let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
+                match live[id].first_absent_in(start, end) {
+                    Some(point) if point == issued => {
+                        (point < end).then(|| live[id].first_absent_in(point + 1, end)).flatten()
+                    }
+                    other => other,
                 }
-                if point != issued && !live[id].contains(point) {
-                    self.out_of_scope.entry(point).or_default().push(id);
-                    continue;
-                }
-                work.extend(successors_of(body, cfg, cfg.location(point)));
+            });
+            for point in ends {
+                self.out_of_scope.entry(point).or_default().push(id);
             }
         }
     }
@@ -741,17 +738,36 @@ impl Loans {
         let blocks = body.basic_blocks.len();
         let count = self.loans.len();
         let mut entry = vec![BitSet::new(count); blocks];
+        if count == 0 {
+            return entry;
+        }
+        // A block only adds and removes loans, whatever is in scope, so what it does is
+        // `(in & kept) | made`: `made` is what it leaves of nothing in scope, `kept` of all.
+        let mut all = BitSet::new(count);
+        for id in 0..count {
+            all.insert(id);
+        }
+        let mut effect: Vec<Option<(BitSet, BitSet)>> = vec![None; blocks];
+        for &block in &cfg.order {
+            let data = &body.basic_blocks[block];
+            let (mut made, mut kept) = (BitSet::new(count), all.clone());
+            for statement in 0..=data.statements.len() {
+                let location = Location { block, statement };
+                for state in [&mut made, &mut kept] {
+                    self.before(cfg, location, state);
+                    self.after(ctx, body, location, state);
+                }
+            }
+            effect[index(block)] = Some((made, kept));
+        }
         let mut changed = true;
         while changed {
             changed = false;
             for &block in &cfg.order {
+                let Some((made, kept)) = &effect[index(block)] else { continue };
                 let mut state = entry[index(block)].clone();
-                let data = &body.basic_blocks[block];
-                for statement in 0..=data.statements.len() {
-                    let location = Location { block, statement };
-                    self.before(cfg, location, &mut state);
-                    self.after(ctx, body, location, &mut state);
-                }
+                state.intersect(kept);
+                state.union(made);
                 for &successor in &cfg.successors[index(block)] {
                     changed |= entry[index(successor)].union(&state);
                 }
@@ -838,16 +854,51 @@ impl Loans {
     }
 }
 
-fn successors_of(body: &MirBody<'_>, cfg: &Cfg, location: Location) -> Vec<usize> {
-    let data = &body.basic_blocks[location.block];
-    if location.statement < data.statements.len() {
-        vec![cfg.point(Location { block: location.block, statement: location.statement + 1 })]
+/// The first points reachable from just past `issued` that are not in scope, given
+/// `first_absent(start, end)`, the first point of `start..=end` not in scope. It walks whole
+/// blocks: a block's points are consecutive, so one lookup finds where a loan ends in it.
+fn out_of_scope(
+    body: &MirBody<'_>,
+    cfg: &Cfg,
+    issued: Location,
+    mut first_absent: impl FnMut(usize, usize) -> Option<usize>,
+) -> SmallVec<[usize; 2]> {
+    let mut out = SmallVec::new();
+    let last = |block: BasicBlockId| cfg.point(Location {
+        block,
+        statement: body.basic_blocks[block].statements.len(),
+    });
+    let mut entered = BitSet::new(body.basic_blocks.len());
+    let mut work: Vec<BasicBlockId> = Vec::new();
+    // The rest of the issuing block, if the loan is not made by its terminator.
+    let issued_point = cfg.point(issued);
+    let rest = issued.statement < body.basic_blocks[issued.block].statements.len();
+    if rest {
+        match first_absent(issued_point + 1, last(issued.block)) {
+            Some(point) => out.push(point),
+            None => work.extend(cfg.successors[index(issued.block)].iter().copied()),
+        }
     } else {
-        cfg.successors[index(location.block)]
-            .iter()
-            .map(|&it| cfg.point(Location { block: it, statement: 0 }))
-            .collect()
+        work.extend(cfg.successors[index(issued.block)].iter().copied());
     }
+    while let Some(block) = work.pop() {
+        if !entered.insert(index(block)) {
+            continue;
+        }
+        let start = cfg.point(Location { block, statement: 0 });
+        // Coming back around to the issuing block, the points past the loan were seen.
+        let (end, through) = if rest && block == issued.block {
+            (issued_point, false)
+        } else {
+            (last(block), true)
+        };
+        match first_absent(start, end) {
+            Some(point) => out.push(point),
+            None if through => work.extend(cfg.successors[index(block)].iter().copied()),
+            None => (),
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
