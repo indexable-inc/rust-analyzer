@@ -976,6 +976,7 @@ impl<'db> Builder<'_, '_, 'db> {
         } else if self.ctx.closure_local.is_none() {
             // The declared signature, as the parameters' local types have their lifetimes
             // erased.
+            let mut self_free: Vec<Option<Ty<'db>>> = Vec::new();
             let signature = match owner {
                 InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(function)) => {
                     let sig = self
@@ -1086,6 +1087,36 @@ impl<'db> Builder<'_, '_, 'db> {
                         *input = rustc_type_ir::TypeFoldable::fold_with(*input, &mut defaults);
                     }
                     output = rustc_type_ir::TypeFoldable::fold_with(output, &mut defaults);
+                    // What lifetime elision counts of a parameter that writes `Self`: rustc
+                    // looks only at the lifetimes a parameter's type writes or elides, so
+                    // the impl's (`self` of `impl Foo<'_>`, `other: Self`) are none of them.
+                    if aligned
+                        && let ItemContainerId::ImplId(impl_) =
+                            function.lookup(self.ctx.db).container
+                    {
+                        let impl_self = match self.impl_self {
+                            Some((_, named)) => named,
+                            None => self
+                                .ctx
+                                .db
+                                .impl_self_ty(impl_)
+                                .instantiate_identity()
+                                .skip_norm_wip(),
+                        };
+                        let impl_self =
+                            rustc_type_ir::TypeFoldable::fold_with(impl_self, &mut defaults);
+                        let unit = Ty::new_unit(self.interner());
+                        let mut folder = Replace::new(self.interner(), (impl_self, unit));
+                        self_free = inputs
+                            .iter()
+                            .zip(&written.params)
+                            .map(|(&input, &param)| {
+                                writes_self(&written.store, param).then(|| {
+                                    rustc_type_ir::TypeFoldable::fold_with(input, &mut folder)
+                                })
+                            })
+                            .collect();
+                    }
                     (inputs.len() == body.param_locals.len()).then_some((inputs, output))
                 }
                 _ => None,
@@ -1103,11 +1134,23 @@ impl<'db> Builder<'_, '_, 'db> {
                         _ => self.signature_region(region, depth),
                     }
                     .unwrap_or_else(|| self.new_universal(UniversalKind::AnonParam));
-                    if !matches!(region.kind(), RegionKind::ReBound(..)) {
+                    if self_free.get(index).is_none_or(Option::is_none)
+                        && !matches!(region.kind(), RegionKind::ReBound(..))
+                    {
                         inputs.push(region);
                     }
                     region
                 });
+                if let Some(&Some(free)) = self_free.get(index) {
+                    rustc_type_ir::fold_regions(self.interner(), free, |region, depth| {
+                        if let Some(region) = self.signature_region(region, depth)
+                            && !matches!(region.kind(), RegionKind::ReBound(..))
+                        {
+                            inputs.push(region);
+                        }
+                        region
+                    });
+                }
                 local_tys[local.into_raw().into_u32() as usize] = Some(ty);
             }
             // The lifetime elision gives the elided lifetimes of the return type.
@@ -2653,10 +2696,30 @@ impl<'db> Builder<'_, '_, 'db> {
             TyKind::Array(inner, _) | TyKind::Slice(inner) | TyKind::RawPtr(inner, _) => {
                 self.implied_bounds(inner, pairs, seen, depth + 1, in_field)
             }
-            // `dyn Any + 'r` is well-formed only where `'r` outlives what the trait requires of
-            // `Self`: `trait Any: 'static`. Not in a field, of which rustc's inferred outlives
-            // leave out what mentions `Self`.
-            TyKind::Dynamic(predicates, region) if !in_field => {
+            // `dyn Any + 'r` is well-formed only where `'r` outlives what the trait or one of
+            // its supertraits requires of `Self`: `trait Any: 'static`. Not in a field, of which
+            // rustc's inferred outlives leave out what mentions `Self`.
+            // And what the types in its arguments imply, as rustc's well-formedness walks into
+            // them: `&dyn Fn() -> &'a G<'db>` that `'db: 'a`.
+            TyKind::Dynamic(predicates, region) => {
+                for predicate in predicates.iter() {
+                    let predicate = predicate.skip_binder();
+                    let (args, term) = match predicate {
+                        rustc_type_ir::ExistentialPredicate::Trait(it) => (it.args, None),
+                        rustc_type_ir::ExistentialPredicate::Projection(it) => {
+                            (it.args, it.term.as_type())
+                        }
+                        rustc_type_ir::ExistentialPredicate::AutoTrait(_) => continue,
+                    };
+                    for it in args.types().chain(term) {
+                        if !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&it) {
+                            self.implied_bounds(it, pairs, seen, depth + 1, in_field);
+                        }
+                    }
+                }
+                if in_field {
+                    return;
+                }
                 let Some(shorter) = rv_of(region) else { return };
                 for predicate in predicates.iter() {
                     let trait_ = match predicate.skip_binder() {
@@ -2664,17 +2727,9 @@ impl<'db> Builder<'_, '_, 'db> {
                         rustc_type_ir::ExistentialPredicate::AutoTrait(it) => it.0,
                         rustc_type_ir::ExistentialPredicate::Projection(_) => continue,
                     };
-                    let requires_static = GenericPredicates::query_all(self.ctx.db, trait_.into())
-                        .iter_identity()
-                        .any(|clause| {
-                            matches!(
-                                clause.skip_norm_wip().kind().skip_binder(),
-                                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region))
-                                    if matches!(ty.kind(), TyKind::Param(param) if param.index == 0)
-                                        && matches!(region.kind(), RegionKind::ReStatic)
-                            )
-                        });
-                    if requires_static {
+                    // Its supertraits' too, as rustc elaborates them: salsa's `dyn Database`
+                    // through `ZalsaDatabase: Any`.
+                    if static_trait(self.ctx.db, trait_) {
                         pairs.push((shorter, self.regions.static_rv));
                     }
                 }
@@ -4613,9 +4668,30 @@ impl<'db> Builder<'_, '_, 'db> {
                             let container = function.lookup(self.ctx.db).container;
                             self.path_well_formed(expr, container, fn_args, span);
                         }
+                        let mut impl_self = None;
                         let (self_param, keep_static, returns_self, static_self) = match def {
                             CallableDefId::FunctionId(it) => {
                                 let written = FunctionSignature::of(self.ctx.db, it);
+                                if let ItemContainerId::ImplId(impl_) =
+                                    it.lookup(self.ctx.db).container
+                                    && written.params.len() == sig.inputs().len()
+                                {
+                                    let ty = self
+                                        .ctx
+                                        .db
+                                        .impl_self_ty(impl_)
+                                        .instantiate(self.interner(), fn_args)
+                                        .skip_norm_wip();
+                                    let writes: Vec<bool> = written
+                                        .params
+                                        .iter()
+                                        .map(|&param| writes_self(&written.store, param))
+                                        .collect();
+                                    let ret = written
+                                        .ret_type
+                                        .is_some_and(|it| writes_self(&written.store, it));
+                                    impl_self = Some((ty, writes, ret));
+                                }
                                 let returns_self = written.ret_type.is_some_and(|it| {
                                     matches!(&written.store[it],
                                         hir_def::hir::type_ref::TypeRef::Path(path)
@@ -4642,6 +4718,7 @@ impl<'db> Builder<'_, '_, 'db> {
                             keep_static,
                             returns_self,
                             static_self,
+                            impl_self,
                         );
                         // The signature as written is well-formed, `&'a &'b ()` that `'b: 'a`
                         // even where it normalizes to `()`; and the where clauses of its
@@ -4793,6 +4870,10 @@ impl<'db> Builder<'_, '_, 'db> {
     /// defaults to `'static` (`impl dyn Trait { fn f(&self) }`), not the reference's.
     /// An `impl Trait` `function` returns has, for each lifetime its parameters leave out, that
     /// lifetime's region.
+    /// `impl_self`: the self type of the impl `function` is in, which parameters write `Self`
+    /// and whether the return type does. The impl's anonymous lifetimes (`impl Foo<'_>`) are
+    /// one region for each call, and lifetime elision counts none of the impl's lifetimes in
+    /// what writes `Self`, as rustc looks only at those a parameter's type writes or elides.
     #[allow(clippy::too_many_arguments)]
     fn elide(
         &self,
@@ -4803,14 +4884,40 @@ impl<'db> Builder<'_, '_, 'db> {
         keep_static: bool,
         returns_self: bool,
         static_self: bool,
+        impl_self: Option<(Ty<'db>, Vec<bool>, bool)>,
     ) -> (Vec<Ty<'db>>, Ty<'db>) {
         let interner = self.interner();
         let mut defaults = ObjectDefaults { db: self.ctx.db, interner, keep_static, erase: false };
         let mut errors = vec![Vec::new(); inputs.len()];
+        let (impl_self, writes_self, ret_self) = match impl_self {
+            Some((raw, writes, ret)) => {
+                let named =
+                    rustc_type_ir::fold_regions(interner, raw, |region, _| match region.kind() {
+                        RegionKind::ReError(_) => self.fresh(),
+                        _ => region,
+                    });
+                (Some((raw, named)), writes, ret)
+            }
+            None => (None, Vec::new(), false),
+        };
+        let writes_self = |index: usize| writes_self.get(index).copied().unwrap_or(false);
+        let output = match impl_self {
+            Some(replace) if ret_self => {
+                rustc_type_ir::TypeFoldable::fold_with(output, &mut Replace::new(interner, replace))
+            }
+            _ => output,
+        };
         let inputs: Vec<Ty<'db>> = inputs
             .into_iter()
             .enumerate()
             .map(|(index, ty)| {
+                let ty = match impl_self {
+                    Some(replace) if writes_self(index) => rustc_type_ir::TypeFoldable::fold_with(
+                        ty,
+                        &mut Replace::new(interner, replace),
+                    ),
+                    _ => ty,
+                };
                 let ty =
                     rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
                         RegionKind::ReError(_) => {
@@ -4832,8 +4939,22 @@ impl<'db> Builder<'_, '_, 'db> {
         };
         let elided = self_region.or_else(|| {
             let mut distinct = Vec::new();
-            for ty in &inputs {
-                rustc_type_ir::fold_regions(interner, *ty, |region, _| {
+            for (index, ty) in inputs.iter().enumerate() {
+                let ty = match impl_self {
+                    Some((_, named)) if writes_self(index) => {
+                        let named = match static_self && index == 0 {
+                            true => named,
+                            false => rustc_type_ir::TypeFoldable::fold_with(named, &mut defaults),
+                        };
+                        let unit = Ty::new_unit(interner);
+                        rustc_type_ir::TypeFoldable::fold_with(
+                            *ty,
+                            &mut Replace::new(interner, (named, unit)),
+                        )
+                    }
+                    _ => *ty,
+                };
+                rustc_type_ir::fold_regions(interner, ty, |region, _| {
                     if !matches!(region.kind(), RegionKind::ReBound(..))
                         && !distinct.contains(&region)
                     {

@@ -464,6 +464,74 @@ fn f(mut n: N) -> N {
         );
     }
 
+    // hir-ty's `InferBodyId::store_and_root_expr`: lifetime elision counts none of the impl's
+    // lifetimes in a parameter that writes `Self`, so the return type has the lifetime of `db`
+    // or `x`, here and where it is called.
+    #[test]
+    fn elision_counts_no_lifetime_of_self() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, deref, copy, clone
+use core::ops::Deref;
+struct Store(u32);
+struct Body(Store);
+impl Deref for Body {
+    type Target = Store;
+    fn deref(&self) -> &Store { &self.0 }
+}
+trait Db {}
+fn body_of(_db: &dyn Db) -> &Body { loop {} }
+#[derive(Clone, Copy)]
+struct Id<'a>(&'a u8);
+impl Id<'_> {
+    fn store(self, db: &dyn Db) -> (&Store, u32) {
+        let body = body_of(db);
+        (body, 0)
+    }
+    fn other(self, _o: Self, x: &u32) -> &u32 { x }
+}
+impl<'a> Id<'a> {
+    fn named(self, x: &u32) -> &u32 { x }
+}
+fn caller<'a>(db: &'a dyn Db, id: Id<'_>) -> &'a Store { id.store(db).0 }
+fn caller_err(id: Id<'static>) -> &'static u32 {
+    let x = 1;
+    id.named(&x)
+  //^^^^^^^^^^^^ error: cannot return reference to local variable
+}
+"#,
+        );
+    }
+
+    // hir-ty's `path_to_const`: what the types in a trait object's arguments imply holds,
+    // `'db: 'a` of `&dyn Fn() -> &'a G<'db>`.
+    #[test]
+    fn implied_bounds_of_a_trait_objects_arguments() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, fn
+struct G<'db>(&'db u32);
+fn need<'a, 'db: 'a>(_: &'a G<'db>) {}
+fn f<'a, 'db>(g: &dyn Fn() -> &'a G<'db>) { need(g()) }
+"#,
+        );
+    }
+
+    // hir-def's `module_for_assoc_item_loc`: `dyn 'db + Database` implies `'db: 'static`
+    // where a supertrait of `Database` is `'static`.
+    #[test]
+    fn a_supertraits_static_bound_is_implied() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Base: 'static {}
+trait Database: Base {}
+fn take(_: &dyn Database) {}
+fn f<'db>(db: &(dyn 'db + Database)) { take(db) }
+"#,
+        );
+    }
+
     #[test]
     fn unused_mut_self() {
         check_diagnostics(
