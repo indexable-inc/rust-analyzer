@@ -391,6 +391,31 @@ pub fn semantic_diagnostics_within(
     file_id: FileId,
     within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
 ) -> Vec<Diagnostic> {
+    semantic_diagnostics_asked(db, config, resolve, file_id, within, None)
+}
+
+/// [`semantic_diagnostics_within`], of the bodies only those `bodies` asks for, for a caller
+/// that knows what the others' are: those of the items themselves are all there. The walk of
+/// the file's syntax is left out, which gives none but weak warnings.
+pub fn semantic_diagnostics_of_bodies(
+    db: &RootDatabase,
+    config: &DiagnosticsConfig,
+    resolve: &AssistResolveStrategy,
+    file_id: FileId,
+    within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
+    bodies: &dyn Fn(hir::DefWithBody) -> bool,
+) -> Vec<Diagnostic> {
+    semantic_diagnostics_asked(db, config, resolve, file_id, within, Some(bodies))
+}
+
+fn semantic_diagnostics_asked(
+    db: &RootDatabase,
+    config: &DiagnosticsConfig,
+    resolve: &AssistResolveStrategy,
+    file_id: FileId,
+    within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
+    bodies: Option<&dyn Fn(hir::DefWithBody) -> bool>,
+) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("semantic_diagnostics").entered();
     let sema = match within {
         Some(crates) => Semantics::new_within(db, crates),
@@ -406,7 +431,7 @@ pub fn semantic_diagnostics_within(
     // FIXME: This iterates the entire file which is a rather expensive operation.
     // We should implement these differently in some form?
     // Salsa caching + incremental re-parse would be better here
-    for node in parse.syntax().descendants() {
+    for node in parse.syntax().descendants().filter(|_| bodies.is_none()) {
         handlers::useless_braces::useless_braces(db, &mut res, editioned_file_id, &node);
         handlers::field_shorthand::field_shorthand(db, &mut res, editioned_file_id, &node);
         handlers::json_is_not_rust::json_in_items(
@@ -445,7 +470,12 @@ pub fn semantic_diagnostics_within(
         // file, so we skip semantic diagnostics so we can show these faster.
         Some(m) => {
             if editioned_file_id.parse_errors(db).is_none_or(|es| es.len() < 16) {
-                m.diagnostics(db, &mut diags, config.style_lints);
+                match bodies {
+                    Some(bodies) => {
+                        m.diagnostics_of_bodies(db, &mut diags, config.style_lints, bodies)
+                    }
+                    None => m.diagnostics(db, &mut diags, config.style_lints),
+                }
             }
         }
         None => handlers::unlinked_file::unlinked_file(&ctx, &mut res, editioned_file_id),

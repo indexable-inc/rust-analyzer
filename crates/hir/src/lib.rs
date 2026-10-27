@@ -708,7 +708,20 @@ impl Module {
         acc: &mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
     ) {
-        crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints);
+        crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints, None);
+    }
+
+    /// Fills `acc` with the module's diagnostics, of the bodies only those `bodies` asks for:
+    /// those of the items themselves are all there.
+    pub fn diagnostics_of_bodies<'db>(
+        self,
+        db: &'db dyn HirDatabase,
+        acc: &mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: &dyn Fn(DefWithBody) -> bool,
+    ) {
+        let bodies = Some(bodies);
+        crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints, bodies);
     }
 
     pub fn declarations(self, db: &dyn HirDatabase) -> Vec<ModuleDef> {

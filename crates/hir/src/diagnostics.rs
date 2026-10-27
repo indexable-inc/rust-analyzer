@@ -742,6 +742,8 @@ pub(crate) struct DiagnosticsCollector<'a, 'db> {
     edition: Edition,
     style_lints: bool,
     acc: &'a mut Vec<AnyDiagnostic<'db>>,
+    /// The bodies whose diagnostics are asked for, when not all of them are.
+    bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
 }
 
 fn precise_macro_call_location(
@@ -780,9 +782,11 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         module: ModuleId,
         acc: &'a mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
+        bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
     ) {
         let krate = module.krate(db);
-        DiagnosticsCollector { db, krate, edition: krate.data(db).edition, style_lints, acc }
+        let edition = krate.data(db).edition;
+        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies }
             .collect_module(module);
     }
 
@@ -1291,6 +1295,9 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
     }
 
     fn collect_def_with_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
+        if self.bodies.is_some_and(|asked| !asked(def.into())) {
+            return;
+        }
         let (body, source_map) = Body::with_source_map(self.db, def);
 
         self.collect_expr_store(body, source_map);
