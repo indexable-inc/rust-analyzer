@@ -1922,6 +1922,12 @@ impl<'db> Builder<'_, '_, 'db> {
                         .map(|(local, projection)| self.place_ty(local, &projection).ty),
                 };
                 if let Some(value) = value {
+                    // `let _: <(u8, _) as Tr>::Ty = &temp();`: the value has the annotation
+                    // normalized, as rustc's user type annotation.
+                    let ty = match rustc_type_ir::TypeVisitableExt::has_aliases(&ty) {
+                        true => self.normalize_at(ty, at).unwrap_or(ty),
+                        false => ty,
+                    };
                     self.relate(value, ty, Variance::Covariant, at);
                 }
             }
@@ -1956,8 +1962,17 @@ impl<'db> Builder<'_, '_, 'db> {
             .collect();
         for (local, type_ref) in written {
             let Some(type_ref) = type_ref else { continue };
-            let ty = self.written(self.lower_written(type_ref, span));
             let local_ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+            // `|d: <(_,) as Tr>::Ty|`: the `_`s are what the parameter's type makes them, and
+            // the annotation is well-formed, the impl it selects' where clauses holding.
+            if let Some(solved) = self.solved_annotation(type_ref, local_ty, span) {
+                let ty = self.written(solved);
+                self.relate(local_ty, ty, Variance::Invariant, at);
+                let at = At { category: Category::TypeAnnotation, span };
+                self.well_formed(ty, at, 0);
+                continue;
+            }
+            let ty = self.written(self.lower_written(type_ref, span));
             self.relate(local_ty, ty, Variance::Invariant, at);
         }
     }
@@ -2053,6 +2068,7 @@ impl<'db> Builder<'_, '_, 'db> {
     /// as rustc's user type annotations: `None::<<&'a () as Trait>::Ty>` that `&'a ()`
     /// implements `Trait`.
     fn path_arguments(&mut self) {
+        use rustc_type_ir::inherent::GenericArg as _;
         let store = self.ctx.store;
         let mut parent = FxHashMap::default();
         for (expr, _) in store.exprs() {
@@ -2083,17 +2099,29 @@ impl<'db> Builder<'_, '_, 'db> {
             {
                 items.push((expr, def.0, args));
             }
+            let positions = self.spelled_positions(expr, path).unwrap_or_default();
+            let fn_args = match self.ctx.infer.type_of_expr.get(expr).map(|it| it.as_ref().kind()) {
+                Some(TyKind::FnDef(_, args)) => Some(args),
+                _ => None,
+            };
             for args in path.generic_args().into_iter().flatten().flatten() {
                 for arg in args.args.iter() {
                     if let hir_def::expr_store::path::GenericArg::Type(type_ref) = arg {
-                        found.push((expr, *type_ref));
+                        let inferred = positions
+                            .iter()
+                            .find(|(it, _)| it == type_ref)
+                            .and_then(|&(_, index)| fn_args?.get(index)?.as_type());
+                        found.push((expr, *type_ref, inferred));
                     }
                 }
             }
         }
-        for (expr, type_ref) in found {
+        for (expr, type_ref, inferred) in found {
             let span = MirSpan::ExprId(expr);
-            let ty = self.lower_written(type_ref, span);
+            // `Some::<<(_,) as Tr>::Ty>(b)`: the `_`s are what the argument inferred makes them.
+            let solved =
+                inferred.and_then(|inferred| self.solved_annotation(type_ref, inferred, span));
+            let ty = solved.unwrap_or_else(|| self.lower_written(type_ref, span));
             let ty = self.written(ty);
             self.well_formed(ty, At { category: Category::TypeAnnotation, span }, 0);
         }
@@ -3904,6 +3932,9 @@ impl<'db> Builder<'_, '_, 'db> {
         match &self.ctx.store[expr] {
             hir_def::hir::Expr::Path(path) if spells_generics(path) => {
                 let ty = self.written(ty);
+                if let TyKind::FnDef(_, args) = ty.kind() {
+                    self.spelled_projections(expr, path, args);
+                }
                 if let TyKind::FnDef(def, args) = ty.kind()
                     && let CallableDefId::FunctionId(function) = def.0
                 {
@@ -4388,8 +4419,155 @@ impl<'db> Builder<'_, '_, 'db> {
     fn annotation_ty(&mut self, annotation: Annotation) -> Option<Ty<'db>> {
         let inferred = self.ctx.infer.type_of_pat.get(annotation.pat)?.as_ref();
         let lowered = self.lower_annotation(annotation.type_ref, MirSpan::ExprId(annotation.block));
-        let ty = self.zip_annotation(lowered, inferred, &mut FxHashMap::default(), 0);
+        let mut holes = self.projection_holes(lowered, inferred);
+        let ty = self.zip_annotation(lowered, inferred, &mut holes, 0);
         Some(self.written(ty.unwrap_or(inferred)))
+    }
+
+    /// The written type `type_ref` with the `_`s in its associated types solved against the
+    /// type `inferred` for it, if it has any; see `projection_holes`.
+    fn solved_annotation(
+        &self,
+        type_ref: hir_def::type_ref::TypeRefId,
+        inferred: Ty<'db>,
+        span: MirSpan,
+    ) -> Option<Ty<'db>> {
+        let lowered = self.lower_annotation(type_ref, span);
+        let mut holes = self.projection_holes(lowered, inferred);
+        if holes.is_empty() {
+            return None;
+        }
+        self.zip_annotation(lowered, inferred, &mut holes, 0)
+    }
+
+    /// The type arguments a path to a function or constructor spells out on one segment, each
+    /// with its index in the arguments of the item's type: in `Some::<T>` or
+    /// `Option::<T>::None`, the variant's.
+    fn spelled_positions(
+        &self,
+        expr: hir_def::hir::ExprId,
+        path: &hir_def::expr_store::path::Path,
+    ) -> Option<Vec<(hir_def::type_ref::TypeRefId, usize)>> {
+        use hir_def::expr_store::path::GenericArg;
+        use rustc_type_ir::inherent::GenericArg as _;
+        let generic_args = path.generic_args()?;
+        let mut spelled = generic_args.iter().enumerate().filter(|(_, it)| it.is_some());
+        let (at, args) = spelled.next()?;
+        if spelled.next().is_some() {
+            return None;
+        }
+        let ty = self.ctx.infer.type_of_expr.get(expr)?.as_ref();
+        let TyKind::FnDef(def, inferred) = ty.kind() else { return None };
+        let last = at + 1 == generic_args.len();
+        let skip = match def.0 {
+            CallableDefId::FunctionId(function) if last => {
+                hir_ty::generics::generics(self.ctx.db, function.into()).len_parent()
+            }
+            CallableDefId::StructId(_) if last => 0,
+            CallableDefId::EnumVariantId(_) if last || at + 2 == generic_args.len() => 0,
+            _ => return None,
+        };
+        let written: Vec<_> = args
+            .as_ref()?
+            .args
+            .iter()
+            .filter_map(|it| match it {
+                GenericArg::Type(type_ref) => Some(*type_ref),
+                _ => None,
+            })
+            .collect();
+        let positions: Vec<_> = inferred
+            .iter()
+            .enumerate()
+            .skip(skip)
+            .filter(|(_, it)| it.as_type().is_some())
+            .map(|(index, _)| index)
+            .collect();
+        (written.len() == positions.len()).then(|| written.into_iter().zip(positions).collect())
+    }
+
+    /// What a call whose callee path spells out `<(_,) as Tr>::Ty` as a type argument
+    /// requires, as rustc's user type annotation on the callee: the `_`s solved against the
+    /// argument, the annotation normalized is the argument, so `Some::<<(u8, _) as
+    /// Tr>::Ty>(&temp())` needs the borrow to live as long as the impl selected needs.
+    fn spelled_projections(
+        &mut self,
+        expr: hir_def::hir::ExprId,
+        path: &hir_def::expr_store::path::Path,
+        args: GenericArgs<'db>,
+    ) {
+        use rustc_type_ir::inherent::GenericArg as _;
+        let span = MirSpan::ExprId(expr);
+        let at = At { category: Category::TypeAnnotation, span };
+        for (type_ref, index) in self.spelled_positions(expr, path).unwrap_or_default() {
+            let Some(arg) = args.get(index).and_then(|it| it.as_type()) else { continue };
+            let Some(solved) = self.solved_annotation(type_ref, arg, span) else { continue };
+            let solved = self.written(solved);
+            self.well_formed(solved, at, 0);
+            let normalized = self.normalize_at(solved, at).unwrap_or(solved);
+            self.relate(arg, normalized, Variance::Invariant, at);
+        }
+    }
+
+    /// The `_`s of a written type that stand in an associated type, `<(_,) as Tr>::Ty`, as
+    /// rustc infers them for its user type annotation: what equating the written type with
+    /// the one inferred makes them, so normalizing the associated type selects the impl the
+    /// inferred type does, whose where clauses then must hold (`impl<T: 'static> Tr for
+    /// (T,)` needs what the `_` is to be `'static`). Each with its lifetimes fresh.
+    fn projection_holes(&self, lowered: Ty<'db>, inferred: Ty<'db>) -> FxHashMap<Ty<'db>, Ty<'db>> {
+        use hir_ty::next_solver::{
+            infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
+        };
+        use rustc_type_ir::{TypeVisitableExt as _, inherent::GenericArg as _};
+        let mut holes = FxHashMap::default();
+        let mut in_projection = Vec::new();
+        for arg in lowered.walk() {
+            let Some(ty) = arg.as_type() else { continue };
+            if let TyKind::Alias(alias) = ty.kind()
+                && let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
+            {
+                for arg in ty.walk() {
+                    if let Some(hole) = arg.as_type()
+                        && let TyKind::Infer(rustc_type_ir::InferTy::TyVar(_)) = hole.kind()
+                        && !in_projection.contains(&hole)
+                    {
+                        in_projection.push(hole);
+                    }
+                }
+            }
+        }
+        if in_projection.is_empty() {
+            return holes;
+        }
+        let interner = self.interner();
+        // Regions do not select an impl; rust-analyzer infers some as errors.
+        let statik = |ty: Ty<'db>| {
+            rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
+                RegionKind::ReBound(..) => region,
+                _ => Region::new_static(interner),
+            })
+        };
+        if statik(inferred).references_error() {
+            return holes;
+        }
+        let infcx = &self.ctx.infcx;
+        let found: Vec<(Ty<'db>, Ty<'db>)> = infcx.probe(|_| {
+            let mut ocx = ObligationCtxt::new(infcx);
+            let cause = ObligationCause::dummy();
+            if ocx.eq(&cause, self.ctx.env, statik(lowered), statik(inferred)).is_err() {
+                return Vec::new();
+            }
+            let _ = ocx.try_evaluate_obligations();
+            in_projection
+                .iter()
+                .map(|&hole| (hole, infcx.resolve_vars_if_possible(hole)))
+                .filter(|(_, it)| !it.has_non_region_infer() && !it.references_error())
+                .collect()
+        });
+        for (hole, value) in found {
+            holes.insert(hole, self.renumber(value));
+        }
+        holes
     }
 
     /// The written type `lowered` with each `_` in it the type inferred there, the same
@@ -4442,6 +4620,34 @@ impl<'db> Builder<'_, '_, 'db> {
                     });
                 }
                 Ty::new(interner, TyKind::Adt(def, GenericArgs::new_from_iter(args)))
+            }
+            // An associated type with `_`s in it has them as `projection_holes` inferred.
+            (TyKind::Alias(alias), _)
+                if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
+                    && rustc_type_ir::TypeVisitableExt::has_non_region_infer(&lowered) =>
+            {
+                let mut missing = false;
+                let ty = rustc_type_ir::TypeFoldable::fold_with(
+                    lowered,
+                    &mut hir_ty::next_solver::util::BottomUpFolder {
+                        interner,
+                        ty_op: |ty: Ty<'db>| match ty.kind() {
+                            TyKind::Infer(rustc_type_ir::InferTy::TyVar(_)) => {
+                                holes.get(&ty).copied().unwrap_or_else(|| {
+                                    missing = true;
+                                    ty
+                                })
+                            }
+                            _ => ty,
+                        },
+                        lt_op: |region| region,
+                        ct_op: |ct| ct,
+                    },
+                );
+                if missing {
+                    return None;
+                }
+                ty
             }
             (TyKind::FnPtr(a, header), TyKind::FnPtr(b, inferred_header))
                 if header == inferred_header
@@ -4842,6 +5048,21 @@ impl<'db> Builder<'_, '_, 'db> {
                 if annotated {
                     for ty in args.types() {
                         self.well_formed(ty, boring, 0);
+                    }
+                    // `Some::<<(u8, _) as Tr>::Ty>(&temp())`: its argument is the annotation
+                    // normalized.
+                    let callee = match span {
+                        MirSpan::ExprId(expr) => match &store[expr] {
+                            hir_def::hir::Expr::Call { callee, .. } => Some(*callee),
+                            hir_def::hir::Expr::Path(_) => Some(expr),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(callee) = callee
+                        && let hir_def::hir::Expr::Path(path) = &store[callee]
+                    {
+                        self.spelled_projections(callee, path, args);
                     }
                 }
                 let fields = self.ctx.db.field_types(*variant);
