@@ -1799,7 +1799,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         code,
                         span: test.span,
                         message,
-                        at_signature: false,
+                        at_signature: test.signature,
                     }));
                 }
                 break;

@@ -153,6 +153,8 @@ pub(super) struct TypeTest<'db> {
     pub(super) span: MirSpan,
     /// From a `for<'a> T: 'a` bound, which rustc reports without a code.
     pub(super) forall: bool,
+    /// Needed by the signature, which rustc reports at it.
+    pub(super) signature: bool,
 }
 
 pub(super) struct Regions<'db> {
@@ -2353,29 +2355,70 @@ impl<'db> Builder<'_, '_, 'db> {
     /// What normalizing the signature needs, as rustc normalizes the type of each parameter
     /// and the return type: the where clauses of the impl that a projection there is of,
     /// `<&'a () as Visitor<'d>>::Value` with only `impl<'a, 'd: 'a> Visitor<'d> for &'a ()`
-    /// that `'d: 'a`.
+    /// that `'d: 'a`. And what computing its implied bounds needs, as rustc's
+    /// `compute_implied_outlives_bounds_inner` normalizes what the well-formedness of each
+    /// type asks, the where clauses of a struct or enum it names: `Foo<(&'a str,)>` of
+    /// `struct Foo<T: Trait> where T::Assoc: Clone` with only `impl<X: 'static> Trait for (X,)`
+    /// needs `'a: 'static`. Their trait bounds themselves it does not prove.
     fn signature_projections(&mut self) {
         if self.ctx.closure_local.is_some() || self.ctx.inline_const {
             return;
         }
         let interner = self.interner();
         let mut trait_refs = Vec::new();
-        for &local in self
+        let mut tys: Vec<Ty<'db>> = self
             .body
             .param_locals
             .iter()
             .chain((!self.returns_opaque).then_some(&super::return_slot()))
-        {
-            let ty = self.regions.local_tys[local.into_raw().into_u32() as usize];
+            .map(|local| self.regions.local_tys[local.into_raw().into_u32() as usize])
+            .collect();
+        use rustc_type_ir::inherent::GenericArg as _;
+        let mut seen = FxHashSet::default();
+        while let Some(ty) = tys.pop() {
+            // A where clause can name a bigger type than its ADT, with no end.
+            if seen.len() > 256 || !seen.insert(ty) {
+                continue;
+            }
             for arg in ty.walk() {
-                if let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg)
-                    && let TyKind::Alias(alias) = it.kind()
-                    && let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
-                {
-                    let trait_ref = alias.trait_ref(interner);
-                    if !trait_refs.contains(&trait_ref) {
-                        trait_refs.push(trait_ref);
+                let Some(it) = rustc_type_ir::inherent::GenericArg::as_type(&arg) else {
+                    continue;
+                };
+                match it.kind() {
+                    TyKind::Alias(alias)
+                        if matches!(alias.kind, rustc_type_ir::AliasTyKind::Projection { .. }) =>
+                    {
+                        let trait_ref = alias.trait_ref(interner);
+                        if !trait_refs.contains(&trait_ref) {
+                            trait_refs.push(trait_ref);
+                        }
                     }
+                    TyKind::Adt(def, args) => {
+                        let clauses =
+                            GenericPredicates::query_all(self.ctx.db, def.def_id().into())
+                                .iter_instantiated(interner, args.as_slice())
+                                .map(|it| it.skip_norm_wip());
+                        for clause in clauses {
+                            match clause.kind().skip_binder() {
+                                ClauseKind::Trait(predicate) => tys.extend(
+                                    predicate.trait_ref.args.iter().filter_map(|arg| arg.as_type()),
+                                ),
+                                ClauseKind::Projection(predicate) => {
+                                    tys.extend(
+                                        predicate
+                                            .projection_term
+                                            .args
+                                            .iter()
+                                            .filter_map(|arg| arg.as_type()),
+                                    );
+                                    tys.extend(predicate.term.as_type());
+                                }
+                                ClauseKind::TypeOutlives(OutlivesPredicate(ty, _)) => tys.push(ty),
+                                _ => (),
+                            }
+                        }
+                    }
+                    _ => (),
                 }
             }
         }
@@ -3140,6 +3183,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     lower: sub,
                     span: requirement.span,
                     forall: false,
+                    signature: false,
                 });
                 continue;
             }
@@ -3397,6 +3441,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 lower: rv,
                 span: at.span,
                 forall: false,
+                signature: at.category == Category::Signature,
             });
         }
         if depth > 4 {
@@ -3485,7 +3530,13 @@ impl<'db> Builder<'_, '_, 'db> {
             }
             return;
         }
-        self.regions.type_tests.push(TypeTest { ty, lower: rv, span: at.span, forall: false });
+        self.regions.type_tests.push(TypeTest {
+            ty,
+            lower: rv,
+            span: at.span,
+            forall: false,
+            signature: at.category == Category::Signature,
+        });
     }
 
     fn place_ty(&self, local: LocalId, projection: &[PlaceElem]) -> PlaceTy<'db> {
@@ -5547,7 +5598,9 @@ impl<'db> Builder<'_, '_, 'db> {
                     .collect();
             (constraints, obligations)
         };
-        if regionless && constraints.is_empty() {
+        // Its impl's where clauses can still need a type to outlive a region:
+        // `ServiceChain<P, S>: Service` that `P::Error: 'static`.
+        if regionless && constraints.is_empty() && obligations.is_empty() {
             return false;
         }
         if crate::debugging(self.ctx.db, self.ctx.owner) {
