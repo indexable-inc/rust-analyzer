@@ -579,8 +579,9 @@ pub(crate) fn find_matching_impl<'db>(
 /// .unwrap())` parses an `f64` until serde_json's `impl PartialEq<Value> for f64` is seen, and
 /// a test of a crate whose benches use criterion depends on serde_json.
 ///
-/// Named is by the identifiers of `krate`'s files, which is more than rustc resolves (a local
-/// of the same name does) and less where a macro of another crate alone names the dependency.
+/// Named is by the identifiers of `krate`'s files and of what the macros of other crates
+/// expand to among its items, which is more than rustc resolves (a local of the same name
+/// does) and less where such a macro in a body alone names the dependency.
 #[salsa::tracked(returns(deref))]
 pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
@@ -597,10 +598,20 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     // `include!` puts among the items is one of the crate's as well: a root that is only
     // `include!("../../app/main.rs");` names its dependencies there.
     let included = hir_def::include_macro_invoc(db, krate);
-    let mut files = crate_def_map(db, krate)
+    let def_map = crate_def_map(db, krate);
+    let mut files = def_map
         .modules(db)
         .filter_map(|(_, module)| module.origin.file_id())
         .chain(included.iter().map(|&(_, file)| file));
+    let named_in = |unnamed: &mut Vec<&base_db::BuiltDependency>, root: &syntax::SyntaxNode| {
+        let root = root.to_flat();
+        let (tree, at) = root.flat().expect("a flat tree");
+        let identifiers: FxHashSet<&str> = (at..tree.end(at))
+            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
+            .map(|it| tree.token_text(it))
+            .collect();
+        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol().as_str()));
+    };
     while !unnamed.is_empty()
         && let Some(file) = files.next()
     {
@@ -608,13 +619,28 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
         if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
             continue;
         }
-        let root = file.parse(db).syntax_node().to_flat();
-        let (tree, at) = root.flat().expect("a flat tree");
-        let identifiers: FxHashSet<&str> = (at..tree.end(at))
-            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
-            .map(|it| tree.token_text(it))
-            .collect();
-        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol().as_str()));
+        named_in(&mut unnamed, &file.parse(db).syntax_node());
+    }
+    // rustc loads the crate a path in a macro's output names too, as in the `impl
+    // dep::Trait for ..` a derive of a proc macro writes. A `macro_rules!` of `krate` writes
+    // nothing its files do not, nor does a built-in macro but `include!`, whose files are
+    // above.
+    let mut calls = def_map
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).all_macro_calls().collect::<Vec<_>>())
+        .filter(|call| {
+            let def = call.loc(db).def;
+            def.krate != krate
+                && matches!(
+                    def.kind,
+                    hir_expand::MacroDefKind::ProcMacro(..)
+                        | hir_expand::MacroDefKind::Declarative(..)
+                )
+        });
+    while !unnamed.is_empty()
+        && let Some(call) = calls.next()
+    {
+        named_in(&mut unnamed, &call.parse_macro_expansion(db).value.0.syntax_node());
     }
     let mut loaded = FxHashSet::default();
     let mut ordered = vec![krate];
