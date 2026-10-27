@@ -179,6 +179,9 @@ pub(super) struct Regions<'db> {
     /// The universal regions of the placeholders of relating two types' `for<'a>`, whose
     /// errors are rustc's `UniverseInfo::RelateTys`: E0308, one type more general than the other.
     pub(super) related_placeholders: FxHashSet<usize>,
+    /// Of those, the ones what normalizing a projection needs of constrains: rustc's
+    /// `UniverseInfo::TypeOp`, "not general enough", which its type check cannot see.
+    pub(super) normalized_placeholders: FxHashSet<usize>,
     /// The body is a method of a trait impl, whose signature the trait fixes: rustc's
     /// `is_bound_region_in_impl_item`, which keeps E0621 from suggesting a change to it.
     pub(super) is_impl_item: bool,
@@ -662,6 +665,7 @@ pub(super) fn build<'db>(
             type_tests: Vec::new(),
             check_universals: ctx.closure_local.is_none(),
             related_placeholders: FxHashSet::default(),
+            normalized_placeholders: FxHashSet::default(),
             is_impl_item: false,
             unsuggested: FxHashSet::default(),
             closure_env: None,
@@ -2901,6 +2905,15 @@ impl<'db> Builder<'_, '_, 'db> {
             RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) => {
                 this.signature_region(region, rustc_type_ir::INNERMOST).and_then(rv_of)
             }
+            // Of a `for<'a>` instantiated to relate types: `<&'a () as Trait>::Ty` with only
+            // `impl Trait for &'static ()` needs the placeholder to be `'static`, an error of
+            // rustc's type op normalizing it, "not general enough", not of the relating.
+            RegionKind::RePlaceholder(_) => {
+                let rv = rv_of(this.placeholder(region))?;
+                let universal = this.regions.universal(rv)?;
+                this.regions.normalized_placeholders.insert(universal);
+                Some(rv)
+            }
             _ => None,
         };
         let interner = self.interner();
@@ -4320,11 +4333,38 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
                 Ty::new(interner, TyKind::Adt(def, GenericArgs::new_from_iter(args)))
             }
+            (TyKind::FnPtr(a, header), TyKind::FnPtr(b, inferred_header))
+                if header == inferred_header
+                    && a.skip_binder().inputs_and_output.len()
+                        == b.skip_binder().inputs_and_output.len() =>
+            {
+                let tys: Option<Vec<_>> = a
+                    .skip_binder()
+                    .inputs_and_output
+                    .iter()
+                    .zip(b.skip_binder().inputs_and_output.iter())
+                    .map(|(a, b)| zip(a, b))
+                    .collect();
+                let tys = hir_ty::next_solver::Tys::new_from_iter(tys?);
+                Ty::new(
+                    interner,
+                    TyKind::FnPtr(
+                        a.rebind(rustc_type_ir::FnSigTys { inputs_and_output: tys }),
+                        header,
+                    ),
+                )
+            }
             _ => {
                 let erase = |ty: Ty<'db>| {
                     rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner))
                 };
-                if erase(lowered) != erase(inferred) {
+                // A projection rust-analyzer normalized where rustc keeps it as written, as
+                // under a `for<'a>`: `<&'a () as Trait>::Ty` inferred as `()`.
+                let normalizes = || {
+                    matches!(lowered.kind(), TyKind::Alias(..))
+                        && normalize(self.ctx, erase(lowered)).map(erase) == Some(erase(inferred))
+                };
+                if erase(lowered) != erase(inferred) && !normalizes() {
                     return None;
                 }
                 lowered
@@ -4469,6 +4509,22 @@ impl<'db> Builder<'_, '_, 'db> {
                                 Ty::new_fn_ptr(self.interner(), rustc_type_ir::Binder::dummy(sig));
                             self.relate(source, target, Variance::Covariant, at);
                         }
+                    }
+                    // rustc's: the closure's signature as a `fn` pointer's, a subtype of the
+                    // target, higher-ranked as both are: `for<'a> fn(<&'a () as Trait>::Ty)`
+                    // of `|_| {}` normalizes the projection for a placeholder.
+                    CastKind::PointerCoercion(hir_ty::PointerCast::ClosureFnPointer(_))
+                        if let TyKind::Closure(_, args) = source.kind()
+                            && let TyKind::FnPtr(to, _) = target.kind()
+                            && !to.bound_vars().is_empty()
+                            && let sig = args.as_closure().sig()
+                            && let &[tupled] = sig.skip_binder().inputs().as_slice()
+                            && let TyKind::Tuple(_) = tupled.kind() =>
+                    {
+                        let interner = self.interner();
+                        let sig = interner
+                            .signature_unclosure(sig, hir_ty::next_solver::abi::Safety::Safe);
+                        self.relate(Ty::new_fn_ptr(interner, sig), target, Variance::Covariant, at);
                     }
                     CastKind::PointerCoercion(hir_ty::PointerCast::ClosureFnPointer(_)) => {
                         if let TyKind::Closure(_, args) = source.kind()
