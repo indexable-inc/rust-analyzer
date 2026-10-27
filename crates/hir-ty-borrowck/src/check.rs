@@ -1126,6 +1126,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     fn consume_rvalue(&mut self, location: Location, rvalue: &Rvalue, span: MirSpan) {
         match rvalue {
             Rvalue::Ref(..) if self.loans.promoted.contains(&location) => (),
+            // Lowering computes `offset_of!` as the address of the field of a value at address
+            // 0, where rustc has `NullOp::OffsetOf`, which accesses no place.
+            Rvalue::Ref(..)
+                if matches!(span, MirSpan::ExprId(expr)
+                    if matches!(self.ctx.store[expr], hir_def::hir::Expr::OffsetOf(_))) => {}
             Rvalue::Ref(kind, place) => {
                 let place = PlaceRef::of(place);
                 let (access, depth, action) = match kind {
