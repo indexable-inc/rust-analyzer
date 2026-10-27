@@ -434,7 +434,6 @@ impl Sysroot {
         library_manifest: &ManifestPath,
         err: Option<anyhow::Error>,
     ) -> RustLibSrcWorkspace {
-
         // Patch out `rustc-std-workspace-*` crates to point to the real crates.
         // This is done prior to `CrateGraph` construction to prevent de-duplication logic from failing.
         let patches = {
