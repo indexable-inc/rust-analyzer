@@ -2771,12 +2771,7 @@ impl<'db> Evaluator<'db> {
                 TyKind::RawPtr(..) => {
                     let Some(addr) = bytes.get(..this.ptr_size()) else { return Ok(()) };
                     let addr = from_bytes!(usize, addr);
-                    if let Some(Allocated { start, size, align }) = this.allocation_at(addr)
-                        && let Ok(memory) = this.read_memory(Address::from_usize(start), size)
-                    {
-                        mm.insert(start, memory.into());
-                        mm.note_align(start, align);
-                    }
+                    behind_raw(this, addr, mm, stack_depth_limit - 1)?;
                 }
                 TyKind::Ref(_, t, _) => {
                     let size = this.size_align_of(t, locals)?;
@@ -2969,6 +2964,49 @@ impl<'db> Evaluator<'db> {
                     rec(this, bytes, ty, locals, mm, stack_depth_limit - 1)?;
                 }
                 _ => (),
+            }
+            Ok(())
+        }
+        /// Keeps the whole allocation `addr` is in, the type of which a raw pointer does not
+        /// say, and what every word of it that is in another allocation or a static points
+        /// to: the reader of the map takes each such word to be a pointer, as it is in a
+        /// `NonNull<()>` to a value with a `&str` in it (std's `io::Error` of a message).
+        fn behind_raw<'db>(
+            this: &Evaluator<'db>,
+            addr: usize,
+            mm: &mut ComplexMemoryMap<'db>,
+            stack_depth_limit: usize,
+        ) -> Result<'db, ()> {
+            if stack_depth_limit.checked_sub(1).is_none() {
+                return Err(MirEvalError::StackOverflow);
+            }
+            let pointee = this.static_memory.iter().find(|&&(start, size, _)| {
+                addr.checked_sub(start).is_some_and(|offset| offset < size.max(1))
+            });
+            if let Some(&(start, size, id)) = pointee {
+                let pointee = crate::StaticMemory { start, size, id };
+                if !mm.statics.contains(&pointee) {
+                    mm.statics.push(pointee);
+                }
+                return Ok(());
+            }
+            let Some(Allocated { start, size, align }) = this.allocation_at(addr) else {
+                return Ok(());
+            };
+            if mm.memory.get(&start).is_some_and(|it| it.len() >= size) {
+                return Ok(());
+            }
+            let Ok(memory) = this.read_memory(Address::from_usize(start), size) else {
+                return Ok(());
+            };
+            let memory = memory.to_vec();
+            mm.insert(start, memory.clone().into());
+            mm.note_align(start, align);
+            for word in memory.chunks_exact(this.ptr_size()) {
+                let inner = from_bytes!(usize, word);
+                if inner != 0 {
+                    behind_raw(this, inner, mm, stack_depth_limit - 1)?;
+                }
             }
             Ok(())
         }
