@@ -551,8 +551,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         else {
             return Ok(None);
         };
-        // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does.
-        if bk == BorrowKind::Shared
+        // `CONST.len()` borrows a promoted constant just as `(&CONST).len()` does, and
+        // `[][..]` mutably an empty array just as `&mut []` does (rustc's `validate_ref`).
+        let promotable_kind = match bk {
+            BorrowKind::Shared => true,
+            BorrowKind::Mut {
+                kind: super::MutBorrowKind::Default | super::MutBorrowKind::TwoPhasedBorrow,
+            } => self.is_empty_array(expr_id),
+            BorrowKind::Shallow
+            | BorrowKind::Mut { kind: super::MutBorrowKind::ClosureCapture } => false,
+        };
+        if promotable_kind
             && rest.is_empty()
             && p.local.into_raw().into_u32() as usize >= locals
             && p.projection.as_slice().is_empty()
