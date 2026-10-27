@@ -353,9 +353,10 @@ impl WorkspaceBuildScripts {
     ) -> anyhow::Result<WorkspaceBuildScripts> {
         let mut res = WorkspaceBuildScripts::default();
         for package in workspace.packages() {
-            let is_proc_macro = workspace[package].targets.iter().any(|&it| {
-                matches!(workspace[it].kind, TargetKind::Lib { is_proc_macro: true })
-            });
+            let is_proc_macro = workspace[package]
+                .targets
+                .iter()
+                .any(|&it| matches!(workspace[it].kind, TargetKind::Lib { is_proc_macro: true }));
             let data = BuildScriptOutput {
                 proc_macro_dylib_path: match is_proc_macro {
                     true => ProcMacroDylibPath::NotBuilt,
