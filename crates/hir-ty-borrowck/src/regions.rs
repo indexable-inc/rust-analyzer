@@ -6185,27 +6185,47 @@ fn static_trait(db: &dyn hir_ty::db::HirDatabase, trait_: hir_def::TraitId) -> b
     })
 }
 
-/// Whether the type `ty` in `store` writes `Self`.
+/// Whether the type `ty` in `store` writes `Self`, anywhere in it: in a trait object's or
+/// `impl Trait`'s bounds and their associated type bindings (`&mut dyn FnMut(&mut Self) ->
+/// Self`) and in a function pointer's signature too.
 fn writes_self(
     store: &hir_def::expr_store::ExpressionStore,
     ty: hir_def::hir::type_ref::TypeRefId,
 ) -> bool {
-    use hir_def::{expr_store::path::GenericArg, hir::type_ref::TypeRef};
+    use hir_def::{
+        expr_store::path::{GenericArg, GenericArgs, Path},
+        hir::type_ref::{TypeBound, TypeRef},
+    };
+    fn args(store: &hir_def::expr_store::ExpressionStore, generic: &GenericArgs) -> bool {
+        generic
+            .args
+            .iter()
+            .any(|arg| matches!(arg, GenericArg::Type(it) if writes_self(store, *it)))
+            || generic.bindings.iter().any(|binding| {
+                binding.type_ref.is_some_and(|it| writes_self(store, it))
+                    || binding.args.as_ref().is_some_and(|it| args(store, it))
+                    || binding.bounds.iter().any(|it| bound(store, it))
+            })
+    }
+    fn path(store: &hir_def::expr_store::ExpressionStore, path: &Path) -> bool {
+        path.is_self_type()
+            || path.qualifier().is_some_and(|it| it.is_self_type())
+            || path.type_anchor().is_some_and(|it| writes_self(store, it))
+            || path.generic_args().into_iter().flatten().flatten().any(|it| args(store, it))
+    }
+    fn bound(store: &hir_def::expr_store::ExpressionStore, bound: &TypeBound) -> bool {
+        bound.as_path(store).is_some_and(|(it, _)| path(store, it))
+    }
     match &store[ty] {
-        TypeRef::Path(path) => {
-            path.is_self_type()
-                || path.qualifier().is_some_and(|it| it.is_self_type())
-                || path.type_anchor().is_some_and(|it| writes_self(store, it))
-                || path.generic_args().into_iter().flatten().flatten().any(|args| {
-                    args.args
-                        .iter()
-                        .any(|arg| matches!(arg, GenericArg::Type(it) if writes_self(store, *it)))
-                })
-        }
+        TypeRef::Path(it) => path(store, it),
         TypeRef::Tuple(tys) => tys.iter().any(|&it| writes_self(store, it)),
         TypeRef::RawPtr(it, _) | TypeRef::Slice(it) => writes_self(store, *it),
         TypeRef::Reference(it) => writes_self(store, it.ty),
         TypeRef::Array(it) => writes_self(store, it.ty),
+        TypeRef::Fn(it) => it.params.iter().any(|&(_, it)| writes_self(store, it)),
+        TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
+            bounds.iter().any(|it| bound(store, it))
+        }
         _ => false,
     }
 }
