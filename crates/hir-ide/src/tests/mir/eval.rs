@@ -1115,6 +1115,105 @@ fn main<'a, T: Foo + Bar + Baz>(
 }
 
 #[test]
+fn statement_macro_in_the_parentheses_of_another() {
+    // rustc parses `twice!(n += 1;)` with no `;` after it as an expression, so the outer
+    // call's expansion, two calls with nothing between, does not parse (#154).
+    check_error_with(
+        r#"
+macro_rules! twice {
+    ($($body:tt)*) => {
+        $($body)*
+        $($body)*
+    };
+}
+
+fn main() {
+    let mut n = 0u32;
+    twice!(twice!(n += 1;));
+}
+"#,
+        |e| {
+            matches!(
+                e,
+                MirEvalError::MirLowerError(_, MirLowerError::NotSupported(why))
+                    if why.starts_with("macro call in parentheses or brackets with no `;` after it")
+            )
+        },
+    );
+    // Braced, each call is a statement of its own, and both compile it.
+    check_pass(
+        r#"
+//- minicore: panic
+macro_rules! twice {
+    ($($body:tt)*) => {
+        $($body)*
+        $($body)*
+    };
+}
+
+fn main() {
+    let mut n = 0u32;
+    twice! { twice! { n += 1; } }
+    if n != 4 {
+        panic!();
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn statement_macro_last_in_another_statement_macro() {
+    // A call last in another's expansion ends where the expansion does: it is a statement
+    // macro where the outer call was one (`m!(..);`), and its expansion may be statements,
+    // as rustc accepts.
+    check_pass(
+        r#"
+//- minicore: panic
+macro_rules! two { ($($t:tt)*) => { $($t)* $($t)* } }
+macro_rules! outer { ($n:ident) => { two!($n += 1;) } }
+macro_rules! bind { ($n:ident) => { let $n = 42u32; } }
+macro_rules! binds { ($n:ident) => { bind!($n) } }
+macro_rules! nop { () => {} }
+macro_rules! nops { () => { let _x = 1; nop!() } }
+
+fn main() {
+    let mut n = 0u32;
+    outer!(n);
+    if n != 2 {
+        panic!();
+    }
+    binds!(x);
+    if x != 42 {
+        panic!();
+    }
+    nops!();
+}
+"#,
+    );
+    // Where the outer call is an expression, so is one last in its expansion: rustc rejects
+    // `outer!()` as the value of a block when it expands to a call of several statements.
+    check_error_with(
+        r#"
+macro_rules! two { ($($t:tt)*) => { $($t)* $($t)* } }
+macro_rules! outer { () => { two!(n += 1;) } }
+
+fn main() {
+    let mut n = 0u32;
+    let _ = { outer!() };
+}
+"#,
+        |e| {
+            matches!(
+                e,
+                MirEvalError::MirLowerError(_, MirLowerError::NotSupported(why))
+                    if why.starts_with("macro call in parentheses or brackets with no `;` after it")
+            )
+        },
+    );
+}
+
+#[test]
 fn format_args_pass() {
     check_pass(
         r#"

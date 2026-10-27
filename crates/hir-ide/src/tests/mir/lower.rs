@@ -20,6 +20,41 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     })
 }
 
+/// Lowers every function of the fixture, each of which has to lower.
+fn lower_mir_all(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
+    let _tracing = setup_tracing();
+    let (db, file_ids) = TestDB::with_many_files(ra_fixture);
+    crate::attach_db(db.as_dyn(), || {
+        let file_id = *file_ids.last().unwrap();
+        let module_id = db.module_for_file(file_id.file_id(&db));
+        let def_map = module_id.def_map(&db);
+        let scope = &def_map.module(&db, module_id).scope(&db);
+        let funcs = scope.declarations().filter_map(|x| match x {
+            hir_def::ModuleDefId::FunctionId(it) => Some(it),
+            _ => None,
+        });
+        for func in funcs {
+            if let Err(e) = db.mir_body(func.into()) {
+                panic!("{func:?} does not lower: {e:?}");
+            }
+        }
+    })
+}
+
+#[test]
+fn builtin_macro_last_in_a_block() {
+    // A builtin's expansion is rust-analyzer's own (`builtin #asm (..)`), not the statements
+    // rustc parses: a call of one in parentheses at a block's end is not refused (#154).
+    lower_mir_all(
+        r#"
+//- minicore: asm
+fn f() {
+    unsafe { core::arch::asm!("nop") }
+}
+"#,
+    );
+}
+
 #[test]
 fn dyn_projection_with_auto_traits_regression_next_solver() {
     lower_mir(

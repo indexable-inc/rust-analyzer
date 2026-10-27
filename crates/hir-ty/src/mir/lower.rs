@@ -7,7 +7,11 @@ use base_db::Crate;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, GenericParamId, HasModule,
     ItemContainerId, LocalFieldId, Lookup, TraitId,
-    expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
+    expr_store::{
+        Body, ExpressionStore, HygieneId,
+        body::{Param, body_syntax},
+        path::Path,
+    },
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
         CoroutineKind, CoroutineSource, ExprId, ExprOrPatId, LabelId, Literal, LoopSource,
@@ -4370,27 +4374,120 @@ fn mir_body_for_coroutine_cycle_result<'db>(
     Err(MirLowerError::Loop)
 }
 
-/// Refuses a body with a macro call that failed to expand: what stands in for the expansion
-/// is a guess, where rustc stops.
+/// Refuses a body with a macro call that failed to expand, or whose expansion is not what
+/// rustc parses it as: what stands in for the expansion is a guess, where rustc stops.
 fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Result<'db, ()> {
     if let Some(message) = failed_expansion(db, owner) {
-        not_supported!("macro call that failed to expand: {message}");
+        not_supported!("{message}");
     }
     Ok(())
 }
 
-/// Why the first macro call of the body that failed to expand did. A query of its own: the
-/// source map it reads changes with every edit above the body, and what it finds does not.
+/// What is wrong with the first macro call of the body that failed to expand or whose
+/// expansion is not what rustc parses it as. A query of its own: the source map it reads
+/// changes with every edit above the body, and what it finds does not.
 #[salsa::tracked(returns(ref))]
 fn failed_expansion<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Option<String> {
-    let source_map = match owner.expression_store_owner(db) {
-        ExpressionStoreOwnerId::Body(def) => &Body::unmoved_source_map(db, def).store,
-        owner => ExpressionStore::with_source_map(db, owner).1,
+    use syntax::AstNode;
+    let (source_map, own) = match owner.expression_store_owner(db) {
+        ExpressionStoreOwnerId::Body(def) => {
+            // The map of [`Body::relative`] is of the body's own tree, which an edit elsewhere
+            // in its file leaves as it is: a call in the file is found in that tree.
+            let own = match Body::relative(db, def) {
+                Some(_) => body_syntax(db, def).as_ref().map(|it| (it.file_id, it.root(db))),
+                None => None,
+            };
+            (&Body::unmoved_source_map(db, def).store, own)
+        }
+        owner => (ExpressionStore::with_source_map(db, owner).1, None),
     };
-    source_map.macro_calls().find_map(|(_, call)| {
-        let error = call.parse_macro_expansion(db).err.as_ref()?;
-        Some(error.render_to_string(db).message)
+    let root_of = |file: hir_expand::HirFileId| match &own {
+        Some((own_file, root)) if *own_file == file => root.clone(),
+        _ => file.parse_or_expand(db),
+    };
+    let site_of = |ptr: hir_expand::InFile<hir_def::expr_store::MacroCallPtr>| {
+        let site = ptr.value.syntax_node_ptr().try_to_node(&root_of(ptr.file_id))?;
+        syntax::ast::MacroCall::cast(site)
+    };
+    // The call each macro file of the body is the expansion of, for one last in it.
+    let calls: rustc_hash::FxHashMap<_, _> =
+        source_map.macro_calls().map(|(ptr, call)| (call, ptr)).collect();
+    let enclosing = |file: hir_expand::MacroCallId| {
+        let ptr = *calls.get(&file)?;
+        Some((site_of(ptr)?, ptr.file_id))
+    };
+    source_map.macro_calls().find_map(|(ptr, call)| {
+        let expansion = call.parse_macro_expansion(db);
+        if let Some(error) = &expansion.err {
+            let message = error.render_to_string(db).message;
+            return Some(format!("macro call that failed to expand: {message}"));
+        }
+        // A builtin's expansion is rust-analyzer's own stand-in (`builtin #asm (..)`), not
+        // what rustc parses: the rule is of what a macro is written to expand to.
+        let written = matches!(
+            call.loc(db).def.kind,
+            hir_expand::MacroDefKind::Declarative(..) | hir_expand::MacroDefKind::ProcMacro(..)
+        );
+        if !written {
+            return None;
+        }
+        // rustc parses a call in parentheses or brackets with no `;` after it as an
+        // expression, so its expansion is to be one expression (`parse_stmt_mac`); the
+        // parser here takes it as statements, which a call of a macro of several statements
+        // in the parentheses of another's expands to (#154).
+        let Some(call_site) = site_of(ptr) else {
+            return Some("macro call whose site is not in its tree".to_owned());
+        };
+        if !is_expression_call(&call_site, ptr.file_id, &enclosing) {
+            return None;
+        }
+        let statements = syntax::ast::MacroStmts::cast(expansion.value.0.syntax_node())?;
+        let count = statements.statements().count();
+        if count == 0 && statements.expr().is_some() {
+            return None;
+        }
+        let what = match (count, statements.expr().is_some()) {
+            (0, false) => "nothing".to_owned(),
+            (n, false) => format!("{n} statements and no expression"),
+            (n, true) => format!("{n} statements before its expression"),
+        };
+        Some(format!(
+            "macro call in parentheses or brackets with no `;` after it, which rustc \
+             parses as one expression, whose expansion is {what}"
+        ))
     })
+}
+
+/// Whether rustc parses `call` as an expression (`parse_stmt_mac`): in statement position,
+/// in parentheses or brackets, with no `;` after it. One last in another call's expansion
+/// ends where the expansion does, and is what that call is: a statement where the call was
+/// one, as `m!(..);` or `m! { .. }`. `enclosing` finds the call a macro file expands.
+fn is_expression_call(
+    call: &syntax::ast::MacroCall,
+    file: hir_expand::HirFileId,
+    enclosing: &dyn Fn(
+        hir_expand::MacroCallId,
+    ) -> Option<(syntax::ast::MacroCall, hir_expand::HirFileId)>,
+) -> bool {
+    use syntax::{AstNode, SyntaxKind::*, ast};
+    let Some(parent) = call.syntax().parent().filter(|it| it.kind() == MACRO_EXPR) else {
+        return false;
+    };
+    let Some(grandparent) = parent.parent() else { return false };
+    if call.token_tree().is_some_and(|it| it.l_curly_token().is_some()) {
+        return false;
+    }
+    match grandparent.kind() {
+        EXPR_STMT => {
+            ast::ExprStmt::cast(grandparent).is_none_or(|it| it.semicolon_token().is_none())
+        }
+        STMT_LIST => true,
+        MACRO_STMTS => match file.macro_file().and_then(enclosing) {
+            Some((outer, file)) => is_expression_call(&outer, file, enclosing),
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// How the body of a closure gets at what the closure captured.
