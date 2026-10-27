@@ -54,7 +54,7 @@ use crate::{
     },
     per_ns::{Item, PerNs},
     tt,
-    visibility::{RawVisibility, Visibility},
+    visibility::{RawVisibility, Visibility, VisibilityExplicitness},
 };
 
 const GLOB_RECURSION_LIMIT: usize = 100;
@@ -377,6 +377,7 @@ impl<'db> DefCollector<'db> {
         }
 
         self.inject_prelude();
+        self.inject_std_extern_crate();
 
         if let Some(AttrsOrCfg::CfgDisabled(attrs)) = item_tree.top_level_attrs() {
             let (cfg_expr, _) = &**attrs;
@@ -615,6 +616,33 @@ impl<'db> DefCollector<'db> {
                 );
             }
         }
+    }
+
+    /// Defines the `extern crate std;` (`core` under `no_std`) that rustc inserts as the first
+    /// item of the crate root, as a private name in the root's type namespace.
+    ///
+    /// See compiler/rustc_builtin_macros/src/standard_library_imports.rs: rustc gives that item
+    /// a call-site name in edition 2015 and a def-site one from 2018 on. So in 2015 paths that
+    /// look the name up in the root module itself, such as `crate::std::...`, `super::std::...`
+    /// or a macro's `$crate::std::...` (lewton 0.10's own `try!`), find it, and in later editions
+    /// they do not (rustc: "could not find `std` in the crate root"). Plain paths reach the crate
+    /// through the extern prelude in every edition, which `seed_with_top_level` fills.
+    fn inject_std_extern_crate(&mut self) {
+        if self.def_map.data.no_core || self.def_map.data.edition != Edition::Edition2015 {
+            return;
+        }
+        let name = match self.def_map.data.no_std {
+            true => Name::new_symbol_root(sym::core),
+            false => Name::new_symbol_root(sym::std),
+        };
+        // Without the crate rustc stops with "can't find crate"; rust-analyzer has no item to
+        // point at then, and plain paths to it fail the same way.
+        let Some(&(krate_root, _)) = self.local_def_map().extern_prelude.get(&name) else {
+            return;
+        };
+        let root = self.def_map.root;
+        let vis = Visibility::Module(root, VisibilityExplicitness::Implicit);
+        self.update(root, &[(Some(name), PerNs::types(krate_root.into(), vis, None))], vis, None);
     }
 
     fn local_def_map(&mut self) -> &LocalDefMap {
