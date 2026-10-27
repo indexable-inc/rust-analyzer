@@ -39,7 +39,7 @@ use hir_ty::{
 };
 
 pub use outlives::Inferred;
-use outlives::{Known, Needs};
+use outlives::{Known, Needs, Wfcx};
 
 /// Where an error is: rustc's span of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
@@ -148,7 +148,12 @@ impl<'db> Check<'_, 'db> {
                         .map(|it| (it, Site::Field(variant, field))),
                 );
                 let mut found = Vec::new();
-                outlives::projection_needs(self.db, adt.into(), ty, &mut found);
+                outlives::projection_needs(
+                    self.db,
+                    &Wfcx::new(self.db, adt.into()),
+                    ty,
+                    &mut found,
+                );
                 needs.extend(found.into_iter().map(|it| (it, Site::Field(variant, field))));
             }
         }
@@ -157,8 +162,7 @@ impl<'db> Check<'_, 'db> {
     }
 
     /// The self type and trait arguments of an impl, which it and its items assume
-    /// well-formed. `None` when they have an error or an associated type: what normalizing
-    /// them would imply is not known here.
+    /// well-formed. `None` when they have an error.
     fn header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
         let db = self.db;
         let self_ty = db.impl_self_ty(impl_).instantiate_identity().skip_norm_wip();
@@ -170,10 +174,16 @@ impl<'db> Check<'_, 'db> {
                 _ => None,
             }));
         }
-        if header.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
+        if header.iter().any(|ty| ty.references_error()) {
             return None;
         }
         Some(header)
+    }
+
+    /// The impl's header, when it has no associated type: what normalizing it would imply
+    /// is not reasoned about for the impl itself and its associated types.
+    fn plain_header(&self, impl_: ImplId) -> Option<Vec<Ty<'db>>> {
+        self.header(impl_).filter(|header| !header.iter().any(|ty| ty.has_aliases()))
     }
 
     /// What an item knows: its where clauses and what the types it assumes well-formed imply.
@@ -189,7 +199,7 @@ impl<'db> Check<'_, 'db> {
 
     fn impl_(&mut self, impl_: ImplId) {
         let db = self.db;
-        let Some(header) = self.header(impl_) else { return };
+        let Some(header) = self.plain_header(impl_) else { return };
         let known = self.known(impl_.into(), &header);
         let mut needs = self.where_needs(impl_.into());
         // The header is well-formed: the trait bounds that asks hold.
@@ -199,7 +209,7 @@ impl<'db> Check<'_, 'db> {
                 _ => Site::ImplTrait(impl_),
             };
             let mut found = Vec::new();
-            outlives::trait_needs(db, impl_.into(), ty, &mut found);
+            outlives::trait_needs(db, &Wfcx::new(db, impl_.into()), ty, &mut found);
             needs.extend(found.into_iter().map(|it| (it, site)));
         }
 
@@ -282,14 +292,18 @@ impl<'db> Check<'_, 'db> {
                 })
             })
             .collect();
-        let mut assumed = inputs.clone();
-        if assumed.iter().any(|ty| ty.references_error() || ty.has_aliases()) {
+        if inputs.iter().any(|ty| ty.references_error()) {
             return;
         }
+        let wfcx = Wfcx::new(db, function.into());
+        // What it assumes well-formed is normalized for what that implies apart from the
+        // normalizing of its signature for its well-formedness, as rustc's implied bounds.
+        let mut assumed: Vec<Ty<'db>> = inputs.iter().map(|&ty| wfcx.normalize(ty)).collect();
         if let ItemContainerId::ImplId(impl_) = function.lookup(db).container {
             let Some(header) = self.header(impl_) else { return };
-            assumed.extend(header);
+            assumed.extend(header.into_iter().map(|ty| wfcx.normalize(ty)));
         }
+        assumed.retain(|ty| !ty.references_error());
         // An `impl Trait` it returns has those lifetimes too.
         let regions = hir_ty::elided_lifetimes(db, function).regions(&errors);
         let output = hir_ty::with_elided_regions(db, sig.output(), function, &regions);
@@ -305,17 +319,26 @@ impl<'db> Check<'_, 'db> {
             let known = self.known(function.into(), &assumed);
             self.trait_opaques(function, output, &known);
         }
-        if !output.has_aliases() {
-            assumed.push(output);
+        if !output.has_opaque_types() {
+            assumed.extend(Some(wfcx.normalize(output)).filter(|ty| !ty.references_error()));
             let known = self.known(function.into(), &assumed);
             let mut needs = self.where_needs(function.into());
-            // Its signature is well-formed: the trait bounds that asks hold.
+            // Its signature, normalized, is well-formed: what that needs of what outlives
+            // what holds, and so do the trait bounds it asks. Without an associated type
+            // what a type needs is what it implies.
             let sites = (0..inputs.len() as u32)
                 .map(|it| Site::Param(function, it))
                 .chain([Site::Output(function)]);
             for (&ty, site) in inputs.iter().chain([&output]).zip(sites) {
                 let mut found = Vec::new();
-                outlives::trait_needs(db, function.into(), ty, &mut found);
+                let normalized = wfcx.normalize(ty);
+                if normalized.references_error() {
+                    continue;
+                }
+                if ty.has_aliases() {
+                    outlives::wf(db, &mut self.inferred, normalized, &mut found);
+                }
+                outlives::trait_needs(db, &wfcx, normalized, &mut found);
                 needs.extend(found.into_iter().map(|it| (it, site)));
             }
             self.resolve(&known, needs);

@@ -16,8 +16,8 @@ use hir_ty::{
     GenericPredicates,
     db::HirDatabase,
     next_solver::{
-        AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, Region, SolverDefId,
-        StoredRegion, StoredTy, Ty, TyKind,
+        AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, ParamEnv, Region,
+        SolverDefId, StoredRegion, StoredTy, Ty, TyKind, infer::InferCtxt,
     },
 };
 
@@ -288,13 +288,14 @@ fn wf_into<'db>(
 }
 
 /// What the impls of the associated types in `ty` need of what outlives what, given the where
-/// clauses of `def`: rustc's well-formedness asks that the trait of each be implemented, and
+/// clauses of the item `wfcx` checks: rustc's well-formedness asks that the trait of each be
+/// implemented, and
 /// its inference of an ADT's outlives bounds (RFC 2093) does not infer these, so a lifetime
 /// parameter can fail them too. `<T as Dummy<'a>>::Out` with only
 /// `impl<'a, T: 'a> Dummy<'a> for T` needs `T: 'a`.
 pub(crate) fn projection_needs<'db>(
     db: &'db dyn HirDatabase,
-    def: hir_def::GenericDefId,
+    wfcx: &Wfcx<'db>,
     ty: Ty<'db>,
     out: &mut Vec<Needs<'db>>,
 ) {
@@ -314,18 +315,18 @@ pub(crate) fn projection_needs<'db>(
             _ => None,
         })
         .collect();
-    prove_needs(db, def, predicates, out);
+    prove_needs(wfcx, predicates, out);
 }
 
 /// What proving the trait bounds the well-formedness of `ty` asks needs of what outlives what,
-/// given the where clauses of `def`: of each associated type in it, that its trait is
+/// given the where clauses of the item `wfcx` checks: of each associated type in it, that its trait is
 /// implemented, and of each struct or enum, its where clauses. `ServiceChainBuilder<
 /// ServiceChain<P, S>, NS>` of `struct ServiceChainBuilder<P: Service, ..>` with only
 /// `impl<P: Service, S: Service> Service for ServiceChain<P, S> where P::Error: 'static`
 /// needs `P::Error: 'static`.
 pub(crate) fn trait_needs<'db>(
     db: &'db dyn HirDatabase,
-    def: hir_def::GenericDefId,
+    wfcx: &Wfcx<'db>,
     ty: Ty<'db>,
     out: &mut Vec<Needs<'db>>,
 ) {
@@ -361,7 +362,7 @@ pub(crate) fn trait_needs<'db>(
             _ => (),
         }
     }
-    prove_needs(db, def, predicates, out);
+    prove_needs(wfcx, predicates, out);
 }
 
 fn trait_predicate<'db>(
@@ -376,20 +377,66 @@ fn trait_predicate<'db>(
     .upcast(interner)
 }
 
+/// rustc's `WfCheckingCtxt`: an inference context in the environment of the item checked,
+/// which the solver's proofs and normalizations of one check share.
+pub(crate) struct Wfcx<'db> {
+    interner: DbInterner<'db>,
+    infcx: InferCtxt<'db>,
+    env: ParamEnv<'db>,
+}
+
+impl<'db> Wfcx<'db> {
+    pub(crate) fn new(db: &'db dyn HirDatabase, def: hir_def::GenericDefId) -> Self {
+        use hir_def::HasModule as _;
+        use hir_ty::next_solver::{TypingMode, infer::DbInternerInferExt as _};
+        let interner = DbInterner::new_with(db, def.module(db).krate(db)).with_regions();
+        let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        Wfcx { interner, infcx, env: db.trait_environment(def) }
+    }
+
+    /// How many region obligations and constraints the solver has made so far.
+    fn mark(&self) -> (usize, usize) {
+        let mut inner = self.infcx.inner.borrow_mut();
+        let obligations = inner.region_obligations().len();
+        (obligations, inner.unwrap_region_constraints().region_constraint_data().constraints.len())
+    }
+
+    /// `ty` normalized, as rustc's `WfCheckingCtxt::normalize`. A lifetime normalizing makes,
+    /// as one of a `for<'f>` where clause it uses, is a region variable of its own each time:
+    /// rustc normalizes what a signature implies apart from its well-formedness, so
+    /// `<Q as QueryBase>::Db` with `Q: for<'f> AsyncQueryFunction<'f>` (a supertrait
+    /// `QueryBase<Db = <Self as AsyncQueryFunction<'f>>::SendDb>`) is a `SendDb` of a
+    /// different lifetime in each.
+    pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+        use hir_ty::next_solver::{
+            infer::traits::ObligationCause, obligation_ctxt::ObligationCtxt,
+        };
+        if !ty.has_aliases() || ty.has_escaping_bound_vars() {
+            return ty;
+        }
+        let ocx = ObligationCtxt::new(&self.infcx);
+        let Ok(normalized) = ocx.deeply_normalize(&ObligationCause::dummy(), self.env, ty) else {
+            return ty;
+        };
+        let mut inner = self.infcx.inner.borrow_mut();
+        let mut constraints = inner.unwrap_region_constraints();
+        rustc_type_ir::fold_regions(self.interner, normalized, |region, _| match region.kind() {
+            RegionKind::ReVar(var) => constraints.opportunistic_resolve_var(self.interner, var),
+            _ => region,
+        })
+    }
+}
+
 /// What proving `predicates` with the trait solver needs of what outlives what, given the
-/// where clauses of `def`: the where clauses of the impls that prove them. Nothing when one
-/// is not proven.
+/// where clauses of the item `wfcx` checks: the where clauses of the impls that prove them.
+/// Nothing when one is not proven.
 fn prove_needs<'db>(
-    db: &'db dyn HirDatabase,
-    def: hir_def::GenericDefId,
+    wfcx: &Wfcx<'db>,
     predicates: Vec<hir_ty::next_solver::Predicate<'db>>,
     out: &mut Vec<Needs<'db>>,
 ) {
-    use hir_def::HasModule as _;
     use hir_ty::next_solver::{
-        TypingMode,
         infer::{
-            DbInternerInferExt as _,
             region_constraints::Constraint,
             traits::{Obligation, ObligationCause},
         },
@@ -398,15 +445,14 @@ fn prove_needs<'db>(
     if predicates.is_empty() {
         return;
     }
-    let interner = DbInterner::new_with(db, def.module(db).krate(db)).with_regions();
-    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-    let env = db.trait_environment(def);
+    let (interner, infcx) = (wfcx.interner, &wfcx.infcx);
+    let (obligations_before, constraints_before) = wfcx.mark();
     for predicate in predicates {
-        let mut ocx = ObligationCtxt::new(&infcx);
+        let mut ocx = ObligationCtxt::new(infcx);
         ocx.register_obligation(Obligation::new(
             interner,
             ObligationCause::dummy(),
-            env,
+            wfcx.env,
             predicate,
         ));
         if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
@@ -414,10 +460,13 @@ fn prove_needs<'db>(
         }
     }
     let mut inner = infcx.inner.borrow_mut();
-    let obligations: Vec<_> =
-        inner.region_obligations().iter().map(|it| (it.sup_type, it.sub_region)).collect();
-    let constraints =
-        inner.unwrap_region_constraints().region_constraint_data().constraints.clone();
+    let obligations: Vec<_> = inner.region_obligations()[obligations_before..]
+        .iter()
+        .map(|it| (it.sup_type, it.sub_region))
+        .collect();
+    let constraints = inner.unwrap_region_constraints().region_constraint_data().constraints
+        [constraints_before..]
+        .to_vec();
     drop(inner);
     // The impl's lifetimes are inference variables the solver equates with the item's.
     let mut equal: FxHashMap<rustc_type_ir::RegionVid, Region<'db>> = FxHashMap::default();
@@ -777,23 +826,40 @@ impl<'db> Known<'db> {
             return true;
         }
         let interner = DbInterner::new_no_crate(db);
-        let declared = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
-            .iter_instantiated(interner, alias.args.as_slice())
-            .any(|clause| match clause.kind().skip_binder() {
-                ClauseKind::TypeOutlives(OutlivesPredicate(bounded, bound)) => {
-                    bounded == ty
-                        && !bound.has_escaping_bound_vars()
-                        && self.region_outlives(bound, region)
-                }
-                _ => false,
-            });
-        if declared {
+        let declared: Vec<Region<'db>> =
+            rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+                .iter_instantiated(interner, alias.args.as_slice())
+                .filter_map(|clause| match clause.kind().skip_binder() {
+                    ClauseKind::TypeOutlives(OutlivesPredicate(bounded, bound))
+                        if bounded == ty && !bound.has_escaping_bound_vars() =>
+                    {
+                        Some(bound)
+                    }
+                    _ => None,
+                })
+                .collect();
+        if declared.iter().any(|&bound| self.region_outlives(bound, region)) {
             return true;
         }
+        // rustc's `alias_ty_must_outlive`: with a region variable normalizing made in it and
+        // no bound from the where clauses or the trait, even one of other lifetimes, its
+        // arguments must outlive the region, which a variable can be made to. With one, that
+        // is verified instead, and a variable outlives nothing: `<Q as Trait<'?2>>::Out: 'a`
+        // known only of `<Q as Trait<'?1>>::Out` does not hold.
+        let erased = |ty: Ty<'db>| {
+            rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_erased(interner))
+        };
+        let verified = ty.has_infer_regions()
+            && (!declared.is_empty()
+                || self.types.iter().any(|&(known, _)| erased(known) == erased(ty)));
+        let outlives = |longer: Region<'db>| {
+            !(verified && matches!(longer.kind(), RegionKind::ReVar(_)))
+                && self.region_outlives(longer, region)
+        };
         alias.args.iter().all(|arg| match arg.kind() {
-            GenericArgKind::Lifetime(longer) => self.region_outlives(longer, region),
+            GenericArgKind::Lifetime(longer) => outlives(longer),
             GenericArgKind::Type(arg) => components(arg).into_iter().all(|it| match it {
-                Component::Region(longer) => self.region_outlives(longer, region),
+                Component::Region(longer) => outlives(longer),
                 Component::Param(param) => self
                     .types
                     .iter()

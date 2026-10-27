@@ -1529,6 +1529,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         use hir_ty_wfcheck::Site;
         let db = self.db;
         for diagnostic in &hir_ty_wfcheck::wfcheck(db, def).diagnostics {
+            let mut self_param = None;
             let source = match diagnostic.site {
                 Site::Field(variant, field) => {
                     let (fields, source_map) = variant.fields_with_source_map(db);
@@ -1563,10 +1564,21 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 }
                 Site::Param(function, index) => {
                     let (signature, source_map) = FunctionSignature::with_source_map(db, function);
-                    signature
+                    let typed = signature
                         .params
                         .get(index as usize)
-                        .and_then(|&ty| source_map.type_syntax(ty).ok())
+                        .and_then(|&ty| source_map.type_syntax(ty).ok());
+                    // `&'a mut self` has no type written: rustc points at the parameter.
+                    if typed.is_none() && index == 0 && signature.has_self_param() {
+                        let source = hir_def::src::HasSource::source(function.lookup(db), db);
+                        if let Some(param) =
+                            source.value.param_list().and_then(|it| it.self_param())
+                        {
+                            self_param =
+                                Some(source.with_value(SyntaxNodePtr::new(param.syntax())));
+                        }
+                    }
+                    typed
                 }
                 Site::Output(function) => {
                     let (signature, source_map) = FunctionSignature::with_source_map(db, function);
@@ -1616,10 +1628,13 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     })
                 }
             };
-            let Some(source) = source else { continue };
+            let Some(node) = source.map(|it| it.map(|it| it.syntax_node_ptr())).or(self_param)
+            else {
+                continue;
+            };
             self.acc.push(
                 BorrowckError {
-                    node: source.map(|it| it.syntax_node_ptr()),
+                    node,
                     at_end: false,
                     code: diagnostic.code,
                     message: diagnostic.message.clone(),
