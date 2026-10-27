@@ -3,13 +3,17 @@
 use base_db::Crate;
 use hir_def::{
     AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ItemContainerId, ModuleDefId,
-    TypeAliasId, attrs::AttrFlags, nameres::crate_def_map, resolver::HasResolver,
+    TypeAliasId,
+    attrs::AttrFlags,
+    expr_store::Body,
+    nameres::{DefMap, crate_def_map},
+    resolver::HasResolver,
     signatures::ImplSignature,
 };
 use hir_expand::name::Name;
 use la_arena::ArenaMap;
 use rustc_type_ir::inherent::Ty as _;
-use syntax::ast;
+use syntax::{TextSize, ast};
 
 use crate::{
     ImplTraitId, InferBodyId, InferenceResult,
@@ -243,28 +247,81 @@ fn defined_type_aliases(
     })
 }
 
-/// Every function of the crate with a `#[define_opaque(..)]`.
+/// Every function of the crate with a `#[define_opaque(..)]`: in a module, in an impl, and in
+/// a block of a body, as std's `sys::paths::unix::split_paths_ref` has the function that
+/// defines `SplitPathsRef` inside it. Of a crate that is not local, a body is lowered for its
+/// blocks only when its text says `define_opaque`, so one written by a macro there is not found
+/// and its opaque type stays an error, which no function using it compiles with.
 #[salsa::tracked(returns(deref))]
 fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionId]> {
+    let local = krate.data(db).origin.is_local();
     let mut result = Vec::new();
-    let mut add = |func: FunctionId| {
-        if !AttrFlags::define_opaque(db, func).is_empty() {
-            result.push(func);
-        }
-    };
-    for (_, module) in crate_def_map(db, krate).modules(db) {
-        for def in module.scope(db).declarations() {
-            if let ModuleDefId::FunctionId(func) = def {
-                add(func);
+    collect(db, crate_def_map(db, krate), local, &mut result);
+    return result.into_boxed_slice();
+
+    fn collect(db: &dyn HirDatabase, def_map: &DefMap, local: bool, result: &mut Vec<FunctionId>) {
+        for (_, module) in def_map.modules(db) {
+            let scope = module.scope(db);
+            let mut holders: Vec<DefWithBodyId> = Vec::new();
+            for def in scope.declarations() {
+                match def {
+                    ModuleDefId::FunctionId(it) => holders.push(it.into()),
+                    ModuleDefId::ConstId(it) => holders.push(it.into()),
+                    ModuleDefId::StaticId(it) => holders.push(it.into()),
+                    _ => {}
+                }
             }
-        }
-        for impl_id in module.scope(db).impls() {
-            for &(_, item) in &impl_id.impl_items(db).items {
-                if let AssocItemId::FunctionId(func) = item {
-                    add(func);
+            for impl_id in scope.impls() {
+                for &(_, item) in &impl_id.impl_items(db).items {
+                    match item {
+                        AssocItemId::FunctionId(it) => holders.push(it.into()),
+                        AssocItemId::ConstId(it) => holders.push(it.into()),
+                        AssocItemId::TypeAliasId(_) => {}
+                    }
+                }
+            }
+            for owner in holders {
+                if let DefWithBodyId::FunctionId(func) = owner
+                    && !AttrFlags::define_opaque(db, func).is_empty()
+                {
+                    result.push(func);
+                }
+                if local || mentions_define_opaque(db, owner) {
+                    for (_, block) in Body::of(db, owner).blocks(db) {
+                        collect(db, block, local, result);
+                    }
                 }
             }
         }
     }
-    result.into_boxed_slice()
+}
+
+/// Whether the text of `owner` says `define_opaque`, in a file of its own: where its blocks
+/// may have a function with the attribute.
+fn mentions_define_opaque(db: &dyn HirDatabase, owner: DefWithBodyId) -> bool {
+    let (file_id, range) = match owner {
+        DefWithBodyId::FunctionId(it) => {
+            let id = it.loc(db).id;
+            (id.file_id, id.file_id.ast_id_map(db).get(id.value).text_range())
+        }
+        DefWithBodyId::ConstId(it) => {
+            let id = it.loc(db).id;
+            (id.file_id, id.file_id.ast_id_map(db).get(id.value).text_range())
+        }
+        DefWithBodyId::StaticId(it) => {
+            let id = it.loc(db).id;
+            (id.file_id, id.file_id.ast_id_map(db).get(id.value).text_range())
+        }
+        DefWithBodyId::VariantId(_) => return false,
+    };
+    let Some(file) = file_id.file_id() else { return false };
+    define_opaque_at(db, file).iter().any(|&at| range.contains(at))
+}
+
+/// Where the text of `file` says `define_opaque`.
+#[salsa::tracked(returns(deref))]
+fn define_opaque_at(db: &dyn HirDatabase, file: base_db::EditionedFileId) -> Box<[TextSize]> {
+    let text = db.file_text(file.file_id(db)).text(db);
+    let found = text.match_indices("define_opaque").map(|(at, _)| TextSize::from(at as u32));
+    found.collect()
 }

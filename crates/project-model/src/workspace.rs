@@ -1490,11 +1490,24 @@ fn cargo_to_crate_graph(
         for dep in &cargo[pkg].dependencies {
             let Some(&to) = pkg_to_lib_crate.get(&dep.pkg) else { continue };
             let Some(targets) = pkg_crates.get(&pkg) else { continue };
+            // An optional dependency no feature turns on is not built.
+            if dep.optional.as_ref().is_some_and(|key| !cargo[pkg].activates(key)) {
+                continue;
+            }
 
             let name = CrateName::new(&dep.name).unwrap();
             for &(from, kind) in targets {
                 // Build scripts may only depend on build dependencies.
                 if (dep.kind == DepKind::Build) != (kind == TargetKind::BuildScript) {
+                    continue;
+                }
+                // The standard library as built has no `cfg(test)`, and so no use for what
+                // its unit tests depend on: std's `rand`, which rustc's build of it has not.
+                if dep.kind == DepKind::Dev
+                    && sysroot_as_built()
+                    && cargo.is_sysroot()
+                    && matches!(kind, TargetKind::Lib { .. })
+                {
                     continue;
                 }
                 // Those are its unit tests' alone.
