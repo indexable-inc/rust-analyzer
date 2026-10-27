@@ -155,14 +155,13 @@ impl<'db> InferenceContext<'db> {
             .collect();
         debug!("calculate_diverging_fallback: diverging_roots={:?}", diverging_roots);
 
-        let mut diverging_fallback = FxHashMap::with_capacity_and_hasher(
-            diverging_roots.len(),
-            FxBuildHasher,
-        );
+        let mut diverging_fallback =
+            FxHashMap::with_capacity_and_hasher(diverging_roots.len(), FxBuildHasher);
         for vid in unresolved_variables.iter().filter_map(|ty| ty.ty_vid()) {
             if diverging_roots.contains(&self.table.infer_ctxt.root_var(vid)) {
                 debug!("fallback to !: {:?}", vid);
-                diverging_fallback.insert(Ty::new_var(self.interner(), vid), self.types.types.never);
+                diverging_fallback
+                    .insert(Ty::new_var(self.interner(), vid), self.types.types.never);
             }
         }
         diverging_fallback

@@ -151,11 +151,7 @@ pub(super) fn elaborate_drops<'db>(
                     Change::Uninit => false,
                     Change::Borrowed => continue,
                 };
-                writes.push((
-                    id,
-                    at,
-                    FlagWrite { paths: subtrees[effect.path].clone(), value },
-                ));
+                writes.push((id, at, FlagWrite { paths: subtrees[effect.path].clone(), value }));
             }
         }
         if let Some(terminator) = &block.terminator {
