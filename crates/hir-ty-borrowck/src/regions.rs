@@ -4400,6 +4400,24 @@ impl<'db> Builder<'_, '_, 'db> {
                         })
                         .collect::<Vec<_>>()
                 };
+                // rustc's `prove_aggregate_predicates`: a closure's where clauses are its
+                // creator's, which hold where it is made, with its parent args: so
+                // `for<'a> &'a S: 'a` is proven for a placeholder `'a`, needing `S: 'static`.
+                let parent_args = match ty.kind() {
+                    TyKind::Closure(_, args) => Some(args.as_closure().parent_args()),
+                    TyKind::Coroutine(_, args) => Some(args.as_coroutine().parent_args()),
+                    _ => None,
+                };
+                if let Some(parent_args) = parent_args {
+                    let def = self.ctx.owner.generic_def(self.ctx.db);
+                    let at = At { category: Category::Boring, span };
+                    self.predicates(
+                        def,
+                        GenericArgs::new_from_iter(parent_args.iter().copied().collect::<Vec<_>>()),
+                        at,
+                        true,
+                    );
+                }
                 let made = match ty.kind() {
                     TyKind::Closure(def, args) => Some((
                         def.0.loc(self.ctx.db).expr,
@@ -5051,10 +5069,22 @@ impl<'db> Builder<'_, '_, 'db> {
                         self.outlives(longer, shorter, at);
                     }
                 }
-                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region))
-                    if type_outlives
-                        && !rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) =>
-                {
+                ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) if type_outlives => {
+                    // A region of the type bound by the clause's `for<'a>` is a placeholder,
+                    // taken as `'static` as a placeholder in a type is where it is proven:
+                    // `for<'a> &'a S: 'a` needs `S: 'static`.
+                    let interner = self.interner();
+                    let ty =
+                        rustc_type_ir::fold_regions(interner, ty, |it, depth| match it.kind() {
+                            RegionKind::ReBound(
+                                rustc_type_ir::BoundVarIndexKind::Bound(binder),
+                                _,
+                            ) if binder == depth => Region::new_static(interner),
+                            _ => it,
+                        });
+                    if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&ty) {
+                        continue;
+                    }
                     let original = region;
                     let region = match region.kind() {
                         RegionKind::ReStatic => self.static_region(),
@@ -5135,7 +5165,6 @@ impl<'db> Builder<'_, '_, 'db> {
                     // Of a call written as one: `map[i] = v` calls `IndexMut::index_mut`, which
                     // is E0594 where only `Index` is implemented.
                     if self.prove(trait_ref, at)
-                        && !forall
                         && !forall
                         && at.category == Category::Predicate
                         && let MirSpan::ExprId(expr) = at.span
