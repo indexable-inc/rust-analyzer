@@ -841,11 +841,7 @@ pub fn stringify(
             TtElement::Subtree(subtree, _) => {
                 let close = match subtree.delimiter.kind {
                     // What a macro puts around an expression it was passed.
-                    DelimiterKind::Parenthesis
-                        if subtree.delimiter.open == subtree.delimiter.close =>
-                    {
-                        return false;
-                    }
+                    DelimiterKind::Parenthesis if expression_parens(subtree) => return false,
                     DelimiterKind::Parenthesis => ")",
                     DelimiterKind::Brace => "}",
                     // rustc does the same, for the `hex-literal` crate.
@@ -864,6 +860,14 @@ pub fn stringify(
         // The spacing of a token made by a macro says what follows it now.
         matches!(prev, TtElement::Leaf(Leaf::Punct(Punct { spacing: Spacing::Joint, .. })))
             || adjacent(end(prev), start(next))
+    }
+
+    /// Whether `subtree` is the parentheses `macro_rules!` puts around an expression it was
+    /// passed: both of the span of the fragment in the macro's body. A group a proc macro gave
+    /// the span of a group of the source it was handed, with `Group::set_span`, has one span
+    /// for both too, of the source's context, and its parentheses are the source's.
+    fn expression_parens(subtree: &Subtree) -> bool {
+        subtree.delimiter.open == subtree.delimiter.close && !subtree.delimiter.open.ctx.is_root()
     }
 
     /// rustc's `idents_would_merge`.
@@ -917,11 +921,7 @@ pub fn stringify(
                     let (open, close) = match subtree.delimiter.kind {
                         // What a macro puts around an expression it was passed, which is not
                         // in the source.
-                        DelimiterKind::Parenthesis
-                            if subtree.delimiter.open == subtree.delimiter.close =>
-                        {
-                            ("", "")
-                        }
+                        DelimiterKind::Parenthesis if expression_parens(subtree) => ("", ""),
                         // rustc puts a space inside a brace where the source had one after
                         // the opening one.
                         DelimiterKind::Brace => match content.clone().next() {
