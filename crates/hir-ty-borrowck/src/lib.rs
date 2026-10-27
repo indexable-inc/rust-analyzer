@@ -635,7 +635,14 @@ impl<'a, 'db> Ctx<'a, 'db> {
         if let Some(&known) = self.copy.borrow().get(&ty) {
             return known;
         }
-        let known = self.infcx.type_is_copy_modulo_regions(self.env, ty);
+        let known = match rustc_type_ir::TypeVisitableExt::has_non_region_infer(&ty) {
+            true => self.infcx.type_is_copy_modulo_regions(self.env, ty),
+            false => *is_copy_query(
+                self.db,
+                hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
+                ty.store(),
+            ),
+        };
         self.copy.borrow_mut().insert(ty, known);
         known
     }
@@ -666,6 +673,21 @@ impl<'a, 'db> Ctx<'a, 'db> {
     pub(crate) fn upvar_of_local(&self, local: LocalId) -> Option<usize> {
         self.upvars.iter().position(|it| it.local == local)
     }
+}
+
+/// Whether `ty`, its regions `'static`, is `Copy` in `env`: a query, as what it asks of the
+/// solver can be long (a future through every type it holds) and is the same in every body of
+/// the environment, and after an edit.
+#[salsa::tracked]
+fn is_copy_query(
+    db: &dyn HirDatabase,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: hir_ty::next_solver::StoredTy,
+) -> bool {
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    infcx.type_is_copy_modulo_regions(env.param_env, ty.as_ref())
 }
 
 /// `env` with the projections in its where clauses that name no parameter normalized, as

@@ -134,71 +134,122 @@ impl Cfg {
     }
 }
 
-/// The immediate dominator of each reachable block (Cooper, Harvey and Kennedy).
+/// The dominator tree of the reachable blocks, as rustc's: immediate dominators by semi-NCA
+/// (Lengauer and Tarjan's semidominators, then nearest common ancestors), and each block's
+/// entry and exit in a walk of the tree, so that whether one dominates another is two
+/// comparisons. The iterative algorithm walked dominator chains for every predecessor, which a
+/// long body of calls, each unwinding to one cleanup, made quadratic.
 pub(super) struct Dominators {
-    idom: Vec<usize>,
-    rank: Vec<usize>,
+    /// Each block's entry and exit in the walk of the tree; `usize::MAX` when unreachable.
+    enter: Vec<usize>,
+    exit: Vec<usize>,
 }
+
+const NONE: usize = usize::MAX;
 
 impl Dominators {
     pub(super) fn new(cfg: &Cfg) -> Self {
-        let count = cfg.reachable.len();
-        let mut rank = vec![usize::MAX; count];
-        for (position, &block) in cfg.order.iter().enumerate() {
-            rank[index(block)] = position;
-        }
-        let mut idom = vec![usize::MAX; count];
-        let Some(&start) = cfg.order.first() else { return Dominators { idom, rank } };
-        idom[index(start)] = index(start);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &block in &cfg.order[1..] {
-                let mut new = usize::MAX;
-                for &pred in &cfg.predecessors[index(block)] {
-                    let pred = index(pred);
-                    if idom[pred] == usize::MAX {
-                        continue;
-                    }
-                    new = if new == usize::MAX {
-                        pred
-                    } else {
-                        let (mut a, mut b) = (pred, new);
-                        while a != b {
-                            while rank[a] > rank[b] {
-                                a = idom[a];
-                            }
-                            while rank[b] > rank[a] {
-                                b = idom[b];
-                            }
-                        }
-                        a
-                    };
-                }
-                if new != usize::MAX && idom[index(block)] != new {
-                    idom[index(block)] = new;
-                    changed = true;
+        let start = cfg.order.first().map(|&it| index(it));
+        Self::of_graph(cfg.reachable.len(), start, &cfg.successors, &cfg.predecessors)
+    }
+
+    fn of_graph<S: AsRef<[BasicBlockId]>, P: AsRef<[BasicBlockId]>>(
+        count: usize,
+        start: Option<usize>,
+        successors: &[S],
+        predecessors: &[P],
+    ) -> Self {
+        let mut enter = vec![NONE; count];
+        let mut exit = vec![NONE; count];
+        let Some(start) = start else { return Dominators { enter, exit } };
+        // Depth-first preorder: `pre` of each block, `vertex` and `parent` by that number.
+        let mut pre = vec![NONE; count];
+        let mut vertex = Vec::new();
+        let mut parent = Vec::new();
+        let mut stack = vec![(start, NONE)];
+        while let Some((block, from)) = stack.pop() {
+            if pre[block] != NONE {
+                continue;
+            }
+            pre[block] = vertex.len();
+            vertex.push(block);
+            parent.push(from);
+            for &next in successors[block].as_ref().iter().rev() {
+                if pre[index(next)] == NONE {
+                    stack.push((index(next), pre[block]));
                 }
             }
         }
-        Dominators { idom, rank }
+        let n = vertex.len();
+        let mut semi: Vec<usize> = (0..n).collect();
+        let mut label: Vec<usize> = (0..n).collect();
+        let mut ancestor = vec![NONE; n];
+        let mut path = Vec::new();
+        for w in (1..n).rev() {
+            for &pred in predecessors[vertex[w]].as_ref() {
+                let v = pre[index(pred)];
+                if v == NONE {
+                    continue;
+                }
+                // The least semidominator on the forest's path from `v` up, compressed.
+                let u = if ancestor[v] == NONE {
+                    v
+                } else {
+                    let mut x = v;
+                    while ancestor[ancestor[x]] != NONE {
+                        path.push(x);
+                        x = ancestor[x];
+                    }
+                    while let Some(x) = path.pop() {
+                        let up = ancestor[x];
+                        if semi[label[up]] < semi[label[x]] {
+                            label[x] = label[up];
+                        }
+                        ancestor[x] = ancestor[up];
+                    }
+                    label[v]
+                };
+                semi[w] = semi[w].min(semi[u]);
+            }
+            ancestor[w] = parent[w];
+        }
+        let mut idom = parent;
+        for w in 1..n {
+            let mut x = idom[w];
+            while x > semi[w] {
+                x = idom[x];
+            }
+            idom[w] = x;
+        }
+        let mut children = vec![Vec::new(); n];
+        for w in 1..n {
+            children[idom[w]].push(w);
+        }
+        let mut time = 0;
+        let mut stack = vec![(0, false)];
+        while let Some((w, done)) = stack.pop() {
+            if done {
+                exit[vertex[w]] = time;
+                time += 1;
+                continue;
+            }
+            enter[vertex[w]] = time;
+            time += 1;
+            stack.push((w, true));
+            stack.extend(children[w].iter().map(|&it| (it, false)));
+        }
+        Dominators { enter, exit }
     }
 
     pub(super) fn dominates(&self, a: BasicBlockId, b: BasicBlockId) -> bool {
-        let (a, mut b) = (index(a), index(b));
-        if self.rank[b] == usize::MAX {
+        let (a, b) = (index(a), index(b));
+        if self.enter[b] == NONE {
             return false;
         }
-        loop {
-            if a == b {
-                return true;
-            }
-            let up = self.idom[b];
-            if up == b || up == usize::MAX {
-                return false;
-            }
-            b = up;
-        }
+        a == b
+            || (self.enter[a] != NONE
+                && self.enter[a] <= self.enter[b]
+                && self.exit[b] <= self.exit[a])
     }
 
     pub(super) fn location_dominates(&self, a: Location, b: Location) -> bool {
@@ -206,6 +257,92 @@ impl Dominators {
             a.statement <= b.statement
         } else {
             self.dominates(a.block, b.block)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dominators, block, index};
+    use hir_ty::mir::BasicBlockId;
+
+    /// Whether `a` dominates `b`, from each block's set of dominators found to a fixed point.
+    fn naive(count: usize, preds: &[Vec<BasicBlockId>], reachable: &[bool]) -> Vec<Vec<bool>> {
+        let mut dom = vec![vec![true; count]; count];
+        dom[0] = (0..count).map(|it| it == 0).collect();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..count {
+                if !reachable[b] {
+                    continue;
+                }
+                let mut new = vec![true; count];
+                for &p in &preds[b] {
+                    if reachable[index(p)] {
+                        for (it, d) in new.iter_mut().zip(&dom[index(p)]) {
+                            *it &= d;
+                        }
+                    }
+                }
+                new[b] = true;
+                if new != dom[b] {
+                    dom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        dom
+    }
+
+    #[test]
+    fn match_the_dominator_sets() {
+        let mut seed = 0x2545f4914f6cdd1du64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for round in 0..500 {
+            let count = 1 + next(24);
+            let edges = next(count * 3 + 1);
+            let mut succs = vec![Vec::new(); count];
+            let mut preds = vec![Vec::new(); count];
+            // A chain from the start keeps most blocks reachable, as a body's are.
+            for b in 1..count {
+                if next(4) != 0 {
+                    let from = next(b);
+                    succs[from].push(block(b));
+                    preds[b].push(block(from));
+                }
+            }
+            for _ in 0..edges {
+                let (from, to) = (next(count), next(count));
+                if !succs[from].contains(&block(to)) {
+                    succs[from].push(block(to));
+                    preds[to].push(block(from));
+                }
+            }
+            let mut reachable = vec![false; count];
+            let mut stack = vec![0];
+            reachable[0] = true;
+            while let Some(b) = stack.pop() {
+                for &s in &succs[b] {
+                    if !reachable[index(s)] {
+                        reachable[index(s)] = true;
+                        stack.push(index(s));
+                    }
+                }
+            }
+            let fast = Dominators::of_graph(count, Some(0), &succs, &preds);
+            let want = naive(count, &preds, &reachable);
+            for a in 0..count {
+                for b in 0..count {
+                    let want = reachable[b] && reachable[a] && want[b][a];
+                    assert_eq!(fast.dominates(block(a), block(b)), want, "round {round}: {a} dom {b}");
+                }
+            }
         }
     }
 }

@@ -3026,23 +3026,8 @@ impl<'db> Builder<'_, '_, 'db> {
     /// where `'x` is `'a`.
     fn normalize_at(&mut self, ty: Ty<'db>, at: At) -> Option<Ty<'db>> {
         use hir_ty::next_solver::infer::region_constraints::Constraint;
-        let infcx = &self.ctx.infcx;
-        let before = infcx
-            .inner
-            .borrow_mut()
-            .unwrap_region_constraints()
-            .region_constraint_data()
-            .constraints
-            .len();
-        let first_new = infcx.num_region_vars();
-        let normalized = normalize(self.ctx, ty)?;
-        let constraints: Vec<_> = infcx
-            .inner
-            .borrow_mut()
-            .unwrap_region_constraints()
-            .region_constraint_data()
-            .constraints[before..]
-            .to_vec();
+        let first_new = self.ctx.infcx.num_region_vars();
+        let (normalized, constraints) = normalize_full(self.ctx, ty, false)?;
         let rv = |this: &mut Self, region: Region<'db>| match region.kind() {
             RegionKind::ReVar(vid) if vid.index() < first_new => Some(vid.as_usize()),
             RegionKind::ReStatic => Some(this.regions.static_rv),
@@ -6325,9 +6310,8 @@ impl<'db> Builder<'_, '_, 'db> {
         false
     }
 
-    /// What proving `trait_ref` gives, in this body's regions, from [`prove_query`]: its region
-    /// variables, resolved as the solver would, numbered in order, and a fresh one for each
-    /// that proving it made. `None` where it must be proven here, `Err` where it does not hold.
+    /// What proving `trait_ref` gives, in this body's regions, from [`prove_query`], asked with
+    /// its [`canonical_regions`]. `None` where it must be proven here, `Err` where it does not hold.
     #[allow(clippy::type_complexity)]
     fn prove_canonical(
         &mut self,
@@ -6338,27 +6322,7 @@ impl<'db> Builder<'_, '_, 'db> {
             return None;
         }
         let interner = self.interner();
-        let mut vars: Vec<Region<'db>> = Vec::new();
-        let mut here = false;
-        let canonical = rustc_type_ir::fold_regions(interner, trait_ref, |region, _| {
-            let RegionKind::ReVar(vid) = region.kind() else { return region };
-            let mut inner = self.ctx.infcx.inner.borrow_mut();
-            let mut constraints = inner.unwrap_region_constraints();
-            let resolved = constraints.opportunistic_resolve_var(interner, vid);
-            let RegionKind::ReVar(root) = resolved.kind() else {
-                here |= resolved.is_placeholder();
-                return resolved;
-            };
-            here |= constraints.probe_value(root) != Err(rustc_type_ir::UniverseIndex::ROOT);
-            let at = vars.iter().position(|&it| it == resolved).unwrap_or_else(|| {
-                vars.push(resolved);
-                vars.len() - 1
-            });
-            Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(at))
-        });
-        if here {
-            return None;
-        }
+        let (canonical, vars) = canonical_regions(self.ctx, trait_ref)?;
         let env = hir_ty::ParamEnvAndCrate { param_env: self.ctx.env, krate: self.ctx.krate };
         let (pairs, obligations) = match prove_query(
             self.ctx.db,
@@ -6370,14 +6334,8 @@ impl<'db> Builder<'_, '_, 'db> {
             &Proven::Error(true_error) => return Some(Err(true_error)),
             Proven::Gives { pairs, obligations } => (pairs, obligations),
         };
-        let mut made: FxHashMap<u32, Region<'db>> = FxHashMap::default();
-        let mut map = |region: Region<'db>| match region.kind() {
-            RegionKind::ReVar(vid) => match vars.get(vid.index()) {
-                Some(&it) => it,
-                None => *made.entry(vid.as_u32()).or_insert_with(|| self.fresh()),
-            },
-            _ => region,
-        };
+        let mut made = FxHashMap::default();
+        let mut map = |region| region_from_query(self.ctx, &vars, &mut made, region);
         let pairs =
             pairs.iter().map(|(a, b)| (map(a.as_ref()), map(b.as_ref()))).collect::<Vec<_>>();
         let obligations = obligations
@@ -7104,6 +7062,16 @@ fn normalizes_to_error<'db>(ctx: &Ctx<'_, 'db>, tys: impl IntoIterator<Item = Ty
 }
 
 fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Option<Ty<'db>> {
+    normalize_full(ctx, ty, allow_fresh).map(|(it, _)| it)
+}
+
+/// [`normalize_impl`], with the region constraints normalizing records: from
+/// [`normalize_query`], or the solver in the body's inference context where that cannot say.
+fn normalize_full<'db>(
+    ctx: &Ctx<'_, 'db>,
+    ty: Ty<'db>,
+    allow_fresh: bool,
+) -> Option<(Ty<'db>, Vec<hir_ty::next_solver::infer::region_constraints::Constraint<'db>>)> {
     use hir_ty::next_solver::{
         infer::{region_constraints::Constraint, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
@@ -7112,27 +7080,36 @@ fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Op
         return None;
     }
     let infcx = &ctx.infcx;
-    let constraints_before = infcx
-        .inner
-        .borrow_mut()
-        .unwrap_region_constraints()
-        .region_constraint_data()
-        .constraints
-        .len();
     let first_new = infcx.num_region_vars();
-    let mut ocx = ObligationCtxt::new(infcx);
-    let normalized = ocx.structurally_normalize_ty(&ObligationCause::dummy(), ctx.env, ty).ok()?;
+    let (normalized, constraints) = match normalize_canonical(ctx, ty) {
+        Some(it) => it?,
+        None => {
+            let constraints_before = infcx
+                .inner
+                .borrow_mut()
+                .unwrap_region_constraints()
+                .region_constraint_data()
+                .constraints
+                .len();
+            let mut ocx = ObligationCtxt::new(infcx);
+            let normalized =
+                ocx.structurally_normalize_ty(&ObligationCause::dummy(), ctx.env, ty).ok()?;
+            let constraints = infcx
+                .inner
+                .borrow_mut()
+                .unwrap_region_constraints()
+                .region_constraint_data()
+                .constraints[constraints_before..]
+                .to_vec();
+            (normalized, constraints)
+        }
+    };
     let mut same = FxHashMap::default();
-    {
-        let mut inner = infcx.inner.borrow_mut();
-        let collector = inner.unwrap_region_constraints();
-        let data = collector.region_constraint_data();
-        for constraint in &data.constraints[constraints_before..] {
-            if let Constraint::VarSubVar(a, b) = *constraint {
-                let (new, old) = if a.index() >= first_new { (a, b) } else { (b, a) };
-                if new.index() >= first_new && old.index() < first_new {
-                    same.entry(new).or_insert(old);
-                }
+    for constraint in &constraints {
+        if let Constraint::VarSubVar(a, b) = *constraint {
+            let (new, old) = if a.index() >= first_new { (a, b) } else { (b, a) };
+            if new.index() >= first_new && old.index() < first_new {
+                same.entry(new).or_insert(old);
             }
         }
     }
@@ -7149,5 +7126,163 @@ fn normalize_impl<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>, allow_fresh: bool) -> Op
             _ => region,
         }
     });
-    (allow_fresh || !unmapped).then_some(normalized)
+    (allow_fresh || !unmapped).then_some((normalized, constraints))
+}
+
+/// The region variables of `value`, resolved as the solver resolves them, numbered in order:
+/// `value` with the numbers as its variables, and the region each stands for. `None` where one
+/// is of a universe other than the root or resolves to a placeholder, which only the body's
+/// inference context can say what it is.
+fn canonical_regions<'db, T: rustc_type_ir::TypeFoldable<hir_ty::next_solver::DbInterner<'db>>>(
+    ctx: &Ctx<'_, 'db>,
+    value: T,
+) -> Option<(T, Vec<Region<'db>>)> {
+    let interner = ctx.infcx.interner;
+    let mut vars: Vec<Region<'db>> = Vec::new();
+    let mut here = false;
+    let canonical = rustc_type_ir::fold_regions(interner, value, |region, _| {
+        let RegionKind::ReVar(vid) = region.kind() else { return region };
+        let mut inner = ctx.infcx.inner.borrow_mut();
+        let mut constraints = inner.unwrap_region_constraints();
+        let resolved = constraints.opportunistic_resolve_var(interner, vid);
+        let RegionKind::ReVar(root) = resolved.kind() else {
+            here |= resolved.is_placeholder();
+            return resolved;
+        };
+        here |= constraints.probe_value(root) != Err(rustc_type_ir::UniverseIndex::ROOT);
+        let at = vars.iter().position(|&it| it == resolved).unwrap_or_else(|| {
+            vars.push(resolved);
+            vars.len() - 1
+        });
+        Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(at))
+    });
+    (!here).then_some((canonical, vars))
+}
+
+/// A region of a query's answer in the body: one of `vars`, which the query was asked with, or
+/// a fresh variable for each the query made.
+fn region_from_query<'db>(
+    ctx: &Ctx<'_, 'db>,
+    vars: &[Region<'db>],
+    made: &mut FxHashMap<u32, Region<'db>>,
+    region: Region<'db>,
+) -> Region<'db> {
+    match region.kind() {
+        RegionKind::ReVar(vid) => match vars.get(vid.index()) {
+            Some(&it) => it,
+            None => *made
+                .entry(vid.as_u32())
+                .or_insert_with(|| ctx.infcx.next_region_var(hir_ty::Span::Dummy)),
+        },
+        _ => region,
+    }
+}
+
+/// What [`normalize_query`] gives `ty`, in the body's regions: `None` where it must be
+/// normalized in the body, `Some(None)` where it cannot be.
+#[allow(clippy::type_complexity)]
+fn normalize_canonical<'db>(
+    ctx: &Ctx<'_, 'db>,
+    ty: Ty<'db>,
+) -> Option<Option<(Ty<'db>, Vec<hir_ty::next_solver::infer::region_constraints::Constraint<'db>>)>>
+{
+    use hir_ty::next_solver::infer::region_constraints::Constraint;
+    use rustc_type_ir::TypeVisitableExt as _;
+    if ty.has_placeholders() || ty.has_non_region_infer() {
+        return None;
+    }
+    let (canonical, vars) = canonical_regions(ctx, ty)?;
+    let env = hir_ty::ParamEnvAndCrate { param_env: ctx.env, krate: ctx.krate };
+    let (normalized, pairs) =
+        match normalize_query(ctx.db, env.store(), canonical.store(), vars.len() as u32) {
+            Normalized::Here => return None,
+            Normalized::Fails => return Some(None),
+            Normalized::Gives { ty, pairs } => (ty, pairs),
+        };
+    let interner = ctx.infcx.interner;
+    let mut made = FxHashMap::default();
+    let normalized = rustc_type_ir::fold_regions(interner, normalized.as_ref(), |it, _| {
+        region_from_query(ctx, &vars, &mut made, it)
+    });
+    let constraints = pairs
+        .iter()
+        .map(|(a, b)| {
+            let a = region_from_query(ctx, &vars, &mut made, a.as_ref());
+            let b = region_from_query(ctx, &vars, &mut made, b.as_ref());
+            match (a.kind(), b.kind()) {
+                (RegionKind::ReVar(a), RegionKind::ReVar(b)) => Constraint::VarSubVar(a, b),
+                (_, RegionKind::ReVar(b)) => Constraint::RegSubVar(a, b),
+                (RegionKind::ReVar(a), _) => Constraint::VarSubReg(a, b),
+                _ => Constraint::RegSubReg(a, b),
+            }
+        })
+        .collect();
+    Some(Some((normalized, constraints)))
+}
+
+/// What normalizing a type gives, as salsa keeps it, its region variables numbered as
+/// [`Proven`]'s.
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+enum Normalized {
+    /// What it gives names a placeholder, a variable of another universe or a type variable.
+    Here,
+    Fails,
+    Gives { ty: StoredTy, pairs: Vec<(StoredRegion, StoredRegion)> },
+}
+
+/// Normalizes `ty`, whose region variables are the first `vars`, in `env`, with the region
+/// constraints that records: as [`prove_query`], once per environment and not again after an
+/// edit.
+#[salsa::tracked(returns(ref))]
+fn normalize_query(
+    db: &dyn hir_ty::db::HirDatabase,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: StoredTy,
+    vars: u32,
+) -> Normalized {
+    use hir_ty::next_solver::{
+        DbInterner, TypingMode,
+        infer::{DbInternerInferExt as _, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    };
+    use rustc_type_ir::TypeVisitableExt as _;
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    for _ in 0..vars {
+        infcx.next_region_var(hir_ty::Span::Dummy);
+    }
+    let mut ocx = ObligationCtxt::new(&infcx);
+    let Ok(normalized) =
+        ocx.structurally_normalize_ty(&ObligationCause::dummy(), env.param_env, ty.as_ref())
+    else {
+        return Normalized::Fails;
+    };
+    let normalized = infcx.resolve_vars_if_possible(normalized);
+    if normalized.has_non_region_infer() || normalized.has_placeholders() {
+        return Normalized::Here;
+    }
+    let mut inner = infcx.inner.borrow_mut();
+    let mut constraints = inner.unwrap_region_constraints();
+    let pairs = constraint_pairs(interner, &constraints.region_constraint_data().constraints);
+    let mut own = |region: Region<'_>| match region.kind() {
+        RegionKind::RePlaceholder(_) => false,
+        RegionKind::ReVar(vid) => {
+            vid.as_u32() < vars
+                || constraints.probe_value(vid) == Err(rustc_type_ir::UniverseIndex::ROOT)
+        }
+        _ => true,
+    };
+    let mut ok = pairs.iter().all(|&(a, b)| own(a) && own(b));
+    rustc_type_ir::fold_regions(interner, normalized, |region, _| {
+        ok &= own(region);
+        region
+    });
+    if !ok {
+        return Normalized::Here;
+    }
+    Normalized::Gives {
+        ty: normalized.store(),
+        pairs: pairs.into_iter().map(|(a, b)| (a.store(), b.store())).collect(),
+    }
 }
