@@ -1,0 +1,32 @@
+# Keeps this fork's synced branch equal to what indexable-inc/blaze has under vendor/rust-analyzer.
+# It runs here, not in blaze, so it pushes with this repository's own GITHUB_TOKEN and no
+# secret exists anywhere. vendor/subtree.py only fast-forwards, and pushes nothing if this
+# fork has a change blaze does not (blaze docs/contributing.md, "Changing a rust-analyzer file").
+# This branch is the default only so the schedule runs; it holds nothing else.
+name: sync from blaze
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: indexable-inc/blaze
+          ref: main
+          fetch-depth: 0
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - run: python3 vendor/subtree.py push rust-analyzer
