@@ -43,7 +43,11 @@ pub fn layout_of_adt_query(
         var.fields()
             .iter()
             .map(|(fd, _)| {
-                db.layout_of_ty(field_ty(db, def, fd, args.as_ref()).store(), trait_env.clone())
+                super::field_layout(
+                    db,
+                    field_ty(db, def, fd, args.as_ref()).store(),
+                    trait_env.clone(),
+                )
             })
             .collect::<Result<Vec<_>, _>>()
     };

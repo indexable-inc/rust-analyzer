@@ -10,8 +10,9 @@ use hir_def::{
 use la_arena::{Idx, RawIdx};
 
 use rustc_abi::{
-    AddressSpace, BackendRepr, FieldsShape, Float, Integer, LayoutCalculator, Niche, Primitive,
-    ReprOptions, Scalar, Size, StructKind, TargetDataLayout, WrappingRange,
+    AddressSpace, BackendRepr, FieldsShape, Float, Integer, LayoutCalculator, Niche,
+    NumScalableVectors, Primitive, ReprOptions, Scalar, Size, StructKind, TargetDataLayout,
+    WrappingRange,
 };
 use rustc_index::{IndexVec, bit_set::BitMatrix};
 use rustc_type_ir::{
@@ -84,6 +85,9 @@ pub enum LayoutError {
     InvalidSimdType,
     NotImplemented,
     RecursiveTypeWithoutIndirection,
+    /// A scalable vector in a struct, enum, tuple, array or closure: rustc lays it out at the
+    /// least vector length, which ra-jit's code does not keep it at.
+    ScalableVectorField,
     TargetLayoutNotAvailable,
     Unknown,
     UserReprTooSmall,
@@ -102,6 +106,7 @@ impl fmt::Display for LayoutError {
             LayoutError::RecursiveTypeWithoutIndirection => {
                 write!(f, "recursive type without indirection")
             }
+            LayoutError::ScalableVectorField => write!(f, "a scalable vector in an aggregate"),
             LayoutError::TargetLayoutNotAvailable => write!(f, "target layout not available"),
             LayoutError::Unknown => write!(f, "unknown"),
             LayoutError::UserReprTooSmall => {
@@ -158,6 +163,69 @@ fn layout_of_simd_ty<'db>(
     Ok(Arc::new(cx.calc.layout_of_simd_type(e_ly, e_len, repr_packed)?))
 }
 
+/// A `#[rustc_scalable_vector(N)] struct S(T)` or a `#[rustc_scalable_vector] struct Sx2(S, S)` of
+/// such: rustc's `scalable_vector_parts` and `layout_of_scalable_vector_type`. Its size is that
+/// of the vector at the least vector length, `size_of::<T>() * N` times the vectors of a tuple.
+fn layout_of_scalable_vector_ty<'db>(
+    db: &'db dyn HirDatabase,
+    id: StructId,
+    args: &GenericArgs<'db>,
+    env: ParamEnvAndCrate<'db>,
+    dl: &TargetDataLayout,
+) -> Result<Arc<Layout>, LayoutError> {
+    let interner = DbInterner::new_no_crate(db);
+    let only_field = |id: StructId| -> Result<Vec<Ty<'db>>, LayoutError> {
+        let fields = db.field_types(id.into());
+        Ok(fields.iter().map(|f| (*f.1).ty().instantiate(interner, args).skip_norm_wip()).collect())
+    };
+    let repr = |id: StructId| AttrFlags::repr(db, id.into()).unwrap_or_default().scalable;
+    let fields = only_field(id)?;
+    let (vector, number_of_vectors) = match repr(id) {
+        Some(rustc_abi::ScalableElt::ElementCount(_)) => (id, NumScalableVectors::for_non_tuple()),
+        Some(rustc_abi::ScalableElt::Container) => {
+            let Some(TyKind::Adt(def, _)) = fields.first().map(|it| it.kind()) else {
+                return Err(LayoutError::InvalidSimdType);
+            };
+            let hir_def::AdtId::StructId(vector) = def.def_id() else {
+                return Err(LayoutError::InvalidSimdType);
+            };
+            let Some(count) = NumScalableVectors::from_field_count(fields.len()) else {
+                return Err(LayoutError::InvalidSimdType);
+            };
+            (vector, count)
+        }
+        None => return Err(LayoutError::InvalidSimdType),
+    };
+    let Some(rustc_abi::ScalableElt::ElementCount(count)) = repr(vector) else {
+        return Err(LayoutError::InvalidSimdType);
+    };
+    let element = match &only_field(vector)?[..] {
+        [element] => *element,
+        _ => return Err(LayoutError::InvalidSimdType),
+    };
+    let element = db.layout_of_ty(element.store(), env.store())?;
+    let cx = LayoutCx::new(dl);
+    Ok(Arc::new(cx.calc.layout_of_scalable_vector_type(
+        element,
+        u64::from(count),
+        number_of_vectors,
+    )?))
+}
+
+/// The layout of a field of an aggregate (a struct, enum, tuple, array, closure or coroutine),
+/// which a scalable vector is not laid out as: see [`LayoutError::ScalableVectorField`].
+pub(crate) fn field_layout<'db>(
+    db: &'db dyn HirDatabase,
+    ty: StoredTy,
+    env: StoredParamEnvAndCrate,
+) -> Result<Arc<Layout>, LayoutError> {
+    let layout = db.layout_of_ty(ty, env)?;
+    if let BackendRepr::SimdScalableVector { .. } = layout.backend_repr {
+        return Err(LayoutError::ScalableVectorField);
+    }
+    Ok(layout)
+}
+
 #[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone))]
 pub fn layout_of_ty_query(
     db: &dyn HirDatabase,
@@ -182,6 +250,15 @@ pub fn layout_of_ty_query(
             match def.def_id() {
                 hir_def::AdtId::StructId(s) => {
                     let repr = AttrFlags::repr(db, s.into()).unwrap_or_default();
+                    if repr.scalable.is_some() {
+                        return layout_of_scalable_vector_ty(
+                            db,
+                            s,
+                            &args,
+                            trait_env.as_ref(db),
+                            target,
+                        );
+                    }
                     if repr.simd() {
                         return layout_of_simd_ty(
                             db,
@@ -263,7 +340,7 @@ pub fn layout_of_ty_query(
 
             let fields = tys
                 .iter()
-                .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                .map(|k| field_layout(db, k.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
@@ -271,11 +348,11 @@ pub fn layout_of_ty_query(
         }
         TyKind::Array(element, count) => {
             let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
-            let element = db.layout_of_ty(element.store(), trait_env)?;
+            let element = field_layout(db, element.store(), trait_env)?;
             cx.calc.layout_of_array_like::<_, _, ()>(&element, Some(count))?
         }
         TyKind::Slice(element) => {
-            let element = db.layout_of_ty(element.store(), trait_env)?;
+            let element = field_layout(db, element.store(), trait_env)?;
             cx.calc.layout_of_array_like::<_, _, ()>(&element, None)?
         }
         TyKind::Str => {
@@ -343,7 +420,7 @@ pub fn layout_of_ty_query(
             let upvars = ty.closure_upvars_ty().expect("a closure");
             let fields = rustc_type_ir::inherent::Ty::tuple_fields(upvars)
                 .iter()
-                .map(|k| db.layout_of_ty(k.store(), trait_env.clone()))
+                .map(|k| field_layout(db, k.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
             let fields = fields.iter().collect::<IndexVec<_, _>>();
@@ -377,7 +454,7 @@ pub fn layout_of_ty_query(
             let held = body.locals_held_across_yields();
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
-                .map(|ty| db.layout_of_ty(ty.store(), trait_env.clone()))
+                .map(|ty| field_layout(db, ty.store(), trait_env.clone()))
                 .collect::<Result<Vec<_>, _>>()?;
             // Each local is a `MaybeUninit` of its type, as rustc has it: nothing of it is a
             // niche.
@@ -385,7 +462,7 @@ pub fn layout_of_ty_query(
                 .locals
                 .iter()
                 .map(|&local| {
-                    let of = db.layout_of_ty(body.locals[local].ty.clone(), trait_env.clone())?;
+                    let of = field_layout(db, body.locals[local].ty.clone(), trait_env.clone())?;
                     let mut layout = LayoutData::unit(dl, true);
                     layout.size = of.size;
                     layout.align = of.align;
