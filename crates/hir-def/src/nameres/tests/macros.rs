@@ -1890,3 +1890,70 @@ fn foo() {}
         |_, _| (),
     )
 }
+
+/// Writes `pub struct Big;` after more tokens than rust-analyzer used to keep of one
+/// expansion (2,097,152), as biome_wasm's `#[wasm_bindgen]` block of 2271 types does.
+#[derive(Debug)]
+struct HugeExpander;
+impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
+    fn expand(
+        &self,
+        _: &dyn base_db::SourceDatabase,
+        _: &crate::tt::TopSubtree,
+        _: Option<&crate::tt::TopSubtree>,
+        _: &base_db::Env,
+        _: span::Span,
+        call_site: span::Span,
+        _: span::Span,
+        _: String,
+    ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
+        let text = format!(
+            "macro_rules! ignore {{ ($($t:tt)*) => {{}}; }} ignore! {{ {} }} pub struct Big;",
+            "0 ".repeat(2_200_000)
+        );
+        Ok(syntax_bridge::parse_to_token_tree_static_span(Edition::CURRENT, call_site, &text)
+            .unwrap())
+    }
+
+    fn eq_dyn(&self, other: &dyn hir_expand::proc_macro::ProcMacroExpander) -> bool {
+        other.type_id() == std::any::TypeId::of::<Self>()
+    }
+}
+
+#[test]
+fn an_expansion_has_no_token_limit() {
+    let proc_macros = vec![(
+        r#"
+#[proc_macro_attribute]
+pub fn huge(_attr: TokenStream, _item: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+"#
+        .into(),
+        hir_expand::proc_macro::ProcMacro {
+            name: intern::Symbol::intern("huge"),
+            kind: hir_expand::proc_macro::ProcMacroKind::Attr,
+            expander: std::sync::Arc::new(HugeExpander),
+            disabled: false,
+        },
+    )];
+    let db = TestDB::with_files_extra_proc_macros(
+        r#"
+//- proc_macros: huge
+//- /main.rs crate:main
+#[proc_macros::huge]
+extern "C" {}
+"#,
+        proc_macros,
+    );
+    let krate = *all_crates(&db)
+        .iter()
+        .find(|krate| {
+            krate.extra_data(&db).display_name.as_ref().map(|it| it.canonical_name().as_str())
+                == Some("main")
+        })
+        .unwrap();
+    let def_map = crate_def_map(&db, krate);
+    let scope = def_map.module(&db, def_map.root).scope(&db);
+    assert!(scope.entries().any(|(name, _)| name.as_str() == "Big"));
+}

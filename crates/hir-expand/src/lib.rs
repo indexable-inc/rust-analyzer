@@ -73,21 +73,6 @@ pub use tt;
 /// and [`MacroCallId::macro_arg`] are the same.
 type MacroArgResult = (tt::TopSubtree, SyntaxFixupUndoInfo, Span);
 
-/// Total limit on the number of tokens produced by any macro invocation.
-///
-/// If an invocation produces more tokens than this limit, it will not be stored in the database and
-/// an error will be emitted.
-///
-/// Actual max for `analysis-stats .` at some point: 30672. A process that loads once and keeps
-/// nothing, as `blaze doc` does, may lift it with [`set_token_limit`].
-static TOKEN_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2_097_152);
-
-/// Sets the limit on the tokens one macro invocation may produce, before anything expands:
-/// an expansion stored under one limit is not redone under another.
-pub fn set_token_limit(limit: usize) {
-    TOKEN_LIMIT.store(limit, std::sync::atomic::Ordering::Relaxed);
-}
-
 #[macro_export]
 macro_rules! impl_intern_lookup {
     ($id:ident, $loc:ident) => {
@@ -681,7 +666,7 @@ impl MacroCallId {
     ) -> ExpandResult<(Cow<'db, tt::TopSubtree>, MatchedArmIndex)> {
         let _p = tracing::info_span!("macro_expand").entered();
 
-        let (ExpandResult { value: (tt, matched_arm), err }, span) = match loc.def.kind {
+        let ExpandResult { value: (tt, matched_arm), err } = match loc.def.kind {
             MacroDefKind::ProcMacro(..) => {
                 return self.expand_proc_macro(db).as_ref().map(|it| (Cow::Borrowed(it), None));
             }
@@ -734,19 +719,9 @@ impl MacroCallId {
                     }
                     MacroDefKind::ProcMacro(_, _, _) => unreachable!(),
                 };
-                (res, span)
+                res
             }
         };
-
-        // Skip checking token tree limit for include! macro call
-        if !loc.def.is_include() {
-            // Set a hard limit for the expanded tt
-            if let Err(value) = check_tt_count(&tt) {
-                return value
-                    .map(|()| Cow::Owned(tt::TopSubtree::empty(tt::DelimSpan::from_single(span))))
-                    .zip_val(matched_arm);
-            }
-        }
 
         ExpandResult { value: (Cow::Owned(tt), matched_arm), err }
     }
@@ -758,7 +733,7 @@ impl MacroCallId {
     #[salsa::tracked(returns(ref))]
     fn expand_proc_macro(self, db: &dyn SourceDatabase) -> ExpandResult<tt::TopSubtree> {
         let loc = self.loc(db);
-        let (macro_arg, undo_info, span) = self.macro_arg_considering_derives(db, &loc.kind);
+        let (macro_arg, undo_info, _) = self.macro_arg_considering_derives(db, &loc.kind);
 
         let (ast, expander) = match loc.def.kind {
             MacroDefKind::ProcMacro(ast, expander, _) => (ast, expander),
@@ -783,11 +758,6 @@ impl MacroCallId {
                 span_with_mixed_site_ctxt(db, span, self.into(), loc.def.edition),
             )
         };
-
-        // Set a hard limit for the expanded tt
-        if let Err(value) = check_tt_count(&tt) {
-            return value.map(|()| tt::TopSubtree::empty(tt::DelimSpan::from_single(*span)));
-        }
 
         fixup::reverse_fixups(&mut tt, undo_info);
 
@@ -1038,25 +1008,6 @@ fn without_last_semicolon(tt: &tt::TopSubtree) -> Option<tt::TopSubtree> {
             Some(tt::TopSubtree::from_token_trees(tt.top_subtree().delimiter, before))
         }
         _ => None,
-    }
-}
-
-fn check_tt_count(tt: &tt::TopSubtree) -> Result<(), ExpandResult<()>> {
-    let tt = tt.top_subtree();
-    let count = tt.count();
-    let limit = TOKEN_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
-    if count <= limit {
-        Ok(())
-    } else {
-        Err(ExpandResult {
-            value: (),
-            err: Some(ExpandError::other(
-                tt.delimiter.open,
-                format!(
-                    "macro invocation exceeds token limit: produced {count} tokens, limit is {limit}",
-                ),
-            )),
-        })
     }
 }
 
