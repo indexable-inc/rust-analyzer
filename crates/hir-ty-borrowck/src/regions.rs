@@ -4554,14 +4554,44 @@ impl<'db> Builder<'_, '_, 'db> {
                             if let TyKind::FnPtr(to, _) = target.kind()
                                 && !to.bound_vars().is_empty()
                             {
+                                // An elided lifetime rust-analyzer leaves as an error region
+                                // (`f: &mut Formatter<'_>`) is late-bound in rustc, so it is a
+                                // lifetime of that `for<'a>` too, not one of the caller's: a
+                                // variable of the caller could name no placeholder of the
+                                // target and would have to outlive `'static`.
                                 let interner = self.interner();
-                                let sig =
-                                    rustc_type_ir::fold_regions(interner, sig, |r, _| {
-                                        match r.kind() {
-                                            RegionKind::ReError(_) => self.fresh_elided(),
-                                            _ => r,
+                                let bound_vars = sig.bound_vars();
+                                let mut elided = 0;
+                                let inner = rustc_type_ir::fold_regions(
+                                    interner,
+                                    sig.skip_binder(),
+                                    |r, depth| match r.kind() {
+                                        RegionKind::ReError(_) => {
+                                            let var = rustc_type_ir::BoundVar::from_usize(
+                                                bound_vars.len() + elided,
+                                            );
+                                            elided += 1;
+                                            Region::new_bound(
+                                                interner,
+                                                depth,
+                                                hir_ty::next_solver::BoundRegion {
+                                                    var,
+                                                    kind: rustc_type_ir::BoundRegionKind::Anon,
+                                                },
+                                            )
                                         }
-                                    });
+                                        _ => r,
+                                    },
+                                );
+                                let bound_vars = hir_ty::next_solver::BoundVarKinds::new_from_iter(
+                                    bound_vars.iter().chain(std::iter::repeat_n(
+                                        rustc_type_ir::BoundVariableKind::Region(
+                                            rustc_type_ir::BoundRegionKind::Anon,
+                                        ),
+                                        elided,
+                                    )),
+                                );
+                                let sig = rustc_type_ir::Binder::bind_with_vars(inner, bound_vars);
                                 let source = Ty::new_fn_ptr(interner, sig);
                                 self.relate(source, target, Variance::Covariant, at);
                                 return Some(target);

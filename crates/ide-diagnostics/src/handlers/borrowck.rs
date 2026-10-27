@@ -517,6 +517,25 @@ fn f<'a, 'db>(g: &dyn Fn() -> &'a G<'db>) { need(g()) }
         );
     }
 
+    // core's `fmt::rt::Argument::new_display`: the `'_` of `Formatter<'_>` is late-bound in
+    // `Display::fmt`, so the item reifies to the `for<'a, 'b, 'c> fn` it is given as.
+    #[test]
+    fn a_fn_items_elided_lifetime_is_late_bound_when_reified() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+struct Formatter<'a>(&'a ());
+trait Display {
+    fn fmt(&self, f: &mut Formatter<'_>);
+}
+fn new<T>(_: &T, _: fn(&T, &mut Formatter<'_>)) {}
+fn new_display<T: Display>(x: &T) {
+    new(x, Display::fmt)
+}
+"#,
+        );
+    }
+
     // hir-def's `module_for_assoc_item_loc`: `dyn 'db + Database` implies `'db: 'static`
     // where a supertrait of `Database` is `'static`.
     #[test]
