@@ -677,7 +677,6 @@ pub(super) fn build<'db>(
         aggregate_temps: aggregate_temps(body),
         synthesized: synthesized(ctx),
         placeholders: FxHashMap::default(),
-        forall_universe: None,
         elided: Default::default(),
     };
     builder.universal_regions();
@@ -745,9 +744,6 @@ struct Builder<'c, 'a, 'db> {
     synthesized: FxHashSet<hir_def::hir::ExprId>,
     /// The universal region of each placeholder the trait solver's answers name.
     placeholders: FxHashMap<Region<'db>, Region<'db>>,
-    /// The universe of the placeholders a `for<'a>` predicate being proven is instantiated
-    /// with, which a type outlives only by outliving `'static`.
-    forall_universe: Option<rustc_type_ir::UniverseIndex>,
     /// The region variables given the error regions rust-analyzer leaves for elided lifetimes,
     /// each a late-bound lifetime of its own in rustc: the fn pointer two fn items or closures
     /// coerce to, `if r { up } else { down }`, is `for<'a> fn(&'a T)` there.
@@ -5117,13 +5113,12 @@ impl<'db> Builder<'_, '_, 'db> {
                     };
                     let placeholders = forall.then(|| {
                         let universe = self.ctx.infcx.create_next_universe();
-                        let placeholders = instantiate(&mut |bound| {
+                        instantiate(&mut |bound| {
                             Region::new_placeholder(
                                 interner,
                                 hir_ty::next_solver::PlaceholderRegion::new(universe, bound),
                             )
-                        });
-                        (universe, placeholders)
+                        })
                     });
                     let trait_ref = match forall {
                         true => instantiate(&mut |_| Region::new_static(interner)),
@@ -5134,10 +5129,8 @@ impl<'db> Builder<'_, '_, 'db> {
                     // Proven for placeholders, what the trait's impls need of them is an error
                     // where it is more than they can be, `for<'a> Foo<&'a isize>` needing
                     // `'a: 'b`.
-                    if let Some((universe, placeholders)) = placeholders {
-                        self.forall_universe = Some(universe);
+                    if let Some(placeholders) = placeholders {
                         self.prove(placeholders, at);
-                        self.forall_universe = None;
                     }
                     // Of a call written as one: `map[i] = v` calls `IndexMut::index_mut`, which
                     // is E0594 where only `Index` is implemented.
@@ -5534,24 +5527,23 @@ impl<'db> Builder<'_, '_, 'db> {
                 self.outlives(longer, shorter, at);
             }
         }
-        let forall = self.forall_universe;
-        let ctx = self.ctx;
-        let infcx = &ctx.infcx;
-        let ours = |region: Region<'db>| {
-            region.is_placeholder() && Some(infcx.universe_of_region(region)) == forall
-        };
+        // A type outlives a placeholder, of the predicate being proven or of a `for<'a>` in
+        // the where clauses of an impl or of the environment that proves it, only by outliving
+        // `'static`: the body's regions are of a universe that cannot name it, as rustc's
+        // `add_incompatible_universe`. So `for<'a> F: FnMut(<&'1 mut I as Lend>::Item<'a>)`,
+        // whose normalization needs `&'1 mut I: 'a`, needs `'1: 'static` (rustc's "due to a
+        // current limitation of the type system"), and a type parameter that must outlive it
+        // is rustc's codeless "does not live long enough".
         for (ty, region) in obligations {
-            let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match ours(it) {
+            let placeholder = region.is_placeholder();
+            let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match it.is_placeholder() {
                 true => Region::new_static(interner),
                 false => it,
             });
-            let region = match ours(region) {
+            let region = match placeholder {
                 true => Region::new_static(interner),
                 false => region,
             };
-            if region.is_placeholder() || rustc_type_ir::TypeVisitableExt::has_placeholders(&ty) {
-                continue;
-            }
             let Some(region) = rv(self, region) else { continue };
             let ty = rustc_type_ir::fold_regions(interner, ty, |it, _| match it.kind() {
                 RegionKind::ReEarlyParam(_) | RegionKind::ReLateParam(_) | RegionKind::ReStatic => {
@@ -5561,11 +5553,17 @@ impl<'db> Builder<'_, '_, 'db> {
                 }
                 _ => it,
             });
+            let tests = self.regions.type_tests.len();
             self.type_outlives(
                 ty,
                 Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(region)),
                 at,
             );
+            if placeholder {
+                for test in &mut self.regions.type_tests[tests..] {
+                    test.forall = true;
+                }
+            }
         }
         false
     }
