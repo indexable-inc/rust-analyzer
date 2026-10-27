@@ -657,13 +657,29 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             (reg, Some(*in_expr), *out_expr)
                         }
                         AsmOperand::Const(value) => {
-                            let Some((value, next)) =
-                                self.lower_expr_to_some_operand(*value, current)?
-                            else {
-                                return Ok(None);
+                            // rustc's `const` operand is an anonymous constant, evaluated for
+                            // each instance as a `const { .. }` block is: a value of the
+                            // operand's type, never a temporary of the function, whatever the
+                            // expression (`const 0x0100_0000`, `const SHIFT_BITS`,
+                            // `const size_of::<T>()`). A literal is one as it is.
+                            let operand = match &self.store[*value] {
+                                Expr::Literal(l) if !self.has_adjustments(*value) => {
+                                    let ty = self.expr_ty_without_adjust(*value);
+                                    self.lower_literal_to_operand(ty, l)?
+                                }
+                                _ => {
+                                    let Some(konst) = self.inline_const(*value) else {
+                                        not_supported!("an `asm!` constant of no known type");
+                                    };
+                                    let subst = GenericArgs::identity_for_item(
+                                        self.interner(),
+                                        self.owner.generic_def(self.db).into(),
+                                    );
+                                    self.lower_const_to_operand(subst, konst.into())?
+                                }
                             };
-                            current = next;
-                            operands.push(super::AsmOperand::Const(value));
+                            let span = Some((*value).into());
+                            operands.push(super::AsmOperand::Const(Operand { span, ..operand }));
                             continue;
                         }
                         AsmOperand::Label(block) => {
