@@ -4781,6 +4781,19 @@ impl<'db> Builder<'_, '_, 'db> {
                                 .callable_item_signature(def.0)
                                 .instantiate(self.interner(), args)
                                 .skip_norm_wip();
+                            // An elided `&dyn Trait` of a function's is `&'r (dyn Trait + 'r)`,
+                            // once `'r` is a lifetime of the signature's and not an error.
+                            let mut defaults = match def.0 {
+                                CallableDefId::FunctionId(function) => Some(ObjectDefaults {
+                                    db: self.ctx.db,
+                                    interner: self.interner(),
+                                    keep_static: writes_static_object(
+                                        &FunctionSignature::of(self.ctx.db, function).store,
+                                    ),
+                                    erase: false,
+                                }),
+                                _ => None,
+                            };
                             // To a `for<'a> fn`, the item's signature keeps its own `for<'a>`,
                             // related to the target's as higher-ranked types are.
                             if let TyKind::FnPtr(to, _) = target.kind()
@@ -4815,6 +4828,12 @@ impl<'db> Builder<'_, '_, 'db> {
                                         _ => r,
                                     },
                                 );
+                                let inner = match &mut defaults {
+                                    Some(defaults) => {
+                                        rustc_type_ir::TypeFoldable::fold_with(inner, defaults)
+                                    }
+                                    None => inner,
+                                };
                                 let bound_vars = hir_ty::next_solver::BoundVarKinds::new_from_iter(
                                     bound_vars.iter().chain(std::iter::repeat_n(
                                         rustc_type_ir::BoundVariableKind::Region(
@@ -4842,6 +4861,12 @@ impl<'db> Builder<'_, '_, 'db> {
                                     _ => r,
                                 }
                             });
+                            let sig = match &mut defaults {
+                                Some(defaults) => {
+                                    rustc_type_ir::TypeFoldable::fold_with(sig, defaults)
+                                }
+                                None => sig,
+                            };
                             let wf = At { category: Category::Boring, span };
                             for ty in sig.inputs_and_output.iter() {
                                 self.well_formed(ty, wf, 0);

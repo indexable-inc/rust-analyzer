@@ -536,6 +536,25 @@ fn new_display<T: Display>(x: &T) {
         );
     }
 
+    // ruff's `OptionSet::of`: `record: T::record` of `fn record(visit: &mut dyn Visit)` into a
+    // `fn(&mut dyn Visit)`. The item's elided `&mut dyn Visit` is `&'r mut (dyn Visit + 'r)`.
+    #[test]
+    fn a_fn_items_elided_trait_object_has_its_references_lifetime_when_reified() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+trait Visit {}
+trait Options { fn record(visit: &mut dyn Visit); }
+struct Set { record: fn(&mut dyn Visit), shared: fn(&dyn Visit) }
+fn free(_: &mut dyn Visit) {}
+fn shared(_: &dyn Visit) {}
+fn of<T: Options>() -> Set { Set { record: T::record, shared } }
+fn local() { let _f: fn(&mut dyn Visit) = free; }
+fn named<'a>() { let _f: fn(&'a mut dyn Visit) = free; }
+"#,
+        );
+    }
+
     // hir-def's `module_for_assoc_item_loc`: `dyn 'db + Database` implies `'db: 'static`
     // where a supertrait of `Database` is `'static`.
     #[test]
