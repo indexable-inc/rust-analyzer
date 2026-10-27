@@ -160,7 +160,11 @@ impl IntervalSet {
     }
 
     /// The runs of `start..=end` in the set, clipped to it.
-    pub(super) fn runs_in(&self, start: usize, end: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    pub(super) fn runs_in(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> impl Iterator<Item = (usize, usize)> + '_ {
         let (start, end) = (start as u32, end as u32);
         let at = self.first_ending_at_or_after(start);
         self.ranges[at..]
@@ -251,12 +255,9 @@ mod tests {
                     for end in start..13 {
                         let want = (start..=end).find(|it| !a.contains(it));
                         assert_eq!(set(a).first_absent_in(start, end), want);
-                        let runs: Vec<usize> = set(a)
-                            .runs_in(start, end)
-                            .flat_map(|(s, e)| s..=e)
-                            .collect();
-                        let want: Vec<usize> =
-                            (start..=end).filter(|it| a.contains(it)).collect();
+                        let runs: Vec<usize> =
+                            set(a).runs_in(start, end).flat_map(|(s, e)| s..=e).collect();
+                        let want: Vec<usize> = (start..=end).filter(|it| a.contains(it)).collect();
                         assert_eq!(runs, want);
                         let mut grown = set(a);
                         let new: Vec<usize> = grown
@@ -264,8 +265,7 @@ mod tests {
                             .into_iter()
                             .flat_map(|(s, e)| s..=e)
                             .collect();
-                        let want: Vec<usize> =
-                            (start..=end).filter(|it| !a.contains(it)).collect();
+                        let want: Vec<usize> = (start..=end).filter(|it| !a.contains(it)).collect();
                         assert_eq!(new, want);
                         assert!((start..=end).all(|it| grown.contains(it)));
                     }

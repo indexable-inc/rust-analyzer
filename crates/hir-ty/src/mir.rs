@@ -34,12 +34,12 @@ use crate::{
 mod eval;
 mod held;
 pub mod location;
-mod storage;
 mod lower;
 mod monomorphization;
 mod optimize;
 pub mod overflow;
 mod pretty;
+mod storage;
 pub mod target;
 mod transform;
 pub mod type_name;
@@ -49,7 +49,6 @@ pub use eval::{
     render_const_using_debug_impl,
 };
 pub use held::{HeldLocals, YieldPoint};
-pub use storage::StorageConflicts;
 pub use lower::is_builtin_index;
 pub use lower::{
     MirLowerError, inline_const_at, is_by_move_coroutine, lower_body_to_mir,
@@ -69,6 +68,7 @@ pub use optimize::{
     optimized_mir_body_query, passes_not_ported, set_interpreter_mir_opt_level,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
+pub use storage::StorageConflicts;
 pub use transform::{
     monomorphized_runtime_mir_body_for_closure_query,
     monomorphized_runtime_mir_body_for_coroutine_by_move_query,
@@ -1593,8 +1593,21 @@ impl MirBody<'_> {
         self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
     }
 
-    places_walker!(walk_places, walk_statement_places, walk_terminator_places, iter_mut, for_each_operand_mut, mut);
-    places_walker!(visit_places, visit_statement_places, visit_terminator_places, iter, for_each_operand);
+    places_walker!(
+        walk_places,
+        walk_statement_places,
+        walk_terminator_places,
+        iter_mut,
+        for_each_operand_mut,
+        mut
+    );
+    places_walker!(
+        visit_places,
+        visit_statement_places,
+        visit_terminator_places,
+        iter,
+        for_each_operand
+    );
 }
 
 impl<'db> MirBody<'db> {

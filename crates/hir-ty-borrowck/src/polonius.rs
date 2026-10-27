@@ -99,10 +99,8 @@ pub(super) fn live_loans<'db>(
         edges.sort_unstable();
         edges.dedup();
     }
-    let last_of = |block| cfg.point(Location {
-        block,
-        statement: body.basic_blocks[block].statements.len(),
-    });
+    let last_of =
+        |block| cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() });
 
     // The graph's nodes are a region at a point, but it is walked a run of points of one block
     // at a time: what reaches a region at a run of points reaches its subregions at all of
@@ -159,7 +157,8 @@ pub(super) fn live_loans<'db>(
                     // Past the end of the run, the region flows on while it is live.
                     let mut follow = |next: usize, last: usize| {
                         if region_live.contains(next) {
-                            let to = region_live.first_absent_in(next, last).map_or(last, |it| it - 1);
+                            let to =
+                                region_live.first_absent_in(next, last).map_or(last, |it| it - 1);
                             stack.push((region, next, to));
                         }
                     };
@@ -167,7 +166,10 @@ pub(super) fn live_loans<'db>(
                         follow(end + 1, last);
                     } else {
                         for &successor in &cfg.successors[index(block)] {
-                            follow(cfg.point(Location { block: successor, statement: 0 }), last_of(successor));
+                            follow(
+                                cfg.point(Location { block: successor, statement: 0 }),
+                                last_of(successor),
+                            );
                         }
                     }
                 }

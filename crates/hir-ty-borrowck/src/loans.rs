@@ -864,10 +864,9 @@ fn out_of_scope(
     mut first_absent: impl FnMut(usize, usize) -> Option<usize>,
 ) -> SmallVec<[usize; 2]> {
     let mut out = SmallVec::new();
-    let last = |block: BasicBlockId| cfg.point(Location {
-        block,
-        statement: body.basic_blocks[block].statements.len(),
-    });
+    let last = |block: BasicBlockId| {
+        cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() })
+    };
     let mut entered = BitSet::new(body.basic_blocks.len());
     let mut work: Vec<BasicBlockId> = Vec::new();
     // The rest of the issuing block, if the loan is not made by its terminator.
@@ -887,11 +886,8 @@ fn out_of_scope(
         }
         let start = cfg.point(Location { block, statement: 0 });
         // Coming back around to the issuing block, the points past the loan were seen.
-        let (end, through) = if rest && block == issued.block {
-            (issued_point, false)
-        } else {
-            (last(block), true)
-        };
+        let (end, through) =
+            if rest && block == issued.block { (issued_point, false) } else { (last(block), true) };
         match first_absent(start, end) {
             Some(point) => out.push(point),
             None if through => work.extend(cfg.successors[index(block)].iter().copied()),

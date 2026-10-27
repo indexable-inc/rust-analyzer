@@ -5,11 +5,11 @@
 
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use rustc_type_ir::{
     ClauseKind, OutlivesPredicate, RegionKind,
     inherent::{GenericArgs as _, IntoKind, Region as _},
 };
+use smallvec::SmallVec;
 
 use hir_ty::{
     mir::{
