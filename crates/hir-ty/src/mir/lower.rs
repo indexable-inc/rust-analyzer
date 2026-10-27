@@ -236,7 +236,6 @@ pub enum MirLowerError<'db> {
     RecordLiteralWithoutPath,
     UnresolvedMethod(String),
     UnresolvedField,
-    UnsizedTemporary(StoredTy),
     MissingFunctionDefinition(InferBodyId<'db>, ExprId),
     HasErrors,
     /// This should never happen. Type mismatch should catch everything.
@@ -412,10 +411,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.infcx.interner.lang_items()
     }
 
+    /// A temporary of type `ty`. It may be unsized, as rustc's `as_temp` makes one of a value
+    /// that is moved out of an unsized place (`*s;`, `[a[..]]`): borrow checking reports the
+    /// move (E0507, E0508), and nothing that compiles has one.
     fn temp(&mut self, ty: Ty<'db>, current: BasicBlockId, span: MirSpan) -> Result<'db, LocalId> {
-        if matches!(ty.kind(), TyKind::Slice(_) | TyKind::Dynamic(..)) {
-            return Err(MirLowerError::UnsizedTemporary(ty.store()));
-        }
         let l = self.result.locals.alloc(Local { ty: ty.store() });
         self.push_storage_live_for_local(l, current, span)?;
         Ok(l)
@@ -3525,18 +3524,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 &hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
                     let scope2 = self.push_drop_scope();
-                    // A place used as a statement (`*x;`) is moved out of, and the value
-                    // dropped at the end of the statement.
-                    let unsized_place = matches!(
-                        self.expr_ty_after_adjustments(expr).kind(),
-                        TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..)
-                    );
-                    let lowered = if unsized_place {
-                        self.lower_expr_as_place(current, expr, true)?
-                    } else {
-                        self.lower_expr_to_fresh_place(expr, current)?
-                    };
-                    let Some((p, c)) = lowered else {
+                    // A place used as a statement (`*x;`, `S[0];`) is moved out of into a
+                    // temporary, as rustc's `stmt_expr` does with `as_temp`, sized or not, and
+                    // the value dropped at the end of the statement.
+                    let Some((p, c)) = self.lower_expr_to_fresh_place(expr, current)? else {
                         scope2.pop_assume_dropped(self);
                         scope.pop_assume_dropped(self);
                         return Ok(None);

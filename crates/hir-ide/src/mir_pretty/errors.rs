@@ -83,7 +83,6 @@ impl MirLowerError<'_> {
                 writeln!(f, "]")?;
             }
             MirLowerError::LayoutError(_)
-            | MirLowerError::UnsizedTemporary(_)
             | MirLowerError::IncompleteExpr
             | MirLowerError::IncompletePattern
             | MirLowerError::InaccessibleLocal

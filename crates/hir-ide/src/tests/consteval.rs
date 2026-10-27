@@ -3216,7 +3216,8 @@ fn unsized_local() {
         z[1]
     };
     "#,
-        |e| matches!(e, ConstEvalError::MirLowerError(MirLowerError::UnsizedTemporary(_))),
+        // The temporary of the slice is lowered, as rustc's is; evaluating it fails.
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::TypeIsUnsized(..))),
     );
 }
 
