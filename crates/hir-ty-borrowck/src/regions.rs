@@ -29,8 +29,11 @@ use hir_ty::{
         AggregateKind, BinOp, BorrowKind, CastKind, LocalId, MirBody, MirSpan, Operand,
         OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     },
-    next_solver::{Clause, ConstKind, GenericArgKind, GenericArgs, Region, Ty, TyKind},
+    next_solver::{
+        Clause, ConstKind, GenericArgKind, GenericArgs, Region, StoredRegion, StoredTy, Ty, TyKind,
+    },
 };
+use salsa::SalsaValue;
 
 pub(super) use super::inference::{RegionValues, infer};
 use super::{
@@ -6171,10 +6174,7 @@ impl<'db> Builder<'_, '_, 'db> {
         at: At,
     ) -> bool {
         use hir_ty::next_solver::{
-            infer::{
-                region_constraints::Constraint,
-                traits::{Obligation, ObligationCause},
-            },
+            infer::traits::{Obligation, ObligationCause},
             obligation_ctxt::ObligationCtxt,
         };
         if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&trait_ref)
@@ -6189,49 +6189,55 @@ impl<'db> Builder<'_, '_, 'db> {
         // clauses says of the placeholders it is proven for: `&'static str: DeserializeOwned`.
         let regionless = !rustc_type_ir::TypeVisitableExt::has_free_regions(&trait_ref);
         let interner = self.interner();
-        let (constraints_before, obligations_before) = {
-            let mut inner = self.ctx.infcx.inner.borrow_mut();
-            let obligations = inner.region_obligations().len();
-            let constraints =
-                inner.unwrap_region_constraints().region_constraint_data().constraints.len();
-            (constraints, obligations)
-        };
-        let mut ocx = ObligationCtxt::new(&self.ctx.infcx);
-        let predicate = rustc_type_ir::TraitPredicate {
-            trait_ref,
-            polarity: rustc_type_ir::PredicatePolarity::Positive,
-        };
-        ocx.register_obligation(Obligation::new(
-            interner,
-            ObligationCause::dummy(),
-            self.ctx.env,
-            predicate,
-        ));
-        let errors = ocx.evaluate_obligations_error_on_ambiguity();
-        if !errors.is_empty() {
-            return !regionless && errors.iter().any(|it| it.is_true_error());
-        }
-        let (constraints, obligations) = {
-            let mut inner = self.ctx.infcx.inner.borrow_mut();
-            let obligations: Vec<_> = inner.region_obligations()[obligations_before..]
-                .iter()
-                .map(|it| (it.sup_type, it.sub_region))
-                .collect();
-            let constraints: Vec<_> =
-                inner.unwrap_region_constraints().region_constraint_data().constraints
-                    [constraints_before..]
+        let (pairs, obligations) = match self.prove_canonical(trait_ref) {
+            Some(Ok(it)) => it,
+            Some(Err(true_error)) => return !regionless && true_error,
+            None => {
+                let (constraints_before, obligations_before) = {
+                    let mut inner = self.ctx.infcx.inner.borrow_mut();
+                    let obligations = inner.region_obligations().len();
+                    let constraints = inner
+                        .unwrap_region_constraints()
+                        .region_constraint_data()
+                        .constraints
+                        .len();
+                    (constraints, obligations)
+                };
+                let mut ocx = ObligationCtxt::new(&self.ctx.infcx);
+                let predicate = rustc_type_ir::TraitPredicate {
+                    trait_ref,
+                    polarity: rustc_type_ir::PredicatePolarity::Positive,
+                };
+                ocx.register_obligation(Obligation::new(
+                    interner,
+                    ObligationCause::dummy(),
+                    self.ctx.env,
+                    predicate,
+                ));
+                let errors = ocx.evaluate_obligations_error_on_ambiguity();
+                if !errors.is_empty() {
+                    return !regionless && errors.iter().any(|it| it.is_true_error());
+                }
+                let mut inner = self.ctx.infcx.inner.borrow_mut();
+                let obligations: Vec<_> = inner.region_obligations()[obligations_before..]
                     .iter()
-                    .cloned()
+                    .map(|it| (it.sup_type, it.sub_region))
                     .collect();
-            (constraints, obligations)
+                let pairs = constraint_pairs(
+                    interner,
+                    &inner.unwrap_region_constraints().region_constraint_data().constraints
+                        [constraints_before..],
+                );
+                (pairs, obligations)
+            }
         };
         // Its impl's where clauses can still need a type to outlive a region:
         // `ServiceChain<P, S>: Service` that `P::Error: 'static`.
-        if regionless && constraints.is_empty() && obligations.is_empty() {
+        if regionless && pairs.is_empty() && obligations.is_empty() {
             return false;
         }
         if crate::debugging(self.ctx.db, self.ctx.owner) {
-            eprintln!("prove {trait_ref:?}: {constraints:?} {obligations:?}");
+            eprintln!("prove {trait_ref:?}: {pairs:?} {obligations:?}");
         }
         let rv = |this: &mut Self, region: Region<'db>| match region.kind() {
             RegionKind::ReVar(vid) => Some(vid.as_usize()),
@@ -6242,16 +6248,6 @@ impl<'db> Builder<'_, '_, 'db> {
             RegionKind::RePlaceholder(_) => rv_of(this.placeholder(region)),
             _ => None,
         };
-        let var = |vid: rustc_type_ir::RegionVid| Region::new_var(interner, vid);
-        let pairs: Vec<(Region<'db>, Region<'db>)> = constraints
-            .into_iter()
-            .map(|constraint| match constraint {
-                Constraint::VarSubVar(a, b) => (var(a), var(b)),
-                Constraint::RegSubVar(a, b) => (a, var(b)),
-                Constraint::VarSubReg(a, b) => (var(a), b),
-                Constraint::RegSubReg(a, b) => (a, b),
-            })
-            .collect();
         // A placeholder equated with an error region stands for a lifetime rust-analyzer
         // elided in a signature, whose trait objects it gives `'static` rather than that
         // lifetime (`fn(&mut dyn Write)` for `for<'b> FnMut(&'b mut dyn Write)`), so nothing
@@ -6329,6 +6325,71 @@ impl<'db> Builder<'_, '_, 'db> {
         false
     }
 
+    /// What proving `trait_ref` gives, in this body's regions, from [`prove_query`]: its region
+    /// variables, resolved as the solver would, numbered in order, and a fresh one for each
+    /// that proving it made. `None` where it must be proven here, `Err` where it does not hold.
+    #[allow(clippy::type_complexity)]
+    fn prove_canonical(
+        &mut self,
+        trait_ref: rustc_type_ir::TraitRef<hir_ty::next_solver::DbInterner<'db>>,
+    ) -> Option<Result<(Vec<(Region<'db>, Region<'db>)>, Vec<(Ty<'db>, Region<'db>)>), bool>> {
+        use rustc_type_ir::TypeVisitableExt as _;
+        if trait_ref.has_placeholders() || trait_ref.has_non_region_infer() {
+            return None;
+        }
+        let interner = self.interner();
+        let mut vars: Vec<Region<'db>> = Vec::new();
+        let mut here = false;
+        let canonical = rustc_type_ir::fold_regions(interner, trait_ref, |region, _| {
+            let RegionKind::ReVar(vid) = region.kind() else { return region };
+            let mut inner = self.ctx.infcx.inner.borrow_mut();
+            let mut constraints = inner.unwrap_region_constraints();
+            let resolved = constraints.opportunistic_resolve_var(interner, vid);
+            let RegionKind::ReVar(root) = resolved.kind() else {
+                here |= resolved.is_placeholder();
+                return resolved;
+            };
+            here |= constraints.probe_value(root) != Err(rustc_type_ir::UniverseIndex::ROOT);
+            let at = vars.iter().position(|&it| it == resolved).unwrap_or_else(|| {
+                vars.push(resolved);
+                vars.len() - 1
+            });
+            Region::new_var(interner, rustc_type_ir::RegionVid::from_usize(at))
+        });
+        if here {
+            return None;
+        }
+        let env = hir_ty::ParamEnvAndCrate { param_env: self.ctx.env, krate: self.ctx.krate };
+        let (pairs, obligations) = match prove_query(
+            self.ctx.db,
+            env.store(),
+            hir_ty::next_solver::StoredTraitRef::new(canonical),
+            vars.len() as u32,
+        ) {
+            Proven::Here => return None,
+            &Proven::Error(true_error) => return Some(Err(true_error)),
+            Proven::Gives { pairs, obligations } => (pairs, obligations),
+        };
+        let mut made: FxHashMap<u32, Region<'db>> = FxHashMap::default();
+        let mut map = |region: Region<'db>| match region.kind() {
+            RegionKind::ReVar(vid) => match vars.get(vid.index()) {
+                Some(&it) => it,
+                None => *made.entry(vid.as_u32()).or_insert_with(|| self.fresh()),
+            },
+            _ => region,
+        };
+        let pairs =
+            pairs.iter().map(|(a, b)| (map(a.as_ref()), map(b.as_ref()))).collect::<Vec<_>>();
+        let obligations = obligations
+            .iter()
+            .map(|(ty, region)| {
+                let ty = rustc_type_ir::fold_regions(interner, ty.as_ref(), |it, _| map(it));
+                (ty, map(region.as_ref()))
+            })
+            .collect();
+        Some(Ok((pairs, obligations)))
+    }
+
     /// `ty` of the signature with its lifetimes as universal regions.
     fn signature_ty(&mut self, ty: Ty<'db>) -> Ty<'db> {
         let interner = self.interner();
@@ -6342,6 +6403,100 @@ impl<'db> Builder<'_, '_, 'db> {
             RegionKind::ReStatic => Some(self.regions.static_rv),
             _ => rv_of(region),
         }
+    }
+}
+
+/// What proving a trait reference gives a body, as salsa keeps it: its region variables are
+/// the trait reference's, numbered in order, and after them the ones proving it made.
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+enum Proven {
+    /// What it gives names a placeholder, or a variable of another universe, which only the
+    /// body's own inference context can say what it is.
+    Here,
+    /// It does not hold; whether that is a true error.
+    Error(bool),
+    Gives { pairs: Vec<(StoredRegion, StoredRegion)>, obligations: Vec<(StoredTy, StoredRegion)> },
+}
+
+/// `a <= b` for each of `constraints`: `b` outlives `a`.
+fn constraint_pairs<'db>(
+    interner: hir_ty::next_solver::DbInterner<'db>,
+    constraints: &[hir_ty::next_solver::infer::region_constraints::Constraint<'db>],
+) -> Vec<(Region<'db>, Region<'db>)> {
+    use hir_ty::next_solver::infer::region_constraints::Constraint;
+    let var = |vid: rustc_type_ir::RegionVid| Region::new_var(interner, vid);
+    constraints
+        .iter()
+        .map(|constraint| match *constraint {
+            Constraint::VarSubVar(a, b) => (var(a), var(b)),
+            Constraint::RegSubVar(a, b) => (a, var(b)),
+            Constraint::VarSubReg(a, b) => (var(a), b),
+            Constraint::RegSubReg(a, b) => (a, b),
+        })
+        .collect()
+}
+
+/// Proves `trait_ref`, whose region variables are the first `vars`, in `env`, as rustc's
+/// canonical `type_op_prove_predicate`: a query, so a goal is proven once for every body of the
+/// same environment, and an edit proves again only the goals of what it changes.
+#[salsa::tracked(returns(ref))]
+fn prove_query(
+    db: &dyn hir_ty::db::HirDatabase,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    trait_ref: hir_ty::next_solver::StoredTraitRef,
+    vars: u32,
+) -> Proven {
+    use hir_ty::next_solver::{
+        DbInterner, TypingMode,
+        infer::{
+            DbInternerInferExt as _,
+            traits::{Obligation, ObligationCause},
+        },
+        obligation_ctxt::ObligationCtxt,
+    };
+    use rustc_type_ir::TypeVisitableExt as _;
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    for _ in 0..vars {
+        infcx.next_region_var(hir_ty::Span::Dummy);
+    }
+    let trait_ref = trait_ref.get(interner);
+    let mut ocx = ObligationCtxt::new(&infcx);
+    ocx.register_obligation(Obligation::new(
+        interner,
+        ObligationCause::dummy(),
+        env.param_env,
+        rustc_type_ir::TraitPredicate {
+            trait_ref,
+            polarity: rustc_type_ir::PredicatePolarity::Positive,
+        },
+    ));
+    let errors = ocx.evaluate_obligations_error_on_ambiguity();
+    if !errors.is_empty() {
+        return Proven::Error(errors.iter().any(|it| it.is_true_error()));
+    }
+    let mut inner = infcx.inner.borrow_mut();
+    let obligations: Vec<_> =
+        inner.region_obligations().iter().map(|it| (it.sup_type, it.sub_region)).collect();
+    let mut constraints = inner.unwrap_region_constraints();
+    let pairs = constraint_pairs(interner, &constraints.region_constraint_data().constraints);
+    let mut own = |region: Region<'_>| match region.kind() {
+        RegionKind::RePlaceholder(_) => false,
+        RegionKind::ReVar(vid) => {
+            vid.as_u32() < vars
+                || constraints.probe_value(vid) == Err(rustc_type_ir::UniverseIndex::ROOT)
+        }
+        _ => true,
+    };
+    if !pairs.iter().all(|&(a, b)| own(a) && own(b))
+        || !obligations.iter().all(|&(ty, region)| own(region) && !ty.has_placeholders())
+    {
+        return Proven::Here;
+    }
+    Proven::Gives {
+        pairs: pairs.into_iter().map(|(a, b)| (a.store(), b.store())).collect(),
+        obligations: obligations.into_iter().map(|(ty, region)| (ty.store(), region.store())).collect(),
     }
 }
 
