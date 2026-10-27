@@ -280,6 +280,15 @@ impl<'db> Check<'_, 'db> {
         if output.references_error() {
             return;
         }
+        if let ItemContainerId::TraitId(_) = function.lookup(db).container
+            && output.has_opaque_types()
+        {
+            // An `impl Trait` a trait's method returns is an associated type of the trait,
+            // whose bounds must be well-formed given only what the method's parameters imply:
+            // the return type, its projection, implies nothing.
+            let known = self.known(function.into(), &assumed);
+            self.trait_opaques(function, output, &known);
+        }
         if !output.has_aliases() {
             assumed.push(output);
             let known = self.known(function.into(), &assumed);
@@ -344,6 +353,60 @@ impl<'db> Check<'_, 'db> {
                 }
             }
             needs.extend(found.into_iter().map(|it| (it, site)));
+            self.resolve(known, needs);
+        }
+    }
+
+    /// rustc's `check_associated_type_bounds` of the associated type an `impl Trait` a
+    /// trait's method returns is (an `async fn`'s future too): the types its bounds name are
+    /// well-formed given what the method knows, so `async fn foo(&self) -> &(T, U)` in
+    /// `trait MyTrait<T, U>` needs `T` and `U` to outlive the lifetime of `&self` (E0311), as
+    /// only `Self` is known to. An `impl Trait` with no outlives bound outlives as its
+    /// arguments do: `&'static impl T` needs `Self: 'static` (E0310).
+    fn trait_opaques(&mut self, function: FunctionId, output: Ty<'db>, known: &Known<'db>) {
+        let db = self.db;
+        let interner = self.interner();
+        let mut opaques = Vec::new();
+        outlives::opaques(output, &mut opaques);
+        for alias in opaques {
+            let SolverDefId::InternedOpaqueTyId(opaque) = alias.kind.def_id() else { continue };
+            let ImplTraitId::ReturnTypeImplTrait(owner, index) = opaque.loc(db) else { continue };
+            if owner != function {
+                continue;
+            }
+            let mut found = Vec::new();
+            let bounds = rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id());
+            for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
+                let (args, term) = match clause.kind().skip_binder() {
+                    ClauseKind::Trait(predicate) => (predicate.trait_ref.args, None),
+                    ClauseKind::Projection(predicate) => {
+                        (predicate.projection_term.args, predicate.term.as_type())
+                    }
+                    _ => continue,
+                };
+                let tys = args
+                    .iter()
+                    .skip(1)
+                    .filter_map(|arg| match arg.kind() {
+                        GenericArgKind::Type(ty) => Some(ty),
+                        _ => None,
+                    })
+                    .chain(term);
+                for ty in tys {
+                    if !ty.references_error() {
+                        outlives::wf(db, &mut self.inferred, ty, &mut found);
+                    }
+                }
+            }
+            let site = Site::Opaque(function, index.into_raw().into_u32());
+            let needs = found
+                .into_iter()
+                .map(|it| match it {
+                    Needs::Type(ty, region) => Needs::Type(outlives::outlived_as(db, ty), region),
+                    Needs::Region(..) => it,
+                })
+                .map(|it| (it, site))
+                .collect();
             self.resolve(known, needs);
         }
     }
