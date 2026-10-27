@@ -4,6 +4,7 @@
 
 use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
 use rustc_hash::{FxHashMap, FxHashSet};
+use salsa::SalsaValue;
 use rustc_type_ir::{
     ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind, TypeFoldable,
     TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
@@ -16,7 +17,7 @@ use hir_ty::{
     db::HirDatabase,
     next_solver::{
         AliasTy, Clause, DbInterner, GenericArg, GenericArgKind, GenericArgs, Region, SolverDefId,
-        Ty, TyKind,
+        StoredRegion, StoredTy, Ty, TyKind,
     },
 };
 
@@ -470,13 +471,10 @@ fn prove_needs<'db>(
 
 /// rustc's `inferred_outlives_of` the ADTs a check comes across: what each one's fields need
 /// of its own parameters, `T: 'a` and `'b: 'a` with `'a` a lifetime parameter, never
-/// `'static`. Worked out to a fixed point, as ADTs can contain each other.
+/// `'static`.
 #[derive(Default)]
 pub struct Inferred<'db> {
     memo: FxHashMap<AdtId, Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>>,
-    in_progress: FxHashSet<AdtId>,
-    cyclic: bool,
-    fixing: bool,
 }
 
 impl<'db> Inferred<'db> {
@@ -485,120 +483,156 @@ impl<'db> Inferred<'db> {
         db: &'db dyn HirDatabase,
         adt: AdtId,
     ) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
-        if let Some(found) = self.memo.get(&adt) {
-            if self.in_progress.contains(&adt) {
-                self.cyclic = true;
-            }
-            return found.clone();
-        }
-        self.memo.insert(adt, Vec::new());
-        self.in_progress.insert(adt);
-        let found = self.compute(db, adt);
-        self.in_progress.remove(&adt);
-        self.memo.insert(adt, found);
-        if self.in_progress.is_empty() && self.cyclic && !self.fixing {
-            self.cyclic = false;
-            self.fixing = true;
-            for _ in 0..8 {
-                let mut changed = false;
-                let adts: Vec<_> = self.memo.keys().copied().collect();
-                for adt in adts {
-                    let found = self.compute(db, adt);
-                    if self.memo.get(&adt) != Some(&found) {
-                        self.memo.insert(adt, found);
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-            self.fixing = false;
-        }
-        self.memo[&adt].clone()
+        self.memo.entry(adt).or_insert_with(|| inferred_of(db, adt)).clone()
     }
+}
 
-    fn compute(
-        &mut self,
-        db: &'db dyn HirDatabase,
-        adt: AdtId,
-    ) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
-        let mut found = Vec::new();
-        for variant in variants(db, adt) {
-            for (_, field) in db.field_types(variant).iter() {
-                let ty = field.ty().instantiate_identity().skip_norm_wip();
-                let mut subtypes = Vec::new();
-                walk(ty, &mut subtypes);
-                for ty in subtypes {
-                    self.required(db, ty, &mut found);
-                }
+/// One of an ADT's inferred outlives predicates as salsa keeps it: what outlives, a type or a
+/// region, and the region.
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+enum InferredArg {
+    Type(StoredTy),
+    Region(StoredRegion),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+struct InferredPredicate {
+    arg: InferredArg,
+    region: StoredRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+struct InferredOutlives(Vec<InferredPredicate>);
+
+fn inferred_of<'db>(
+    db: &'db dyn HirDatabase,
+    adt: AdtId,
+) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
+    inferred_outlives(db, adt)
+        .0
+        .iter()
+        .map(|it| {
+            let arg: GenericArg<'db> = match &it.arg {
+                InferredArg::Type(ty) => ty.as_ref().into(),
+                InferredArg::Region(region) => region.as_ref().into(),
+            };
+            OutlivesPredicate(arg, it.region.as_ref())
+        })
+        .collect()
+}
+
+/// A query, so an edit checks again only the ADTs it changes. Worked out to a fixed point, as
+/// ADTs can contain each other.
+#[salsa::tracked(
+    returns(ref),
+    cycle_fn = inferred_outlives_cycle_fn,
+    cycle_initial = inferred_outlives_cycle_initial,
+)]
+fn inferred_outlives(db: &dyn HirDatabase, adt: AdtId) -> InferredOutlives {
+    let mut found = Vec::new();
+    for variant in variants(db, adt) {
+        for (_, field) in db.field_types(variant).iter() {
+            let ty = field.ty().instantiate_identity().skip_norm_wip();
+            let mut subtypes = Vec::new();
+            walk(ty, &mut subtypes);
+            for ty in subtypes {
+                required(db, ty, &mut found);
             }
         }
-        let mut seen = FxHashSet::default();
-        found.retain(|it| seen.insert(*it));
+    }
+    let mut seen = FxHashSet::default();
+    found.retain(|it| seen.insert(*it));
+    InferredOutlives(
         found
-    }
+            .into_iter()
+            .filter_map(|OutlivesPredicate(arg, region)| {
+                let arg = match arg.kind() {
+                    GenericArgKind::Type(ty) => InferredArg::Type(ty.store()),
+                    GenericArgKind::Lifetime(region) => InferredArg::Region(region.store()),
+                    GenericArgKind::Const(_) => return None,
+                };
+                Some(InferredPredicate { arg, region: region.store() })
+            })
+            .collect(),
+    )
+}
 
-    /// rustc's `insert_required_predicates_to_be_wf`, for one type in a field's.
-    fn required(
-        &mut self,
-        db: &'db dyn HirDatabase,
-        ty: Ty<'db>,
-        found: &mut Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>,
-    ) {
-        let interner = DbInterner::new_no_crate(db);
-        let mut needs = Vec::new();
-        match ty.kind() {
-            TyKind::Ref(region, inner, _) => needs.push(Needs::Type(inner, region)),
-            TyKind::Adt(def, args) => {
-                let clauses: Vec<Clause<'db>> =
-                    GenericPredicates::query_all(db, def.def_id().into())
-                        .iter_instantiated(interner, args.as_slice())
-                        .map(|it| it.skip_norm_wip())
-                        .collect();
-                clause_needs(&clauses, &mut needs);
-                for predicate in self.of(db, def.def_id()) {
-                    let OutlivesPredicate(arg, region) =
-                        EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
-                    match arg.kind() {
-                        GenericArgKind::Type(ty) => needs.push(Needs::Type(ty, region)),
-                        GenericArgKind::Lifetime(longer) => {
-                            needs.push(Needs::Region(longer, region))
-                        }
-                        GenericArgKind::Const(_) => (),
-                    }
-                }
-            }
-            TyKind::Alias(alias)
-                if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
-                    && let SolverDefId::TypeAliasId(item) = alias.kind.def_id()
-                    && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
-            {
-                let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, trait_.into())
-                    .iter_instantiated(interner, alias.args.as_slice())
+fn inferred_outlives_cycle_initial(
+    _db: &dyn HirDatabase,
+    _: salsa::Id,
+    _adt: AdtId,
+) -> InferredOutlives {
+    InferredOutlives::default()
+}
+
+fn inferred_outlives_cycle_fn(
+    _db: &dyn HirDatabase,
+    _: &salsa::Cycle<'_>,
+    _last_provisional_value: &InferredOutlives,
+    value: InferredOutlives,
+    _adt: AdtId,
+) -> InferredOutlives {
+    value
+}
+
+/// rustc's `insert_required_predicates_to_be_wf`, for one type in a field's.
+fn required<'db>(
+    db: &'db dyn HirDatabase,
+    ty: Ty<'db>,
+    found: &mut Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>,
+) {
+    let interner = DbInterner::new_no_crate(db);
+    let mut needs = Vec::new();
+    match ty.kind() {
+        TyKind::Ref(region, inner, _) => needs.push(Needs::Type(inner, region)),
+        TyKind::Adt(def, args) => {
+            let clauses: Vec<Clause<'db>> =
+                GenericPredicates::query_all(db, def.def_id().into())
+                    .iter_instantiated(interner, args.as_slice())
                     .map(|it| it.skip_norm_wip())
                     .collect();
-                clause_needs(&clauses, &mut needs);
+            clause_needs(&clauses, &mut needs);
+            for predicate in inferred_of(db, def.def_id()) {
+                let OutlivesPredicate(arg, region) =
+                    EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
+                match arg.kind() {
+                    GenericArgKind::Type(ty) => needs.push(Needs::Type(ty, region)),
+                    GenericArgKind::Lifetime(longer) => {
+                        needs.push(Needs::Region(longer, region))
+                    }
+                    GenericArgKind::Const(_) => (),
+                }
+            }
+        }
+        TyKind::Alias(alias)
+            if let rustc_type_ir::AliasTyKind::Projection { .. } = alias.kind
+                && let SolverDefId::TypeAliasId(item) = alias.kind.def_id()
+                && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
+        {
+            let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, trait_.into())
+                .iter_instantiated(interner, alias.args.as_slice())
+                .map(|it| it.skip_norm_wip())
+                .collect();
+            clause_needs(&clauses, &mut needs);
+        }
+        _ => (),
+    }
+    for need in needs {
+        match need {
+            Needs::Type(ty, region) if is_free(region) => {
+                for component in components(ty) {
+                    let arg: GenericArg<'db> = match component {
+                        Component::Region(longer) if is_free(longer) => longer.into(),
+                        Component::Param(ty) | Component::Alias(ty) => ty.into(),
+                        Component::Region(_) => continue,
+                    };
+                    found.push(OutlivesPredicate(arg, region));
+                }
+            }
+            Needs::Region(longer, shorter) if is_free(longer) && is_free(shorter) => {
+                found.push(OutlivesPredicate(longer.into(), shorter));
             }
             _ => (),
-        }
-        for need in needs {
-            match need {
-                Needs::Type(ty, region) if is_free(region) => {
-                    for component in components(ty) {
-                        let arg: GenericArg<'db> = match component {
-                            Component::Region(longer) if is_free(longer) => longer.into(),
-                            Component::Param(ty) | Component::Alias(ty) => ty.into(),
-                            Component::Region(_) => continue,
-                        };
-                        found.push(OutlivesPredicate(arg, region));
-                    }
-                }
-                Needs::Region(longer, shorter) if is_free(longer) && is_free(shorter) => {
-                    found.push(OutlivesPredicate(longer.into(), shorter));
-                }
-                _ => (),
-            }
         }
     }
 }

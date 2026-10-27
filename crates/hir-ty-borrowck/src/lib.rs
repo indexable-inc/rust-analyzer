@@ -37,7 +37,7 @@ use hir_ty::{
     closure_analysis::CapturedPlace,
     db::{HirDatabase, InternedCoroutineId},
     next_solver::{
-        DbInterner, ParamEnv, Ty, TypingMode,
+        DbInterner, ParamEnv, Region, Ty, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
 };
@@ -471,6 +471,7 @@ pub(crate) struct Ctx<'a, 'db> {
     /// A where clause of a call does not hold, rustc's E0277, which rust-analyzer does not
     /// report: rustc does not borrow check a body whose type check fails.
     pub(crate) tainted: std::cell::Cell<bool>,
+    copy: std::cell::RefCell<FxHashMap<Ty<'db>, bool>>,
 }
 
 fn guard_bindings(store: &ExpressionStore) -> FxHashMap<ExprId, Vec<BindingId>> {
@@ -566,6 +567,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             inline_const: false,
             guard_bindings: guard_bindings(store),
             tainted: std::cell::Cell::new(false),
+            copy: Default::default(),
         }
     }
 
@@ -624,7 +626,17 @@ impl<'a, 'db> Ctx<'a, 'db> {
     }
 
     pub(crate) fn is_copy(&self, ty: Ty<'db>) -> bool {
-        self.infcx.type_is_copy_modulo_regions(self.env, ty)
+        // Modulo regions, so asked once per type whatever its free regions are: each local's
+        // type has region variables of its own.
+        use rustc_type_ir::inherent::Region as _;
+        let interner = self.infcx.interner;
+        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        if let Some(&known) = self.copy.borrow().get(&ty) {
+            return known;
+        }
+        let known = self.infcx.type_is_copy_modulo_regions(self.env, ty);
+        self.copy.borrow_mut().insert(ty, known);
+        known
     }
 
     /// The place `operand` moves out of. Lowering says a value a closure captures by value is
