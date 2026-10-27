@@ -22,6 +22,11 @@ impl<'db> TargetFeatures<'db> {
         result
     }
 
+    /// Whether `feature` is enabled, by the attributes or by a feature they enable.
+    pub fn enables(&self, feature: &str) -> bool {
+        self.enabled.contains(&Symbol::intern(feature))
+    }
+
     fn expand_implications(&mut self) {
         let all_implications = LazyLock::force(&TARGET_FEATURE_IMPLICATIONS);
         let enabled = self.enabled.to_mut();
