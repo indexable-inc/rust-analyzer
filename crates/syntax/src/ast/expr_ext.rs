@@ -170,8 +170,21 @@ impl ast::PrefixExpr {
     }
 
     pub fn op_token(&self) -> Option<SyntaxToken> {
-        self.syntax().first_child_or_token()?.into_token()
+        self.syntax()
+            .children_with_tokens()
+            .find(|e| !ast::AnyAttr::can_cast(e.kind()) && !e.kind().is_trivia())?
+            .into_token()
     }
+}
+
+#[test]
+fn test_prefix_expr_with_attr() {
+    let parse = ast::SourceFile::parse(
+        "fn f(b: bool) -> bool { #[cfg(all())] !b }",
+        parser::Edition::CURRENT,
+    );
+    let expr = parse.tree().syntax().descendants().find_map(ast::PrefixExpr::cast).unwrap();
+    assert_eq!(expr.op_kind(), Some(UnaryOp::Not));
 }
 
 impl ast::BinExpr {
