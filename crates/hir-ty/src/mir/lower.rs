@@ -2793,6 +2793,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A closure that captures nothing, as a function pointer, is a constant: rustc's
+            // `promote_consts::Validator` promotes the cast of a closure aggregate with no
+            // upvars. minijinja's `type_erase!` builds `DynObject`'s vtable of such closures by
+            // reference in a generic function; not promoted, the vtable was a slot of the frame
+            // the function returned a reference to, and the borrow checker refused it (E0515).
+            [Adjustment { kind: Adjust::Pointer(PointerCast::ClosureFnPointer(_)), .. }] => {
+                matches!(self.store[expr], Expr::Closure { closure_kind: ClosureKind::Closure, .. })
+                    && self
+                        .infer
+                        .closures_data
+                        .get(&expr)
+                        .is_some_and(|it| it.min_captures.values().flatten().next().is_none())
+            }
             // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
             // rustc's `promote_consts::Validator::validate_rvalue`.
             [
