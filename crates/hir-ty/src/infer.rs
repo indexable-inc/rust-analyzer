@@ -819,6 +819,12 @@ pub struct InferenceResult<'db> {
     error_ty: StoredTy,
 
     pub expr_adjustments: FxHashMap<ExprId, Box<[Adjustment]>>,
+    /// For each place a destructuring assignment assigns to, the coercion of the part of the
+    /// value it is given to the place's type: rustc's `place = lhsN` of
+    /// `{ let (lhs0, ..) = rhs; place0 = lhs0; .. }` coerces `lhsN`. These are not adjustments of
+    /// the place, which is used as it is written (a reborrow here does not make `g.label`
+    /// a shared use of `g`).
+    pub assignment_coercions: FxHashMap<ExprId, Box<[Adjustment]>>,
     /// Stores the types which were implicitly dereferenced in pattern binding modes.
     pub pat_adjustments: FxHashMap<PatId, Vec<PatAdjustment>>,
     /// Stores the binding mode (`ref` in `let ref x = 2`) of bindings.
@@ -1187,6 +1193,7 @@ impl<'db> InferenceResult<'db> {
             pat_adjustments: Default::default(),
             binding_modes: Default::default(),
             expr_adjustments: Default::default(),
+            assignment_coercions: Default::default(),
             coercion_casts: Default::default(),
             closures_without_expectation: Default::default(),
             asm_sym_tys: Default::default(),
@@ -1304,6 +1311,10 @@ impl<'db> InferenceResult<'db> {
 
     pub fn expr_adjustment(&self, id: ExprId) -> Option<&[Adjustment]> {
         self.expr_adjustments.get(&id).map(|it| &**it)
+    }
+
+    pub fn assignment_coercion(&self, place: ExprId) -> &[Adjustment] {
+        self.assignment_coercions.get(&place).map_or(&[], |it| &**it)
     }
 
     pub fn binding_mode(&self, id: PatId) -> Option<BindingMode> {
@@ -1540,6 +1551,7 @@ impl<'db> InferenceContext<'db> {
             diagnostics: _,
             error_ty: _,
             expr_adjustments,
+            assignment_coercions,
             pat_adjustments,
             binding_modes,
             skipped_ref_pats,
@@ -1570,6 +1582,7 @@ impl<'db> InferenceContext<'db> {
         merge_hash_maps(type_of_type_placeholder, &other.type_of_type_placeholder);
         merge_hash_maps(type_of_opaque, &other.type_of_opaque);
         merge_hash_maps(expr_adjustments, &other.expr_adjustments);
+        merge_hash_maps(assignment_coercions, &other.assignment_coercions);
         merge_hash_maps(pat_adjustments, &other.pat_adjustments);
         merge_arena_maps(binding_modes, &other.binding_modes);
         merge_hash_set(skipped_ref_pats, &other.skipped_ref_pats);
@@ -1714,6 +1727,7 @@ impl<'db> InferenceContext<'db> {
             pat_adjustments,
             binding_modes: _,
             expr_adjustments,
+            assignment_coercions,
             tuple_field_access_types,
             coercion_casts: _,
             closures_without_expectation: _,
@@ -1768,6 +1782,10 @@ impl<'db> InferenceContext<'db> {
             resolver.resolve_completely(&mut adjustment.target);
         }
         expr_adjustments.shrink_to_fit();
+        for adjustment in assignment_coercions.values_mut().flatten() {
+            resolver.resolve_completely(&mut adjustment.target);
+        }
+        assignment_coercions.shrink_to_fit();
         for adjustments in pat_adjustments.values_mut() {
             for adjustment in &mut *adjustments {
                 resolver.resolve_completely(&mut adjustment.source);

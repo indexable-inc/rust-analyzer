@@ -782,11 +782,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
         })
     }
 
-    /// The part of a destructured value at `part` as it is assigned to `target`. The
-    /// adjustments of the target are the coercion of the part to the type of the target.
+    /// The part of a destructured value at `part` as it is assigned to `target`, coerced to the
+    /// type of the target.
     fn assigned_part(&self, target: ExprId, part: Place<'db>) -> Result<'db, Rvalue> {
         let part = Operand { kind: OperandKind::Copy(part.store()), span: None };
-        let adjustments = self.infer.expr_adjustments.get(&target).map_or(&[][..], |it| &**it);
+        let adjustments = self.infer.assignment_coercion(target);
         // A reborrow is the pointer it is of.
         let adjustments = match adjustments {
             [

@@ -609,6 +609,32 @@ impl S {
     }
 
     #[test]
+    fn destructuring_assignment_through_deref_mut_to_a_reference_field() {
+        check_diagnostics(
+            r#"
+//- minicore: deref_mut, copy, fn
+use core::ops::{Deref, DerefMut};
+struct State { count: u32, label: &'static str }
+struct Guard<'s>(&'s mut State);
+impl Deref for Guard<'_> { type Target = State; fn deref(&self) -> &State { self.0 } }
+impl DerefMut for Guard<'_> { fn deref_mut(&mut self) -> &mut State { self.0 } }
+fn guard(mut g: Guard<'_>, flag: bool) {
+    (g.count, g.label) = if flag { (1, "one") } else { (2, "two") };
+    (g.label,) = ("x",);
+}
+fn closure(mut g: Guard<'_>) {
+    let mut set = || (g.label,) = ("y",);
+    set();
+}
+fn shared(s: &State) {
+    (s.label,) = ("z",);
+   //^^^^^^^ error: cannot assign to `s.label`, which is behind a `&` reference
+}
+"#,
+        );
+    }
+
+    #[test]
     fn async_bodys_tail_temporaries_drop_before_its_parameters_2021() {
         check_diagnostics(
             r#"

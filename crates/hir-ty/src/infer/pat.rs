@@ -1713,7 +1713,7 @@ impl<'db> InferenceContext<'db> {
         // LHS of assignment doesn't constitute reads.
         let expr_is_read = ExprIsRead::No;
         let lhs_ty = self.infer_expr_inner(expr, &Expectation::has_type(expected), expr_is_read);
-        match self.coerce(expr, expected, lhs_ty, AllowTwoPhase::No, expr_is_read) {
+        let ty = match self.coerce(expr, expected, lhs_ty, AllowTwoPhase::No, expr_is_read) {
             Ok(ty) => ty,
             Err(_) => {
                 self.emit_type_mismatch(expr.into(), expected, lhs_ty);
@@ -1721,6 +1721,10 @@ impl<'db> InferenceContext<'db> {
                 // reported because of this mismatch.
                 expected
             }
+        };
+        if let Some(coercion) = self.result.expr_adjustments.remove(&expr) {
+            self.result.assignment_coercions.insert(expr, coercion);
         }
+        ty
     }
 }
